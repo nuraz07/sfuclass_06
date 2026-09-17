@@ -162,6 +162,8 @@ export class SfuClient {
   private nodeId: string | null = null;
   private peerId: string | null = null;
   private state: SfuConnectionState = 'idle';
+  /** Consecutive ICE failures. Reset by a join that actually connects. */
+  private connectionLossCount = 0;
 
   constructor(options: SfuClientOptions) {
     this.options = options;
@@ -251,8 +253,11 @@ export class SfuClient {
         });
       }
 
-      this.peerId = roomState.selfPeerId;
-      await this.createTransports();
+    this.peerId = roomState.selfPeerId;
+    // A join that got this far means the path worked; previous failures were
+    // transient and should not count against the next one.
+    this.connectionLossCount = 0;
+    await this.createTransports();
 
       this.setState('joined');
       this.emit('roomState', roomState);
@@ -652,8 +657,39 @@ export class SfuClient {
   private async handleConnectionLoss(): Promise<void> {
     const roomId = this.roomId;
     if (!roomId) return;
+
+    this.connectionLossCount += 1;
+
+    /**
+     * Bounded, because an unbounded rejoin is worse than a clean failure.
+     *
+     * Each attempt tears the socket down and opens a new one, and the server
+     * sees that as the peer leaving and a different peer arriving. Everyone
+     * else in the room watches someone vanish and reappear every few seconds.
+     * With two people both looping, it looks like they are taking turns being
+     * thrown out — which is exactly the symptom, and it hides the real cause.
+     *
+     * Three attempts covers a network change or a node being replaced during a
+     * deploy. Beyond that the media path is not going to establish, and saying
+     * so once is more use than trying forever.
+     */
+    if (this.connectionLossCount > 3) {
+      this.emitError(
+        new ApiError('sfu_unavailable', {
+          detail:
+            'Could not establish a media connection. Audio and video are unavailable; ' +
+            'the rest of the lesson still works.',
+        }),
+      );
+      // Deliberately not teardown(): the signalling socket stays up, so the
+      // peer list, chat and hand raise keep working without media.
+      this.setState('joined');
+      return;
+    }
+
     this.setState('reconnecting');
     this.options.nodeResolver.invalidate(roomId);
+
     try {
       await this.rejoin(roomId);
     } catch (cause) {
