@@ -1,0 +1,1 @@
+import{j as t}from"./index-67PodGp2.js";import"./react-BP_f69tf.js";function i(){return t.jsxs("section",{className:"page",children:[t.jsx("h1",{children:"Settings"}),t.jsx("p",{className:"muted",children:"This part of the product has not been built yet."})]})}export{i as default};

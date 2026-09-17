@@ -1,0 +1,1 @@
+import{j as e}from"./index-67PodGp2.js";import{L as s}from"./react-BP_f69tf.js";function t(){return e.jsxs("section",{className:"page",children:[e.jsx("h1",{children:"Page not found"}),e.jsx("p",{className:"muted",children:"That address does not lead anywhere."}),e.jsx(s,{to:"/",children:"Back to the dashboard"})]})}export{t as default};
