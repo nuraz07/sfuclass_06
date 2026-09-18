@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, useNavigate, useParams } from 'react-router-dom';
 import { useClassroom, useCore } from '@classroom/core-client';
 
@@ -25,28 +25,49 @@ export default function ClassroomPage() {
   const { session, status } = useCore();
 
   const { sfu, deviceAdapter, screenShareAdapter } = useSfuClient();
+
+  // Which dependency changed identity between renders. Each line prints only
+  // when that value is a different object than last render, so whatever is
+  // listed is what is rebuilding the client.
+  const prev = useRef({});
+  useEffect(() => {
+    const now = { sfu, deviceAdapter, screenShareAdapter, roomId, status };
+    const changed = Object.keys(now).filter((k) => prev.current[k] !== now[k]);
+    if (changed.length) console.log('[deps] changed:', changed.join(', '));
+    prev.current = now;
+  });
   const [reactions, setReactions] = useState([]);
   const [showParticipants, setShowParticipants] = useState(true);
   // A peer never consumes its own producer — the SFU has nothing to send back —
   // so the sharer's own view has to come from the local track directly.
   const [localScreenTrack, setLocalScreenTrack] = useState(null);
 
-  const classroom = useClassroom({
-    sfu,
-    deviceAdapter,
-    roomId,
-    // Nothing is attempted until there is a session; joining anonymously would
-    // only fail the socket handshake.
-    autoJoin: status === 'authenticated',
-    // Above ten people, arriving unmuted is a room full of keyboard noise.
-    startMuted: true,
-    onReaction: ({ peerId, emoji }) => {
-      const id = `${peerId}-${Date.now()}-${Math.random()}`;
-      setReactions((current) => [...current, { id, emoji }]);
-      // Ephemeral by design: the burst clears itself and never touches history.
-      setTimeout(() => setReactions((current) => current.filter((r) => r.id !== id)), 3_000);
-    },
-  });
+  // Stable identity. useClassroom's join() is a useCallback over these values,
+  // and its effect re-runs whenever join() changes — so an inline object
+  // literal rebuilt on every render makes the room leave and rejoin in a loop.
+  // The second join lands on a socket that already has a session and never
+  // gets answered, which presents as "Joining the lesson…" forever.
+  const onReaction = useCallback(({ peerId, emoji }) => {
+    const id = `${peerId}-${Date.now()}-${Math.random()}`;
+    setReactions((current) => [...current, { id, emoji }]);
+    setTimeout(() => setReactions((current) => current.filter((r) => r.id !== id)), 3_000);
+  }, []);
+
+  const classroomOptions = useMemo(
+    () => ({
+      sfu,
+      deviceAdapter,
+      roomId,
+      autoJoin: status === 'authenticated',
+      // Above ten people, arriving unmuted is a room full of keyboard noise.
+      startMuted: true,
+      startCameraOff: false,
+      onReaction,
+    }),
+    [sfu, deviceAdapter, roomId, status, onReaction],
+  );
+  const classroom = useClassroom(classroomOptions);
+
 
   const {
     status: connection,
@@ -110,7 +131,17 @@ export default function ClassroomPage() {
   if (connection === 'idle' || connection === 'resolving' || connection === 'connecting') {
     return (
       <main className="room room--pending">
-        <p>Joining the lesson…</p>
+        <p>Joining the lesson… ({connection})</p>
+        {/*
+          A join that fails leaves the state at 'connecting' rather than moving
+          to 'closed', so the error screen below never renders and the spinner
+          runs forever. Showing it here turns a hang into a message.
+        */}
+        {error && (
+          <p className="banner banner--warn">
+            {error.code}: {error.detail ?? error.message}
+          </p>
+        )}
       </main>
     );
   }

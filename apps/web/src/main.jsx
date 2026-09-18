@@ -37,7 +37,7 @@ function Loading() {
 }
 
 createRoot(document.getElementById('root')).render(
-  <StrictMode>
+  <>
     <ErrorBoundary area="app">
       <CoreProvider
         apiUrl={import.meta.env.VITE_API_URL}
@@ -76,5 +76,5 @@ createRoot(document.getElementById('root')).render(
         </BrowserRouter>
       </CoreProvider>
     </ErrorBoundary>
-  </StrictMode>,
+  </>,
 );

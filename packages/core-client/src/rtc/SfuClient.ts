@@ -471,11 +471,22 @@ export class SfuClient {
     const device = this.device;
     if (!device) throw new Error('join() must run first');
 
-    const sendInfo = await this.request<SignalingEvents.TransportCreated>(CLIENT.createTransport, {
-      direction: 'send',
-      forceRelay: false,
-    });
-    const send = device.createSendTransport(sendInfo as unknown as MediasoupTypes.TransportOptions);
+    console.log('[sfu] requesting send transport');
+    const sendInfo = await this.request<SignalingEvents.TransportCreated>(
+      CLIENT.createTransport,
+      { direction: 'send', forceRelay: false },
+    );
+    console.log(
+      '[sfu] send transport candidates:',
+      JSON.stringify((sendInfo as { iceCandidates?: unknown[] }).iceCandidates),
+    );
+    const send = device.createSendTransport(
+      sendInfo as unknown as MediasoupTypes.TransportOptions,
+    );
+    console.log(
+      '[sfu] candidates:',
+      JSON.stringify((sendInfo as { iceCandidates?: unknown[] }).iceCandidates),
+    );
     this.wireTransport(send, 'send');
     this.sendTransport = send;
 
@@ -513,6 +524,7 @@ export class SfuClient {
     }
 
     transport.on('connectionstatechange', (connectionState) => {
+      console.log('[sfu] transport', direction, connectionState);
       this.options.logger?.debug('transport', direction, connectionState);
       // 'failed' means ICE gave up: usually a network change, occasionally a
       // node that disappeared. Either way the session needs rebuilding.

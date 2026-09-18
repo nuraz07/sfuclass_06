@@ -193,7 +193,17 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
         await sfu.publishCamera(videoTrack);
       }
     } catch (cause) {
-      joinedRef.current = false;
+      // Deliberately not resetting joinedRef here.
+      //
+      // The room join and the media capture are two different things, and only
+      // the first decides whether this peer is in the room. Releasing the guard
+      // on a capture failure meant the next render called join() again on a
+      // client that already had a session — a second transport pair, a second
+      // peer from the server's point of view, and a loop that never settles.
+      //
+      // Someone who denies the camera belongs in the lesson and can watch. The
+      // error is shown; the membership stands.
+      console.error('[classroom] join failed after room entry:', cause);
       setError(
         ApiError.is(cause)
           ? cause

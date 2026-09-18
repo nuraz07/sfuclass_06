@@ -343,6 +343,20 @@ export function CoreProvider({
     }
   }, [http, csrfHeaders, nodeResolver]);
 
+  /**
+   * Stable across renders, deliberately.
+   *
+   * An inline arrow here is a new function every time the context value is
+   * rebuilt — which is on every session, status and socket change. Anything
+   * memoised against it downstream rebuilds too, and useSfuClient memoises the
+   * whole SfuClient against exactly this. The result was a client torn down and
+   * recreated on unrelated state changes, which the server sees as the peer
+   * leaving and a new one arriving.
+   *
+   * It reads a ref, so it never needs to change.
+   */
+  const getAccessToken = useCallback(() => accessTokenRef.current, []);
+
   const value = useMemo<CoreContextValue>(
     () => ({
       http,
@@ -353,11 +367,23 @@ export function CoreProvider({
       release,
       apiUrl,
       wsUrl,
-      getAccessToken: () => accessTokenRef.current,
+      getAccessToken,
       signIn,
       signOut,
     }),
-    [http, nodeResolver, chatSocket, session, status, release, apiUrl, wsUrl, signIn, signOut],
+    [
+      http,
+      nodeResolver,
+      chatSocket,
+      session,
+      status,
+      release,
+      apiUrl,
+      wsUrl,
+      getAccessToken,
+      signIn,
+      signOut,
+    ],
   );
 
   return <CoreContext.Provider value={value}>{children}</CoreContext.Provider>;
