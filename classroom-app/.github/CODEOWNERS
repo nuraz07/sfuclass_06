@@ -1,0 +1,183 @@
+# .github/CODEOWNERS — Classroom Platform v7
+#
+# One owning team per feature folder (architecture doc, section 6 "Ownership map").
+# GitHub applies the LAST matching pattern, so this file goes from general to specific.
+# Enforcement: branch protection on main with "Require review from Code Owners".
+#
+# Teams (replace the organisation slug if yours differs; every team needs write access):
+#   @classroom-platform/platform       F7  production and operations, CI/CD, core infrastructure
+#   @classroom-platform/security       cross-cutting reviewer for secrets, auth, hardening
+#   @classroom-platform/live-classroom F1  SFU, classroom, signalling, recording
+#   @classroom-platform/connectivity   F8  ICE, STUN/TURN, SFU public addressing, media regions
+#   @classroom-platform/community      F2  spaces, feeds, notifications
+#   @classroom-platform/learning       F3  courses, builder, progress, certificates
+#   @classroom-platform/media          F4  uploads, transcoding, assignments, storage
+#   @classroom-platform/clients        F5  contracts, core-client, web shell, mobile
+#   @classroom-platform/messaging      F6  chat, profiles, presence
+
+# ---------------------------------------------------------------- default
+*                                                   @classroom-platform/platform
+
+# ---------------------------------------------------------------- root and CI (F7)
+/package.json                                       @classroom-platform/platform @classroom-platform/clients
+/turbo.json                                         @classroom-platform/platform
+/.nvmrc                                             @classroom-platform/platform
+/.npmrc                                             @classroom-platform/platform @classroom-platform/security
+/.env.example                                       @classroom-platform/platform @classroom-platform/security
+/.dockerignore                                      @classroom-platform/platform
+/renovate.json                                      @classroom-platform/platform @classroom-platform/security
+/docker-compose.dev.yml                             @classroom-platform/platform
+/docker-compose.prod.yml                            @classroom-platform/platform
+/.github/                                           @classroom-platform/platform
+/.github/CODEOWNERS                                 @classroom-platform/platform @classroom-platform/security
+/.github/workflows/deploy-realtime.yml              @classroom-platform/platform @classroom-platform/live-classroom
+/.github/workflows/deploy-sfu.yml                   @classroom-platform/platform @classroom-platform/live-classroom
+/.github/workflows/deploy-turn.yml                  @classroom-platform/platform @classroom-platform/connectivity
+/.github/workflows/deploy-mobile.yml                @classroom-platform/platform @classroom-platform/clients
+/.github/workflows/deploy-web.yml                   @classroom-platform/platform @classroom-platform/clients
+
+# ---------------------------------------------------------------- shared packages (F5)
+/packages/                                          @classroom-platform/clients
+/packages/config-presets/                           @classroom-platform/platform
+/packages/contracts/src/zod/course.schema.ts        @classroom-platform/learning @classroom-platform/clients
+/packages/contracts/src/zod/community.schema.ts     @classroom-platform/community @classroom-platform/clients
+/packages/contracts/src/zod/media.schema.ts         @classroom-platform/media @classroom-platform/clients
+/packages/contracts/src/zod/assignment.schema.ts    @classroom-platform/media @classroom-platform/clients
+/packages/contracts/src/zod/chat.schema.ts          @classroom-platform/messaging @classroom-platform/clients
+/packages/contracts/src/zod/profile.schema.ts       @classroom-platform/messaging @classroom-platform/clients
+/packages/contracts/src/zod/rtc.schema.ts           @classroom-platform/connectivity @classroom-platform/clients
+/packages/contracts/src/events/signaling.events.ts  @classroom-platform/live-classroom @classroom-platform/connectivity
+/packages/contracts/src/events/community.events.ts  @classroom-platform/community
+/packages/contracts/src/events/chat.events.ts       @classroom-platform/messaging
+/packages/contracts/src/events/media.events.ts      @classroom-platform/media
+/packages/core-client/src/rtc/                      @classroom-platform/live-classroom @classroom-platform/clients
+/packages/core-client/src/rtc/IceConfigProvider.ts  @classroom-platform/connectivity
+/packages/core-client/src/rtc/IceRecovery.ts        @classroom-platform/connectivity
+/packages/core-client/src/rtc/ConnectivityProbe.ts  @classroom-platform/connectivity
+/packages/core-client/src/rtc/rtcStats.ts           @classroom-platform/connectivity
+/packages/core-client/src/api/rtcApi.ts             @classroom-platform/connectivity
+/packages/core-client/src/api/courseApi.ts          @classroom-platform/learning
+/packages/core-client/src/api/progressApi.ts        @classroom-platform/learning
+/packages/core-client/src/api/communityApi.ts       @classroom-platform/community
+/packages/core-client/src/api/mediaApi.ts           @classroom-platform/media
+/packages/core-client/src/api/chatApi.ts            @classroom-platform/messaging
+/packages/core-client/src/api/profileApi.ts         @classroom-platform/messaging
+/packages/core-client/src/state/useConnectionQuality.ts @classroom-platform/connectivity
+/packages/core-client/src/state/useChat.ts          @classroom-platform/messaging
+/packages/core-client/src/state/usePresence.ts      @classroom-platform/messaging
+/packages/core-client/src/socket/                   @classroom-platform/messaging @classroom-platform/clients
+
+# ---------------------------------------------------------------- server: operations (F7)
+/server/src/app.js                                  @classroom-platform/platform
+/server/src/server.js                               @classroom-platform/platform
+/server/src/worker.js                               @classroom-platform/platform
+/server/src/config/                                 @classroom-platform/platform
+/server/src/config/secrets.js                       @classroom-platform/platform @classroom-platform/security
+/server/src/config/security.config.js               @classroom-platform/security
+/server/src/middleware/                             @classroom-platform/platform @classroom-platform/security
+/server/src/lifecycle/                              @classroom-platform/platform
+/server/src/queues/                                 @classroom-platform/platform
+/server/src/jobs/                                   @classroom-platform/platform
+/server/src/db/                                     @classroom-platform/platform
+/server/src/security/                               @classroom-platform/security
+/server/src/observability/                          @classroom-platform/platform
+/server/Dockerfile.api                              @classroom-platform/platform
+/server/Dockerfile.worker                           @classroom-platform/platform @classroom-platform/media
+
+# ---------------------------------------------------------------- server: live classrooms (F1)
+/server/src/realtime.js                             @classroom-platform/live-classroom @classroom-platform/platform
+/server/src/sfu.js                                  @classroom-platform/live-classroom
+/server/src/mediasoup/                              @classroom-platform/live-classroom
+/server/src/sfu-node/                               @classroom-platform/live-classroom
+/server/src/classroom/                              @classroom-platform/live-classroom
+/server/src/signaling/                              @classroom-platform/live-classroom
+/server/src/capacity/                               @classroom-platform/live-classroom
+/server/src/capacity/StorageGuard.js                @classroom-platform/media
+/server/src/config/mediasoup.config.js              @classroom-platform/live-classroom
+/server/src/lifecycle/drainSfu.js                   @classroom-platform/live-classroom @classroom-platform/platform
+/server/src/routes/classroom.routes.js              @classroom-platform/live-classroom
+/server/src/routes/route-resolve.routes.js          @classroom-platform/live-classroom
+/server/Dockerfile.sfu                              @classroom-platform/live-classroom @classroom-platform/platform
+/server/Dockerfile.capture                          @classroom-platform/live-classroom @classroom-platform/media
+
+# ---------------------------------------------------------------- server: connectivity (F8)
+/server/src/rtc/                                    @classroom-platform/connectivity
+/server/src/rtc/TurnCredentialIssuer.js             @classroom-platform/connectivity @classroom-platform/security
+/server/src/rtc/TurnSecretRing.js                   @classroom-platform/connectivity @classroom-platform/security
+/server/src/rtc/OpaqueUserId.js                     @classroom-platform/connectivity @classroom-platform/security
+/server/src/config/ice.config.js                    @classroom-platform/connectivity
+/server/src/config/publicAddress.js                 @classroom-platform/connectivity @classroom-platform/live-classroom
+/server/src/mediasoup/WebRtcServerFactory.js        @classroom-platform/connectivity @classroom-platform/live-classroom
+/server/src/classroom/RoomPlacementService.js       @classroom-platform/connectivity @classroom-platform/live-classroom
+/server/src/routes/rtc.routes.js                    @classroom-platform/connectivity
+/server/src/db/migrations/011_rtc_policy.sql        @classroom-platform/connectivity @classroom-platform/platform
+/turn/                                              @classroom-platform/connectivity
+/turn/config/                                       @classroom-platform/connectivity @classroom-platform/security
+/turn/bootstrap/                                    @classroom-platform/connectivity @classroom-platform/security
+
+# ---------------------------------------------------------------- server: product domains (F2, F3, F4, F6)
+/server/src/community/                              @classroom-platform/community
+/server/src/routes/community.routes.js              @classroom-platform/community
+/server/src/courses/                                @classroom-platform/learning
+/server/src/routes/course.routes.js                 @classroom-platform/learning
+/server/src/routes/progress.routes.js               @classroom-platform/learning
+/server/src/realtime/                               @classroom-platform/messaging @classroom-platform/platform
+/server/src/realtime/collabServer.js                @classroom-platform/learning
+/server/src/scheduling/                             @classroom-platform/learning @classroom-platform/live-classroom
+/server/src/media/                                  @classroom-platform/media
+/server/src/assignments/                            @classroom-platform/media
+/server/src/routes/media.routes.js                  @classroom-platform/media
+/server/src/routes/assignment.routes.js             @classroom-platform/media
+/server/src/config/storage.config.js                @classroom-platform/media
+/server/src/mediasoup/recording/                    @classroom-platform/live-classroom @classroom-platform/media
+/server/src/messaging/                              @classroom-platform/messaging
+/server/src/routes/messaging.routes.js              @classroom-platform/messaging
+/server/src/routes/profile.routes.js                @classroom-platform/messaging
+/server/src/identity/                               @classroom-platform/clients @classroom-platform/security
+/server/src/identity/Profile.js                     @classroom-platform/messaging
+/server/src/routes/auth.routes.js                   @classroom-platform/clients @classroom-platform/security
+/server/src/billing/                                @classroom-platform/platform
+/server/src/routes/billing.routes.js                @classroom-platform/platform
+
+# ---------------------------------------------------------------- apps (F5 and feature UIs)
+/apps/                                              @classroom-platform/clients
+/apps/web/src/components/Classroom/                 @classroom-platform/live-classroom @classroom-platform/clients
+/apps/web/src/components/Classroom/NetworkCheckDialog.jsx      @classroom-platform/connectivity
+/apps/web/src/components/Classroom/ConnectionQualityBadge.jsx  @classroom-platform/connectivity
+/apps/web/src/components/Chat/                      @classroom-platform/messaging
+/apps/web/src/components/Profile/                   @classroom-platform/messaging
+/apps/web/src/components/CourseBuilder/             @classroom-platform/learning
+/apps/web/src/components/CourseViewer/              @classroom-platform/learning
+/apps/web/src/components/Community/                 @classroom-platform/community
+/apps/web/src/components/Media/                     @classroom-platform/media
+/apps/mobile/src/native/networkMonitor.ts           @classroom-platform/connectivity @classroom-platform/clients
+/apps/mobile/src/native/rtcAdapter.ts               @classroom-platform/live-classroom @classroom-platform/clients
+/apps/mobile/src/native/screenShareAdapter.ts       @classroom-platform/live-classroom @classroom-platform/clients
+
+# ---------------------------------------------------------------- infrastructure (F7, F1, F8)
+/infra/                                             @classroom-platform/platform
+/infra/core/secrets.tf                              @classroom-platform/platform @classroom-platform/security
+/infra/core/kms.tf                                  @classroom-platform/platform @classroom-platform/security
+/infra/core/iam.tf                                  @classroom-platform/platform @classroom-platform/security
+/infra/core/github-oidc.tf                          @classroom-platform/platform @classroom-platform/security
+/infra/core/waf.tf                                  @classroom-platform/platform @classroom-platform/security
+/infra/media-edge/                                  @classroom-platform/connectivity @classroom-platform/platform
+/infra/modules/sfu-node-pool/                       @classroom-platform/live-classroom @classroom-platform/platform
+/infra/modules/turn-node-pool/                      @classroom-platform/connectivity @classroom-platform/platform
+/infra/modules/node-lifecycle/                      @classroom-platform/connectivity @classroom-platform/platform
+/infra/modules/connectivity-canary/                 @classroom-platform/connectivity
+/infra/functions/                                   @classroom-platform/connectivity @classroom-platform/platform
+/infra/functions/turn-secret-rotation/              @classroom-platform/connectivity @classroom-platform/security
+/infra/functions/acme-renewer/                      @classroom-platform/connectivity @classroom-platform/security
+
+# ---------------------------------------------------------------- operations (F7)
+/ops/                                               @classroom-platform/platform
+/ops/runbooks/sfu-incident.md                       @classroom-platform/live-classroom @classroom-platform/platform
+/ops/runbooks/turn-incident.md                      @classroom-platform/connectivity @classroom-platform/platform
+/ops/runbooks/customer-firewall.md                  @classroom-platform/connectivity
+/ops/runbooks/rotate-secrets.md                     @classroom-platform/platform @classroom-platform/security
+/ops/load/sfu-soak.md                               @classroom-platform/live-classroom
+/ops/load/turn-load.md                              @classroom-platform/connectivity
+/ops/load/ice-matrix.md                             @classroom-platform/connectivity
+/ops/scripts/check-turn.sh                          @classroom-platform/connectivity
+/ops/scripts/mint-ice-credentials.js                @classroom-platform/connectivity @classroom-platform/security

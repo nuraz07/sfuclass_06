@@ -1,0 +1,278 @@
+# .github/workflows/deploy-realtime.yml
+#
+# Deploys the realtime service (server/src/realtime.js: Socket.IO signalling, chat, presence, Yjs)
+# to ECS Fargate, first to staging, then to production after approval.
+#
+# How it fits the release path (architecture doc, section 11):
+#   build-images.yml   builds the api image once per commit (Dockerfile.api is used by BOTH api and realtime),
+#                      tags it with the commit SHA, pushes to ECR and signs it with cosign (keyless).
+#   deploy-api.yml     runs the migration task, then rolls the api service.
+#   deploy-realtime    (this file) promotes the SAME image digest. It waits until the api service in the
+#                      same environment runs that digest, which guarantees migrations for this release ran.
+#
+# Required GitHub Environment variables (Settings → Environments → staging / production → Variables):
+#   AWS_REGION               control-plane region, e.g. eu-central-1
+#   AWS_DEPLOY_ROLE_ARN      role from infra/core/github-oidc.tf, trusted for this repo + environment
+#   ECS_CLUSTER              core ECS cluster name
+#   ECS_API_SERVICE          api service name        (infra/core/ecs-api.tf)
+#   ECS_REALTIME_SERVICE     realtime service name   (infra/core/ecs-realtime.tf)
+#   ECR_REPO_API             ECR repository of the api image, e.g. classroom/api
+#   REALTIME_HEALTH_URL      public health endpoint routed to the realtime target group,
+#                            e.g. https://ws.example.com/healthz  (payload contains "release": "<sha>")
+# Protection: "production" requires reviewers; both environments restrict deployments to main.
+#
+# Contract with infra/core/ecs-realtime.tf:
+#   deployment_circuit_breaker { enable = true, rollback = true }, minimum_healthy_percent = 100,
+#   maximum_percent = 200, lifecycle { ignore_changes = [task_definition] } so this workflow owns the image.
+
+name: deploy-realtime
+
+on:
+  workflow_run:
+    workflows: ["build-images"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA whose images were built by build-images (redeploy or rollback)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-realtime
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve release
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Validate commit SHA
+        id: sha
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          sha="${INPUT_SHA:-$RUN_SHA}"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected a full 40-character commit SHA, got '$sha'"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy realtime (${{ matrix.environment }})
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      # Environments run strictly in order; a staging failure cancels production.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        environment: [staging, production]
+    environment:
+      name: ${{ matrix.environment }}
+      url: ${{ vars.REALTIME_HEALTH_URL }}
+    env:
+      SHA: ${{ needs.resolve.outputs.sha }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_API_SERVICE: ${{ vars.ECS_API_SERVICE }}
+      ECS_REALTIME_SERVICE: ${{ vars.ECS_REALTIME_SERVICE }}
+      ECR_REPO_API: ${{ vars.ECR_REPO_API || 'classroom/api' }}
+      REALTIME_HEALTH_URL: ${{ vars.REALTIME_HEALTH_URL }}
+    steps:
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: deploy-realtime-${{ matrix.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Resolve image digest for this commit
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          digest="$(aws ecr describe-images \
+            --repository-name "$ECR_REPO_API" \
+            --image-ids imageTag="$SHA" \
+            --query 'imageDetails[0].imageDigest' --output text)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No image tagged $SHA in $ECR_REPO_API"
+            exit 1
+          fi
+          {
+            echo "repo_uri=$REGISTRY/$ECR_REPO_API"
+            echo "digest=$digest"
+            echo "image=$REGISTRY/$ECR_REPO_API@$digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify image signature (signed by build-images on main)
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          SIGNER: https://github.com/${{ github.repository }}/.github/workflows/build-images.yml@refs/heads/main
+        run: |
+          cosign verify "$IMAGE" \
+            --certificate-identity "$SIGNER" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            > /dev/null
+          echo "Signature verified for $IMAGE"
+
+      - name: Wait until api runs this release (migrations applied)
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 45 * 60 ))
+          while :; do
+            read -r td rollout < <(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" --services "$ECS_API_SERVICE" \
+              --query "services[0].deployments[?status=='PRIMARY'] | [0].[taskDefinition, rolloutState]" \
+              --output text)
+            images="$(aws ecs describe-task-definition --task-definition "$td" \
+              --query 'taskDefinition.containerDefinitions[].image' --output text)"
+            if [[ "$images" == *"@$DIGEST"* && "$rollout" == "COMPLETED" ]]; then
+              echo "api service runs $DIGEST (rollout $rollout)"
+              break
+            fi
+            if (( $(date +%s) > deadline )); then
+              echo "::error::api did not reach this release within 45 minutes (current: $td, $rollout). Deploy api first."
+              exit 1
+            fi
+            echo "Waiting for api rollout ... ($rollout, $td)"
+            sleep 30
+          done
+
+      - name: Register task definition with the new image
+        id: taskdef
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          REPO_URI: ${{ steps.image.outputs.repo_uri }}
+        run: |
+          set -euo pipefail
+          current="$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_REALTIME_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          echo "previous=$current" >> "$GITHUB_OUTPUT"
+
+          aws ecs describe-task-definition --task-definition "$current" --include TAGS > current.json
+
+          # Replace only containers built from the api repository (realtime); sidecars keep their images.
+          jq --arg repo "$REPO_URI" --arg image "$IMAGE" --arg sha "$SHA" '
+            .taskDefinition
+            | .containerDefinitions |= map(
+                if (.image | startswith($repo + "@") or startswith($repo + ":")) then
+                  .image = $image
+                  | .environment = ((.environment // [])
+                      | map(select(.name != "RELEASE_SHA"))
+                      + [{ "name": "RELEASE_SHA", "value": $sha }])
+                else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+                  .registeredAt, .registeredBy, .deregisteredAt)
+          ' current.json > next.json
+          jq --slurpfile cur current.json \
+            'if (($cur[0].tags // []) | length) > 0 then . + { tags: $cur[0].tags } else . end' \
+            next.json > register.json
+
+          jq -e --arg image "$IMAGE" '[.containerDefinitions[] | select(.image == $image)] | length > 0' \
+            register.json > /dev/null || { echo "::error::No container in $current uses $REPO_URI"; exit 1; }
+
+          next_arn="$(aws ecs register-task-definition --cli-input-json file://register.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)"
+          echo "next=$next_arn" >> "$GITHUB_OUTPUT"
+          echo "Registered $next_arn (previous $current)"
+
+      - name: Roll the realtime service
+        env:
+          NEXT_TD: ${{ steps.taskdef.outputs.next }}
+        run: |
+          set -euo pipefail
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_REALTIME_SERVICE" \
+            --task-definition "$NEXT_TD" > /dev/null
+
+          # Long-lived sockets drain through gracefulShutdown + ALB deregistration delay,
+          # so rollouts take longer than the default ECS waiter allows.
+          deadline=$(( $(date +%s) + 30 * 60 ))
+          while :; do
+            read -r td rollout reason < <(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" --services "$ECS_REALTIME_SERVICE" \
+              --query "services[0].deployments[?status=='PRIMARY'] | [0].[taskDefinition, rolloutState, rolloutStateReason]" \
+              --output text)
+            if [[ "$td" != "$NEXT_TD" ]]; then
+              echo "::error::Circuit breaker rolled back to $td: $reason"
+              exit 1
+            fi
+            case "$rollout" in
+              COMPLETED) echo "Rollout completed"; break ;;
+              FAILED)    echo "::error::Rollout failed: $reason"; exit 1 ;;
+            esac
+            if (( $(date +%s) > deadline )); then
+              echo "::error::Rollout did not complete within 30 minutes"
+              exit 1
+            fi
+            echo "Rollout $rollout ..."
+            sleep 20
+          done
+
+      - name: Verify release through the load balancer
+        run: |
+          set -euo pipefail
+          # Several samples so every healthy target behind the ALB is likely to answer at least once.
+          for i in $(seq 1 10); do
+            release="$(curl -fsS --max-time 5 "$REALTIME_HEALTH_URL" | jq -r '.release // empty')"
+            if [[ "$release" != "$SHA" ]]; then
+              echo "::error::Sample $i answered release '$release', expected $SHA"
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "All samples report release $SHA"
+
+      - name: Roll back to the previous task definition
+        if: failure() && steps.taskdef.outputs.previous != ''
+        env:
+          PREVIOUS_TD: ${{ steps.taskdef.outputs.previous }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Rolling $ECS_REALTIME_SERVICE back to $PREVIOUS_TD"
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_REALTIME_SERVICE" \
+            --task-definition "$PREVIOUS_TD" > /dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_REALTIME_SERVICE" || true
+
+      - name: Summary
+        if: always()
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          NEXT_TD: ${{ steps.taskdef.outputs.next }}
+          PREVIOUS_TD: ${{ steps.taskdef.outputs.previous }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### realtime → $ENVIRONMENT: $JOB_STATUS"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`$SHA\` |"
+            echo "| Image | \`${IMAGE:-n/a}\` |"
+            echo "| Task definition | \`${NEXT_TD:-n/a}\` |"
+            echo "| Previous | \`${PREVIOUS_TD:-n/a}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

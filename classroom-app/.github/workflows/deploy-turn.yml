@@ -1,0 +1,534 @@
+# .github/workflows/deploy-turn.yml
+#
+# Deploys the STUN/TURN service (turn/: coturn + agent sidecar) to every media region,
+# staging first, then production region by region. Live relay allocations are never cut:
+# each region is switched blue/green and the old colour is drained by allocations.
+#
+# Per region and environment:
+#   1. Resolve the signed turn image (built once by build-images.yml, replicated to the region by ECR).
+#   2. Scale the idle colour (turn-blue | turn-green) to the active node count with the new image.
+#      The capacity provider launches instances; the node-lifecycle Lambda attaches EIPs and DNS;
+#      the agent heartbeats into the TURN registry, so TurnPoolSelector starts handing the new nodes out.
+#   3. Soak: all tasks HEALTHY (agent selfProbe = real STUN binding + TURN allocation) and the regional
+#      Synthetics canary alarm stays OK.
+#   4. Drain the old colour: agents leave the registry (no new credentials point at them) and the
+#      workflow waits until their allocations reach zero or TURN_DRAIN_TIMEOUT_MIN (max lesson length).
+#   5. Scale the old colour to 0. Managed scaling removes the empty instances; the terminate lifecycle
+#      hook releases their EIPs back to the pool.
+#
+# Triggers:
+#   workflow_run     after build-images succeeds on main; a region is skipped when turn/ did not change
+#                    since the release it currently runs.
+#   workflow_dispatch  manual release, rollback (older sha) or node refresh (sha empty = keep image).
+#   repository_dispatch (type: turn-node-refresh) from infra/functions/turn-secret-rotation and
+#                    infra/functions/acme-renewer: refresh every node with the image it already runs, so
+#                    nodes re-read the TURN secret ring / TLS certificate (rotation phases 1 and 3).
+#
+# Repository variables (Settings → Variables → Repository):
+#   MEDIA_REGIONS_STAGING      JSON array, e.g. ["eu-central-1"]
+#   MEDIA_REGIONS_PRODUCTION   JSON array, e.g. ["eu-central-1","us-east-1","ap-southeast-1"]
+# Environment variables (staging / production):
+#   AWS_DEPLOY_ROLE_ARN        role from infra/core/github-oidc.tf; MaxSessionDuration >= 6 h
+#   MEDIA_CLUSTER_PREFIX       cluster per region is "<prefix>-<region>", e.g. classroom-prod-media
+#   TURN_SERVICE_BASENAME      services are "<base>-blue" and "<base>-green" (default: turn)
+#   ECR_REPO_TURN              default: classroom/turn
+#   TURN_CANARY_ALARM_PREFIX   canary alarm per region is "<prefix>-<region>" (modules/connectivity-canary)
+#   TURN_MIN_NODES             node count for a first deployment (default: 2, two AZs)
+#   TURN_DRAIN_TIMEOUT_MIN     upper bound for draining allocations (default: 240)
+#   TURN_AGENT_PORT            agent control port on 127.0.0.1 (default: 8080)
+#
+# Contracts this workflow relies on:
+#   modules/turn-node-pool     two ECS services per region (<base>-blue, <base>-green), exactly one with
+#                              desired_count > 0, lifecycle { ignore_changes = [task_definition, desired_count] },
+#                              capacity provider with managed scaling and managed draining DISABLED (drain is
+#                              owned by the agent), one task per instance (distinctInstance), container
+#                              healthCheck on the agent's /healthz (tasks must reach HEALTHY), instance role
+#                              includes AmazonSSMManagedInstanceCore.
+#   turn/agent/src/healthServer.js + drain.js, bound to 127.0.0.1:${TURN_AGENT_PORT}:
+#                              POST /drain         stop heartbeating, keep serving existing allocations
+#                              GET  /drain/status  {"draining": true|false, "allocations": <int>}
+#   Deploy role permissions: ecs:Describe*/List*/UpdateService/RegisterTaskDefinition, iam:PassRole
+#                              (task + execution roles), ecr:Describe*/BatchGet*/GetAuthorizationToken,
+#                              ssm:SendCommand (AWS-RunShellScript, tagged TURN instances only),
+#                              ssm:GetCommandInvocation, cloudwatch:DescribeAlarms.
+
+name: deploy-turn
+
+on:
+  workflow_run:
+    workflows: ["build-images"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA to deploy. Empty = refresh nodes with the image each region already runs."
+        required: false
+        type: string
+        default: ""
+      reason:
+        description: "Why this run happens (recorded in the summary)"
+        required: true
+        type: choice
+        options: [release, rollback, secret-rotation, tls-renewal, config-refresh]
+        default: release
+      allow_unhealthy_region:
+        description: "Deploy even if the region's TURN canary is already in ALARM (incident fix-forward)"
+        required: false
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [turn-node-refresh]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  plan:
+    name: Plan regions
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      reason: ${{ steps.plan.outputs.reason }}
+      force: ${{ steps.plan.outputs.force }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Build release plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_REASON: ${{ inputs.reason }}
+          DISPATCH_REASON: ${{ github.event.client_payload.reason }}
+          STAGING: ${{ vars.MEDIA_REGIONS_STAGING || '[]' }}
+          PRODUCTION: ${{ vars.MEDIA_REGIONS_PRODUCTION || '[]' }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            workflow_run)        sha="$RUN_SHA";   reason="release";                          force=false ;;
+            workflow_dispatch)   sha="$INPUT_SHA"; reason="$INPUT_REASON";                    force=true  ;;
+            repository_dispatch) sha="";           reason="${DISPATCH_REASON:-config-refresh}"; force=true ;;
+          esac
+          if [[ -n "$sha" && ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected a full 40-character commit SHA, got '$sha'"; exit 1
+          fi
+          if [[ "$reason" == "release" && -z "$sha" ]]; then
+            echo "::error::A release needs a commit SHA"; exit 1
+          fi
+          # Ordered legs: all staging regions first, then production regions one by one.
+          matrix="$(jq -cn --argjson s "$STAGING" --argjson p "$PRODUCTION" '
+            [ ($s[] | {environment: "staging",    region: .}),
+              ($p[] | {environment: "production", region: .}) ]')"
+          if [[ "$matrix" == "[]" ]]; then
+            echo "::error::MEDIA_REGIONS_STAGING and MEDIA_REGIONS_PRODUCTION are both empty"; exit 1
+          fi
+          {
+            echo "sha=$sha"
+            echo "reason=$reason"
+            echo "force=$force"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+          echo "Plan: $reason ${sha:-(keep running image)} → $matrix"
+
+  deploy:
+    name: TURN ${{ matrix.environment }} / ${{ matrix.region }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    # Drain can take up to TURN_DRAIN_TIMEOUT_MIN (240) plus scale-up and soak.
+    timeout-minutes: 330
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    environment:
+      name: ${{ matrix.environment }}
+    concurrency:
+      group: deploy-turn-${{ matrix.environment }}-${{ matrix.region }}
+      cancel-in-progress: false
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+      REASON: ${{ needs.plan.outputs.reason }}
+      FORCE: ${{ needs.plan.outputs.force }}
+      EVENT: ${{ github.event_name }}
+      REGION: ${{ matrix.region }}
+      AWS_REGION: ${{ matrix.region }}
+      CLUSTER: ${{ vars.MEDIA_CLUSTER_PREFIX }}-${{ matrix.region }}
+      SERVICE_BASE: ${{ vars.TURN_SERVICE_BASENAME || 'turn' }}
+      ECR_REPO_TURN: ${{ vars.ECR_REPO_TURN || 'classroom/turn' }}
+      CANARY_ALARM: ${{ vars.TURN_CANARY_ALARM_PREFIX }}-${{ matrix.region }}
+      MIN_NODES: ${{ vars.TURN_MIN_NODES || '2' }}
+      DRAIN_TIMEOUT_MIN: ${{ vars.TURN_DRAIN_TIMEOUT_MIN || '240' }}
+      AGENT_PORT: ${{ vars.TURN_AGENT_PORT || '8080' }}
+      ALLOW_UNHEALTHY: ${{ inputs.allow_unhealthy_region || false }}
+    steps:
+      - name: Check out (history needed to detect changes in turn/)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (OIDC, 6 h session for long drains)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: deploy-turn-${{ matrix.environment }}-${{ github.run_id }}
+          role-duration-seconds: 21600
+          aws-region: ${{ matrix.region }}
+
+      - name: Log in to Amazon ECR (regional replica)
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Write shared shell helpers
+        run: |
+          cat > "$RUNNER_TEMP/turn-lib.sh" <<'LIB'
+          set -euo pipefail
+
+          # EC2 instance ids behind the RUNNING tasks of a service.
+          service_instances() {
+            local svc="$1" tasks ci
+            mapfile -t tasks < <(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$svc" \
+              --desired-status RUNNING --query 'taskArns[]' --output text | tr '\t' '\n' | sed '/^$/d;/^None$/d')
+            (( ${#tasks[@]} )) || return 0
+            mapfile -t ci < <(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "${tasks[@]}" \
+              --query 'tasks[].containerInstanceArn' --output text | tr '\t' '\n' | sed '/^$/d;/^None$/d')
+            (( ${#ci[@]} )) || return 0
+            aws ecs describe-container-instances --cluster "$CLUSTER" --container-instances "${ci[@]}" \
+              --query 'containerInstances[].ec2InstanceId' --output text | tr '\t' '\n' | sed '/^$/d'
+          }
+
+          # Run one shell command on instances via SSM; prints "<instance-id><TAB><stdout>" per instance.
+          ssm_run() {
+            local cmd="$1"; shift
+            local ids=("$@") command_id status out
+            (( ${#ids[@]} )) || return 0
+            command_id="$(aws ssm send-command --document-name AWS-RunShellScript \
+              --instance-ids "${ids[@]}" --timeout-seconds 60 \
+              --comment "deploy-turn run ${GITHUB_RUN_ID}" \
+              --parameters "$(jq -cn --arg c "$cmd" '{commands: [$c]}')" \
+              --query 'Command.CommandId' --output text)"
+            for id in "${ids[@]}"; do
+              status="Pending"
+              for _ in $(seq 1 45); do
+                status="$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$id" \
+                  --query Status --output text 2>/dev/null || echo Pending)"
+                case "$status" in Success|Failed|Cancelled|TimedOut) break ;; esac
+                sleep 2
+              done
+              if [[ "$status" != "Success" ]]; then
+                echo "::error::SSM command on $id ended with $status" >&2
+                return 1
+              fi
+              out="$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$id" \
+                --query StandardOutputContent --output text)"
+              printf '%s\t%s\n' "$id" "$(tr -d '\n' <<<"$out")"
+            done
+          }
+
+          # Wait until a service has settled at its desired count; with desired > 0 all tasks must be HEALTHY.
+          wait_service() {
+            local svc="$1" minutes="$2" deadline running desired rollout unhealthy tasks
+            deadline=$(( $(date +%s) + minutes * 60 ))
+            while :; do
+              read -r running desired rollout < <(aws ecs describe-services --cluster "$CLUSTER" --services "$svc" \
+                --query "services[0].[runningCount, desiredCount, deployments[?status=='PRIMARY'] | [0].rolloutState]" \
+                --output text)
+              if [[ "$rollout" == "FAILED" ]]; then
+                echo "::error::$svc rollout FAILED"; return 1
+              fi
+              if [[ "$running" == "$desired" && "$rollout" == "COMPLETED" ]]; then
+                if (( desired == 0 )); then return 0; fi
+                mapfile -t tasks < <(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$svc" \
+                  --desired-status RUNNING --query 'taskArns[]' --output text | tr '\t' '\n' | sed '/^$/d;/^None$/d')
+                unhealthy="$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "${tasks[@]}" \
+                  --query "length(tasks[?healthStatus!='HEALTHY'])" --output text)"
+                if [[ "$unhealthy" == "0" ]]; then return 0; fi
+                echo "$svc: $unhealthy task(s) not HEALTHY yet"
+              else
+                echo "$svc: running $running / desired $desired, rollout $rollout"
+              fi
+              if (( $(date +%s) > deadline )); then
+                echo "::error::$svc did not settle within $minutes minutes"; return 1
+              fi
+              sleep 20
+            done
+          }
+
+          alarm_state() {
+            aws cloudwatch describe-alarms --alarm-names "$CANARY_ALARM" \
+              --query 'MetricAlarms[0].StateValue' --output text 2>/dev/null || echo None
+          }
+          LIB
+
+      - name: Discover active and idle colour
+        id: colour
+        run: |
+          source "$RUNNER_TEMP/turn-lib.sh"
+          blue="$SERVICE_BASE-blue"; green="$SERVICE_BASE-green"
+          read -r blue_desired blue_td < <(aws ecs describe-services --cluster "$CLUSTER" --services "$blue" \
+            --query 'services[0].[desiredCount, taskDefinition]' --output text)
+          read -r green_desired green_td < <(aws ecs describe-services --cluster "$CLUSTER" --services "$green" \
+            --query 'services[0].[desiredCount, taskDefinition]' --output text)
+          if [[ "$blue_td" == "None" || "$green_td" == "None" ]]; then
+            echo "::error::Services $blue and $green must both exist in $CLUSTER (modules/turn-node-pool)"; exit 1
+          fi
+          if (( blue_desired > 0 && green_desired > 0 )); then
+            echo "::error::Both colours are scaled up: a previous run did not finish. Follow ops/runbooks/turn-incident.md (section: interrupted deployment)."
+            exit 1
+          fi
+          if (( blue_desired > 0 )); then
+            active="$blue"; active_td="$blue_td"; target="$green"; target_td="$green_td"; count="$blue_desired"
+          elif (( green_desired > 0 )); then
+            active="$green"; active_td="$green_td"; target="$blue"; target_td="$blue_td"; count="$green_desired"
+          else
+            active=""; active_td=""; target="$blue"; target_td="$blue_td"; count="$MIN_NODES"
+            echo "::notice::No active colour in $REGION: first deployment with $count node(s)"
+          fi
+          deployed_sha=""
+          if [[ -n "$active_td" ]]; then
+            deployed_sha="$(aws ecs describe-task-definition --task-definition "$active_td" \
+              --query "taskDefinition.containerDefinitions[].environment[?name=='RELEASE_SHA'].value | [] | [0]" \
+              --output text)"
+            [[ "$deployed_sha" == "None" ]] && deployed_sha=""
+          fi
+          {
+            echo "active=$active"; echo "active_td=$active_td"
+            echo "target=$target"; echo "target_td=$target_td"
+            echo "count=$count";   echo "deployed_sha=$deployed_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Active: ${active:-none} ($active_td, release ${deployed_sha:-unknown}) → target: $target, $count node(s)"
+
+      - name: Decide whether this region needs a deployment
+        id: decide
+        env:
+          DEPLOYED_SHA: ${{ steps.colour.outputs.deployed_sha }}
+        run: |
+          set -euo pipefail
+          skip=false
+          if [[ "$EVENT" == "workflow_run" && "$FORCE" != "true" && -n "$DEPLOYED_SHA" ]] \
+             && git cat-file -e "$DEPLOYED_SHA^{commit}" 2>/dev/null \
+             && git diff --quiet "$DEPLOYED_SHA" "$SHA" -- turn/; then
+            skip=true
+            echo "::notice::turn/ unchanged since $DEPLOYED_SHA; $REGION keeps its nodes"
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve image
+        id: image
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ACTIVE_TD: ${{ steps.colour.outputs.active_td }}
+          DEPLOYED_SHA: ${{ steps.colour.outputs.deployed_sha }}
+        run: |
+          set -euo pipefail
+          repo_uri="$REGISTRY/$ECR_REPO_TURN"
+          if [[ -n "$SHA" ]]; then
+            release="$SHA"
+            # ECR cross-region replication is asynchronous: wait up to 10 minutes for the replica.
+            digest=""
+            for _ in $(seq 1 40); do
+              digest="$(aws ecr describe-images --repository-name "$ECR_REPO_TURN" --image-ids imageTag="$SHA" \
+                --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] && break
+              echo "Waiting for $ECR_REPO_TURN:$SHA to replicate to $REGION ..."
+              sleep 15
+            done
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$ECR_REPO_TURN:$SHA not in $REGION"; exit 1; }
+            image="$repo_uri@$digest"
+          else
+            # Node refresh: keep exactly the image the active colour runs.
+            [[ -n "$ACTIVE_TD" ]] || { echo "::error::Refresh requested but $REGION has no active TURN colour"; exit 1; }
+            release="$DEPLOYED_SHA"
+            image="$(aws ecs describe-task-definition --task-definition "$ACTIVE_TD" --output json \
+              | jq -r --arg repo "$repo_uri" '[.taskDefinition.containerDefinitions[].image
+                  | select(startswith($repo + "@"))][0] // empty')"
+            [[ -n "$image" ]] || { echo "::error::Active task definition has no digest-pinned $repo_uri image"; exit 1; }
+          fi
+          {
+            echo "repo_uri=$repo_uri"; echo "image=$image"; echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+          echo "Image: $image (release ${release:-unknown})"
+
+      - name: Verify image signature (signed by build-images on main)
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          SIGNER: https://github.com/${{ github.repository }}/.github/workflows/build-images.yml@refs/heads/main
+        run: |
+          cosign verify "$IMAGE" \
+            --certificate-identity "$SIGNER" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          echo "Signature verified for $IMAGE"
+
+      - name: Pre-check regional TURN canary
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          source "$RUNNER_TEMP/turn-lib.sh"
+          state="$(alarm_state)"
+          echo "Canary $CANARY_ALARM: $state"
+          if [[ "$state" == "ALARM" && "$ALLOW_UNHEALTHY" != "true" ]]; then
+            echo "::error::$REGION TURN canary is already in ALARM. Investigate first or re-run with allow_unhealthy_region."
+            exit 1
+          fi
+
+      - name: Register task definition for the idle colour
+        id: taskdef
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          TARGET_TD: ${{ steps.colour.outputs.target_td }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          REPO_URI: ${{ steps.image.outputs.repo_uri }}
+          RELEASE: ${{ steps.image.outputs.release }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$TARGET_TD" --include TAGS > current.json
+          # coturn and the agent both run from the turn image; other sidecars keep their images.
+          jq --arg repo "$REPO_URI" --arg image "$IMAGE" --arg release "$RELEASE" --arg reason "$REASON" '
+            .taskDefinition
+            | .containerDefinitions |= map(
+                if (.image | startswith($repo + "@") or startswith($repo + ":")) then
+                  .image = $image
+                  | .environment = ((.environment // [])
+                      | map(select(.name != "RELEASE_SHA" and .name != "DEPLOY_REASON"))
+                      + [{ "name": "RELEASE_SHA", "value": $release },
+                         { "name": "DEPLOY_REASON", "value": $reason }])
+                else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+                  .registeredAt, .registeredBy, .deregisteredAt)
+          ' current.json > next.json
+          jq --slurpfile cur current.json \
+            'if (($cur[0].tags // []) | length) > 0 then . + { tags: $cur[0].tags } else . end' \
+            next.json > register.json
+          jq -e --arg image "$IMAGE" '[.containerDefinitions[] | select(.image == $image)] | length > 0' \
+            register.json > /dev/null || { echo "::error::No container in $TARGET_TD uses $REPO_URI"; exit 1; }
+          arn="$(aws ecs register-task-definition --cli-input-json file://register.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)"
+          echo "next=$arn" >> "$GITHUB_OUTPUT"
+          echo "Registered $arn"
+
+      - name: Scale up the idle colour
+        id: scaleup
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          TARGET: ${{ steps.colour.outputs.target }}
+          COUNT: ${{ steps.colour.outputs.count }}
+          NEXT_TD: ${{ steps.taskdef.outputs.next }}
+        run: |
+          source "$RUNNER_TEMP/turn-lib.sh"
+          aws ecs update-service --cluster "$CLUSTER" --service "$TARGET" \
+            --task-definition "$NEXT_TD" --desired-count "$COUNT" > /dev/null
+          echo "started=true" >> "$GITHUB_OUTPUT"
+          # Capacity provider launches instances, lifecycle Lambda attaches EIPs, agents must pass selfProbe.
+          wait_service "$TARGET" 30
+
+      - name: Soak new nodes against the canary
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          source "$RUNNER_TEMP/turn-lib.sh"
+          # Canary period is 1 minute; three periods with the new nodes in the pool.
+          sleep 180
+          state="$(alarm_state)"
+          echo "Canary $CANARY_ALARM after soak: $state"
+          if [[ "$state" == "ALARM" ]]; then
+            echo "::error::TURN canary in ALARM after new nodes joined $REGION"; exit 1
+          fi
+
+      - name: Roll back the idle colour (old nodes untouched)
+        if: >-
+          failure() &&
+          steps.scaleup.outputs.started == 'true' &&
+          steps.colour.outputs.active != ''
+        env:
+          TARGET: ${{ steps.colour.outputs.target }}
+        run: |
+          source "$RUNNER_TEMP/turn-lib.sh"
+          echo "::warning::Scaling $TARGET back to 0; ${REGION} keeps serving from the previous colour"
+          aws ecs update-service --cluster "$CLUSTER" --service "$TARGET" --desired-count 0 > /dev/null
+          wait_service "$TARGET" 20 || true
+
+      - name: Drain the old colour
+        id: drain
+        if: steps.decide.outputs.skip != 'true' && steps.colour.outputs.active != ''
+        env:
+          ACTIVE: ${{ steps.colour.outputs.active }}
+        run: |
+          source "$RUNNER_TEMP/turn-lib.sh"
+          mapfile -t ids < <(service_instances "$ACTIVE")
+          if (( ${#ids[@]} == 0 )); then
+            echo "No running $ACTIVE nodes to drain"; exit 0
+          fi
+          echo "Draining ${#ids[@]} node(s): ${ids[*]}"
+          ssm_run "curl -fsS --max-time 5 -X POST http://127.0.0.1:${AGENT_PORT}/drain" "${ids[@]}" > /dev/null
+
+          deadline=$(( $(date +%s) + DRAIN_TIMEOUT_MIN * 60 ))
+          while :; do
+            total=0
+            if ! status_out="$(ssm_run "curl -fsS --max-time 5 http://127.0.0.1:${AGENT_PORT}/drain/status" "${ids[@]}")"; then
+              echo "::warning::Could not read drain status from every node; retrying"
+              if (( $(date +%s) > deadline )); then
+                echo "drained=timeout" >> "$GITHUB_OUTPUT"; break
+              fi
+              sleep 60; continue
+            fi
+            while IFS=$'\t' read -r id body; do
+              # An unreadable status never counts as drained.
+              n="$(jq -er '.allocations | numbers' <<<"$body" 2>/dev/null)" || n=1
+              echo "  $id: $n"
+              total=$(( total + n ))
+            done <<<"$status_out"
+            echo "$(date -u +%H:%M:%S) active allocations on $ACTIVE: $total"
+            if (( total == 0 )); then
+              echo "drained=complete" >> "$GITHUB_OUTPUT"; break
+            fi
+            if (( $(date +%s) > deadline )); then
+              echo "::warning::Drain timeout (${DRAIN_TIMEOUT_MIN} min) reached with $total allocation(s) left; those clients restart ICE onto the new nodes."
+              echo "drained=timeout" >> "$GITHUB_OUTPUT"; break
+            fi
+            sleep 60
+          done
+
+      - name: Retire the old colour
+        if: steps.decide.outputs.skip != 'true' && steps.colour.outputs.active != ''
+        env:
+          ACTIVE: ${{ steps.colour.outputs.active }}
+        run: |
+          source "$RUNNER_TEMP/turn-lib.sh"
+          aws ecs update-service --cluster "$CLUSTER" --service "$ACTIVE" --desired-count 0 > /dev/null
+          wait_service "$ACTIVE" 20
+          echo "$ACTIVE scaled to 0; managed scaling removes its instances and the lifecycle hook releases the EIPs"
+
+      - name: Summary
+        if: always()
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          SKIPPED: ${{ steps.decide.outputs.skip }}
+          ACTIVE: ${{ steps.colour.outputs.active }}
+          TARGET: ${{ steps.colour.outputs.target }}
+          COUNT: ${{ steps.colour.outputs.count }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          NEXT_TD: ${{ steps.taskdef.outputs.next }}
+          DRAINED: ${{ steps.drain.outputs.drained }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### TURN $ENVIRONMENT / $REGION: $JOB_STATUS"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Reason | $REASON |"
+            echo "| Skipped (turn/ unchanged) | ${SKIPPED:-false} |"
+            echo "| Colour switch | ${ACTIVE:-none} → ${TARGET:-n/a} ($COUNT node(s)) |"
+            echo "| Image | \`${IMAGE:-n/a}\` |"
+            echo "| Task definition | \`${NEXT_TD:-n/a}\` |"
+            echo "| Drain | ${DRAINED:-n/a} |"
+          } >> "$GITHUB_STEP_SUMMARY"

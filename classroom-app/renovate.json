@@ -1,0 +1,138 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Classroom Platform v7 dependency policy. Owned by @classroom-platform/platform (see .github/CODEOWNERS).",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+    ":separateMultipleMajorReleases"
+  ],
+  "timezone": "Europe/Berlin",
+  "schedule": ["after 10pm every weekday", "before 6am every weekday", "every weekend"],
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 4,
+  "rebaseWhen": "conflicted",
+  "postUpdateOptions": ["npmDedupe"],
+  "dependencyDashboard": true,
+  "dependencyDashboardTitle": "Dependency Dashboard — classroom-app",
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "dependencies"],
+    "minimumReleaseAge": null,
+    "schedule": ["at any time"]
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Majors never land silently: they need an explicit approval on the Dependency Dashboard.",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "labels": ["dependencies", "major"]
+    },
+    {
+      "description": "Node.js stays on the 22 LTS line everywhere: .nvmrc, Dockerfiles and engines.",
+      "matchDepNames": ["node"],
+      "allowedVersions": "/^22(\\.|-|$)/"
+    },
+    {
+      "description": "Base images are pinned by digest; digest refreshes are grouped per week.",
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "groupName": "container base image digests",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "coturn (turn/Dockerfile) is the relay for every restricted network. Manual approval, staging soak, deployed by deploy-turn.yml.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["coturn/coturn"],
+      "dependencyDashboardApproval": true,
+      "automerge": false,
+      "minimumReleaseAge": "14 days",
+      "labels": ["dependencies", "area/turn", "needs-staging-soak"]
+    },
+    {
+      "description": "mediasoup server and client must move together; the SFU is drained on deploy, so no automerge.",
+      "matchPackageNames": ["mediasoup", "mediasoup-client"],
+      "groupName": "mediasoup",
+      "automerge": false,
+      "minimumReleaseAge": "7 days",
+      "labels": ["dependencies", "area/sfu"]
+    },
+    {
+      "description": "WebRTC on mobile follows the Expo SDK cadence, never ahead of it.",
+      "matchPackageNames": ["react-native-webrtc", "@config-plugins/react-native-webrtc"],
+      "groupName": "react-native-webrtc",
+      "automerge": false,
+      "labels": ["dependencies", "area/mobile"]
+    },
+    {
+      "description": "Expo SDK packages are upgraded together (npx expo install --fix); react-native itself is driven by the SDK.",
+      "matchPackageNames": ["expo", "/^expo-/", "/^@expo\\//", "react-native"],
+      "groupName": "expo sdk",
+      "automerge": false,
+      "labels": ["dependencies", "area/mobile"]
+    },
+    {
+      "description": "Socket.IO server, client and Redis adapters are protocol-coupled.",
+      "matchPackageNames": ["socket.io", "socket.io-client", "/^@socket\\.io\\//"],
+      "groupName": "socket.io",
+      "labels": ["dependencies", "area/realtime"]
+    },
+    {
+      "description": "Yjs document model and its providers are wire-compatible only as a set.",
+      "matchPackageNames": ["yjs", "/^y-/"],
+      "groupName": "yjs"
+    },
+    {
+      "description": "AWS SDK v3 clients in one PR per week.",
+      "matchPackageNames": ["/^@aws-sdk\\//", "/^@smithy\\//"],
+      "groupName": "aws sdk",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "OpenTelemetry packages are released in lockstep.",
+      "matchPackageNames": ["/^@opentelemetry\\//"],
+      "groupName": "opentelemetry"
+    },
+    {
+      "description": "Security-relevant runtime libraries: no automerge, security review label.",
+      "matchPackageNames": ["jose", "helmet", "stripe", "bullmq", "ioredis", "pg", "zod"],
+      "automerge": false,
+      "labels": ["dependencies", "security-review"]
+    },
+    {
+      "description": "Terraform providers and modules for core and media-edge stacks, planned per region by terraform.yml.",
+      "matchManagers": ["terraform"],
+      "groupName": "terraform",
+      "labels": ["dependencies", "area/infra"]
+    },
+    {
+      "description": "GitHub Actions are pinned by digest; minor and patch bumps merge after CI passes.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
+      "groupName": "github actions",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Tooling-only dev dependencies (lint, test, types) merge on green CI.",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchPackageNames": ["!mediasoup", "!mediasoup-client"],
+      "groupName": "dev tooling",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    }
+  ]
+}
