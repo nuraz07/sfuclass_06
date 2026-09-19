@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+#
+# server/Dockerfile.capture
+#
+# Capture sidecar of the SFU task (infra/modules/sfu-node-pool, task definition: second container next to
+# "sfu", same task, host networking). Receives recording RTP from mediasoup PlainTransports over loopback
+# and writes Matroska segments to the task's shared scratch volume; the SFU container uploads them to S3
+# (recordingPipeline.js) and the worker service muxes them (recordingWorker.js).
+#
+# Contents: Node.js 22 runtime, ffmpeg (stream copy only — no encoders are exercised), tini as PID 1,
+# and one file: src/mediasoup/recording/captureAgent.js (standard library only, no node_modules).
+#
+# Build (build-images.yml, context = server/):
+#   docker buildx build -f server/Dockerfile.capture -t <ecr>/classroom/capture:<sha> server
+# Base images are pinned by digest through Renovate (docker:pinDigests); the tag documents the line.
+#
+# Runtime contract (ECS container definition "capture"):
+#   user                 1000:1000 (image default) — the SFU container must share group 1000 to read/delete segments
+#   readonlyRootFilesystem true; writable mount: /scratch (task volume shared with "sfu")
+#   network              host (inherited from the task); the agent binds 127.0.0.1:7460 only
+#   linuxParameters      initProcessEnabled not needed (tini is PID 1)
+#   stopTimeout          >= CAPTURE_STOP_TIMEOUT_MS + 5 s, so ffmpeg can finalise the last segment
+#   healthCheck          CMD node /app/healthcheck.mjs (mirrors HEALTHCHECK below; ECS ignores the Dockerfile one)
+#   secrets              CAPTURE_AGENT_TOKEN (same value injected into the "sfu" container)
+
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+FROM ${NODE_IMAGE} AS runtime
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG DEBIAN_FRONTEND=noninteractive
+# ffmpeg from Debian bookworm (5.1 line): demuxes RTP (VP8, VP9, H.264, Opus) and writes Matroska by copy.
+# Package versions are deliberately not pinned: the base image is pinned by digest (Renovate) and rebuilt
+# weekly, and unpinned packages within Debian stable pick up security fixes on every rebuild.
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg tini ca-certificates \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /usr/share/doc /usr/share/man
+
+ENV NODE_ENV=production \
+    CAPTURE_LISTEN_PORT=7460 \
+    CAPTURE_SCRATCH_DIR=/scratch \
+    CAPTURE_RTP_PORT_MIN=45000 \
+    CAPTURE_RTP_PORT_MAX=45999 \
+    CAPTURE_SEGMENT_SECONDS=6 \
+    CAPTURE_MAX_SESSIONS=32 \
+    CAPTURE_STOP_TIMEOUT_MS=10000 \
+    FFMPEG_PATH=/usr/bin/ffmpeg
+
+WORKDIR /app
+
+COPY --chown=root:root --chmod=0444 src/mediasoup/recording/captureAgent.js ./captureAgent.js
+COPY --chown=root:root --chmod=0444 <<'EOF_HEALTH' ./healthcheck.mjs
+const port = process.env.CAPTURE_LISTEN_PORT || 7460;
+fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(2000) })
+  .then((r) => process.exit(r.ok ? 0 : 1))
+  .catch(() => process.exit(1));
+EOF_HEALTH
+
+# The scratch directory is a mount point; setgid keeps new files in group 1000 for the SFU container.
+RUN mkdir -p /scratch \
+ && chown 1000:1000 /scratch \
+ && chmod 2775 /scratch \
+ && ffmpeg -hide_banner -protocols 2>/dev/null | grep -qx '  rtp' \
+ && ffmpeg -hide_banner -muxers 2>/dev/null | grep -q ' matroska '
+
+# uid/gid 1000 = the "node" user of the base image; numeric so ECS and the SFU container agree on it.
+USER 1000:1000
+
+VOLUME ["/scratch"]
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["node", "/app/healthcheck.mjs"]
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "/app/captureAgent.js"]
