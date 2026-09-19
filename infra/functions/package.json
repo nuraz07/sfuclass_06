@@ -1,0 +1,33 @@
+{
+  "name": "@classroom/infra-functions",
+  "version": "7.0.0",
+  "private": true,
+  "description": "Lambda functions and the Synthetics canary of the media plane. Each is bundled into one file; the Terraform modules zip dist/<name>.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0 <23"
+  },
+  "scripts": {
+    "build": "npm run build:node-lifecycle && npm run build:turn-secret-rotation && npm run build:acme-renewer && npm run build:publish-ip-ranges && npm run build:turn-canary",
+    "build:node-lifecycle": "esbuild node-lifecycle/handler.js --bundle --platform=node --target=node22 --format=esm --outfile=dist/node-lifecycle/index.mjs --legal-comments=none --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\"",
+    "build:turn-secret-rotation": "esbuild turn-secret-rotation/handler.js --bundle --platform=node --target=node22 --format=esm --outfile=dist/turn-secret-rotation/index.mjs --legal-comments=none --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\"",
+    "build:acme-renewer": "esbuild acme-renewer/handler.js --bundle --platform=node --target=node22 --format=esm --outfile=dist/acme-renewer/index.mjs --legal-comments=none --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\"",
+    "build:publish-ip-ranges": "esbuild publish-ip-ranges/handler.js --bundle --platform=node --target=node22 --format=esm --outfile=dist/publish-ip-ranges/index.mjs --legal-comments=none --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\"",
+    "build:turn-canary": "esbuild turn-canary/canary.js --bundle --platform=node --target=node22 --format=cjs --outfile=dist/turn-canary/nodejs/node_modules/canary.js --external:Synthetics --external:SyntheticsLogger --legal-comments=none",
+    "test": "node --test 'test/*.test.js'"
+  },
+  "dependencies": {
+    "@aws-sdk/client-auto-scaling": "^3.700.0",
+    "@aws-sdk/client-ec2": "^3.700.0",
+    "@aws-sdk/client-ecs": "^3.700.0",
+    "@aws-sdk/client-route-53": "^3.700.0",
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@aws-sdk/client-ssm": "^3.700.0",
+    "acme-client": "^5.4.0",
+    "ioredis": "^5.4.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
