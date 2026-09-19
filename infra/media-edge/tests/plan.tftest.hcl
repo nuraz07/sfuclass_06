@@ -5,6 +5,15 @@ mock_provider "aws" {
   mock_data "aws_secretsmanager_secrets" { defaults = { arns = [] } }
   mock_resource "aws_eip" { defaults = { public_ip = "198.51.100.10", allocation_id = "eipalloc-1" } }
   mock_resource "aws_kms_key" { defaults = { arn = "arn:aws:kms:us-east-1:123456789012:key/k" } }
+  mock_data "aws_ssm_parameter" { defaults = { value = "ami-0123456789abcdef0" } }
+  mock_data "aws_vpc" { defaults = { cidr_block = "10.64.0.0/16" } }
+  mock_resource "aws_autoscaling_group" { defaults = { arn = "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:x:autoScalingGroupName/turn" } }
+  mock_resource "aws_lambda_function" { defaults = { arn = "arn:aws:lambda:us-east-1:123456789012:function:f" } }
+  mock_resource "aws_sqs_queue" { defaults = { arn = "arn:aws:sqs:us-east-1:123456789012:q" } }
+  mock_resource "aws_iam_instance_profile" { defaults = { arn = "arn:aws:iam::123456789012:instance-profile/p" } }
+  mock_resource "aws_cloudwatch_event_rule" { defaults = { arn = "arn:aws:events:us-east-1:123456789012:rule/r" } }
+  mock_resource "aws_ecs_task_definition" { defaults = { arn = "arn:aws:ecs:us-east-1:123456789012:task-definition/t:1" } }
+  mock_resource "aws_ecs_cluster" { defaults = { arn = "arn:aws:ecs:us-east-1:123456789012:cluster/c" } }
   mock_resource "aws_cloudwatch_log_group" { defaults = { arn = "arn:aws:logs:us-east-1:123456789012:log-group:g" } }
   mock_resource "aws_iam_role" { defaults = { arn = "arn:aws:iam::123456789012:role/r" } }
   mock_resource "aws_sns_topic" { defaults = { arn = "arn:aws:sns:us-east-1:123456789012:t" } }
@@ -81,6 +90,14 @@ run "plan" {
   assert {
     condition     = length(aws_route53_record.turn_regional) == var.eip_pool.turn && alltrue([for r in aws_route53_record.turn_regional : r.multivalue_answer_routing_policy])
     error_message = "regional multivalue records"
+  }
+  assert {
+    condition     = module.turn_pool.service_names == ["turn-blue", "turn-green"]
+    error_message = "blue/green service names used by deploy-turn.yml"
+  }
+  assert {
+    condition     = var.canary.enabled ? module.canary.alarm_name == "classroom-${var.environment}-turn-canary-${var.region}" : true
+    error_message = "canary alarm name used by deploy-turn.yml"
   }
   assert {
     condition     = output.github_variables.TURN_CANARY_ALARM_PREFIX == "classroom-${var.environment}-turn-canary"

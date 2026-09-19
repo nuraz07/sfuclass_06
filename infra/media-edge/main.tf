@@ -18,7 +18,8 @@
 #                                                              terminate: set the drain flag, complete the hook
 #     module.canary          infra/modules/connectivity-canary 1-minute TURN allocation canary from outside the VPC
 #
-# Module interfaces are fixed here; the modules implement exactly these inputs and outputs.
+# Module interfaces are fixed here; the modules implement exactly these inputs and outputs. Both pools also output
+# capacity_provider_name, which is attached to the shared cluster below.
 #
 # Core outputs used (infra/core): transit_gateway_* · core_vpc_cidr · media_edge_supernet · rtc_domain ·
 #   rtc_zone_id · turn_shared_secret_arn · turn_tls_secret_arn · sfu_control_node_tls_secret_arn ·
@@ -88,21 +89,30 @@ resource "aws_ecs_cluster" "media" {
   }
 }
 
+# Both pools share the cluster, so their capacity providers are attached here, in one place (the resource owns the
+# cluster's whole provider list). The pools create their services only after this exists.
+resource "aws_ecs_cluster_capacity_providers" "media" {
+  cluster_name       = aws_ecs_cluster.media.name
+  capacity_providers = [module.sfu_pool.capacity_provider_name, module.turn_pool.capacity_provider_name]
+}
+
 # ------------------------------------------------------------------ SFU node pool
 
 module "sfu_pool" {
   source = "../modules/sfu-node-pool"
 
-  name_prefix    = local.name_prefix
-  region         = var.region
-  region_short   = var.region_short
-  vpc_id         = aws_vpc.media.id
-  subnet_ids     = [for s in aws_subnet.public : s.id]
-  ecs_cluster    = { name = aws_ecs_cluster.media.name, arn = aws_ecs_cluster.media.arn }
-  images         = { sfu = local.images.sfu, capture = local.images.capture }
-  instance_types = var.sfu.instance_types
-  architecture   = var.sfu.architecture
-  ipv6           = var.sfu.ipv6
+  name_prefix  = local.name_prefix
+  region       = var.region
+  region_short = var.region_short
+  vpc_id       = aws_vpc.media.id
+  subnet_ids   = [for s in aws_subnet.public : s.id]
+  ecs_cluster  = { name = aws_ecs_cluster.media.name, arn = aws_ecs_cluster.media.arn }
+  images       = { sfu = local.images.sfu, capture = local.images.capture }
+
+  capacity_provider_association = aws_ecs_cluster_capacity_providers.media.id
+  instance_types                = var.sfu.instance_types
+  architecture                  = var.sfu.architecture
+  ipv6                          = var.sfu.ipv6
 
   workers              = var.sfu.workers
   rtc_port_base        = var.sfu.rtc_port_base
@@ -135,17 +145,19 @@ module "sfu_pool" {
 module "turn_pool" {
   source = "../modules/turn-node-pool"
 
-  name_prefix    = local.name_prefix
-  region         = var.region
-  region_short   = var.region_short
-  vpc_id         = aws_vpc.media.id
-  subnet_ids     = [for s in aws_subnet.public : s.id]
-  ecs_cluster    = { name = aws_ecs_cluster.media.name, arn = aws_ecs_cluster.media.arn }
-  image          = local.images.turn
-  instance_types = var.turn.instance_types
-  architecture   = var.turn.architecture
-  realm          = local.rtc_domain
-  service_base   = "turn" # services turn-blue / turn-green (deploy-turn.yml)
+  name_prefix  = local.name_prefix
+  region       = var.region
+  region_short = var.region_short
+  vpc_id       = aws_vpc.media.id
+  subnet_ids   = [for s in aws_subnet.public : s.id]
+  ecs_cluster  = { name = aws_ecs_cluster.media.name, arn = aws_ecs_cluster.media.arn }
+  image        = local.images.turn
+
+  capacity_provider_association = aws_ecs_cluster_capacity_providers.media.id
+  instance_types                = var.turn.instance_types
+  architecture                  = var.turn.architecture
+  realm                         = local.rtc_domain
+  service_base                  = "turn" # services turn-blue / turn-green (deploy-turn.yml)
 
   min_nodes             = var.turn.min_nodes
   max_nodes             = var.turn.max_nodes
@@ -193,6 +205,8 @@ module "node_lifecycle" {
       terminate_hook_name = module.sfu_pool.lifecycle_hook_names.terminate
       eip_allocation_ids  = [for e in aws_eip.sfu : e.allocation_id]
       node_tags           = false # SFU nodes need no DNS name; they are addressed through the registry
+
+      drain_timeout_minutes = var.sfu.drain_timeout_minutes
     }
     turn = {
       asg_name            = module.turn_pool.asg_name
@@ -201,6 +215,8 @@ module "node_lifecycle" {
       terminate_hook_name = module.turn_pool.lifecycle_hook_names.terminate
       eip_allocation_ids  = [for e in aws_eip.turn : e.allocation_id]
       node_tags           = true # copies TurnNodeName / TurnHostname / TurnPublicIp from the EIP to the instance
+
+      drain_timeout_minutes = var.turn.drain_timeout_minutes
     }
   }
 
