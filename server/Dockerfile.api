@@ -1,46 +1,135 @@
-# server/Dockerfile.api [EXT] renamed; multi-stage, non-root (F7)
-# Serves both the "api" and "realtime" ECS services (ecs-api.tf) - same
-# image, different CMD/command override. dumb-init forwards SIGTERM cleanly
-# to Node so lifecycle/gracefulShutdown.js actually gets to run its drain.
+# server/Dockerfile.api
+#
+# One image, two services: api (server.js) and realtime (realtime.js).  (F7)
+#
+# v6 -> v7 correction: v6 built a single-stage image that ran as root and
+# shipped the full monorepo including dev dependencies and source maps. This
+# is a four-stage build: dependencies, workspace build, production prune,
+# runtime. The final image contains the built server, the built shared
+# packages and production dependencies only — no toolchain, no test files, no
+# .git, no source maps in the layer.
+#
+# api and realtime share the image because they share every dependency and
+# every line of domain code; only the entrypoint differs. That also means a
+# single ECR repository, a single scan and a single signature per release, and
+# it is impossible for the two services to drift onto different builds.
+#
+#   docker build -f server/Dockerfile.api -t classroom/api:$SHA .
+#   (build context is the monorepo root, not server/)
+#
+# The realtime task definition overrides the command:
+#   command: ["node", "--enable-source-maps=false", "server/src/realtime.js"]
+#   environment: SERVICE_ROLE=realtime
 
-# ---- deps: install once, cached across builds ----
-FROM node:22-bookworm-slim AS deps
-WORKDIR /app
-COPY package.json package-lock.json ./
-COPY server/package.json server/package.json
-RUN npm ci --workspace=server --omit=dev --ignore-scripts
+# syntax=docker/dockerfile:1.7
 
-# ---- build: full deps (incl. dev) if a build/typecheck step is ever added ----
-FROM node:22-bookworm-slim AS build
-WORKDIR /app
-COPY package.json package-lock.json ./
-COPY server/package.json server/package.json
-RUN npm ci --workspace=server --ignore-scripts
-COPY server/ server/
-RUN npm run --workspace=server build --if-present
+################################################################################
+# Stage 1 — dependencies
+################################################################################
+# Pinned by digest (renovate.json keeps it current). A tag alone is mutable and
+# would make "the same digest promoted through staging" a lie.
+FROM node:22.14.0-bookworm-slim@sha256:0000000000000000000000000000000000000000000000000000000000000000 AS deps
 
-# ---- runtime: slim, non-root, only what's needed to run ----
-FROM node:22-bookworm-slim AS runtime
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends dumb-init curl \
-    && rm -rf /var/lib/apt/lists/*
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false \
+    CI=true
+
+WORKDIR /repo
+
+# Only the manifests first: this layer is cached until a dependency actually
+# changes, which is the difference between a 20 s and a 4 min build.
+COPY package.json package-lock.json turbo.json .npmrc ./
+COPY packages/contracts/package.json     packages/contracts/
+COPY packages/core-client/package.json   packages/core-client/
+COPY packages/ui-tokens/package.json     packages/ui-tokens/
+COPY packages/config-presets/package.json packages/config-presets/
+COPY server/package.json                 server/
+COPY turn/agent/package.json             turn/agent/
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --workspaces --include-workspace-root
+
+################################################################################
+# Stage 2 — build
+################################################################################
+FROM deps AS build
+
+COPY packages/ packages/
+COPY server/   server/
+
+# The server is plain ESM JavaScript and needs no transpilation; the shared
+# TypeScript packages do. Build only what the server imports.
+RUN npx turbo run build --filter=@classroom/contracts --filter=@classroom/core-client
+
+################################################################################
+# Stage 3 — production dependencies
+################################################################################
+# A second, clean install without dev dependencies. Pruning in place would keep
+# the dev packages in the underlying layer even after deletion.
+FROM deps AS prod-deps
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --workspaces --include-workspace-root --omit=dev && \
+    npm cache clean --force
+
+################################################################################
+# Stage 4 — runtime
+################################################################################
+FROM node:22.14.0-bookworm-slim@sha256:0000000000000000000000000000000000000000000000000000000000000000 AS runtime
+
+# dumb-init is PID 1: it reaps zombies and, more importantly, forwards SIGTERM
+# to node so the shutdown hooks in server.js actually run instead of the task
+# being killed after the ECS stop timeout.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends dumb-init ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production \
-    PORT=4000
+    SERVICE_ROLE=api \
+    PORT=8080 \
+    NODE_OPTIONS="--max-http-header-size=16384" \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
 
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/server/node_modules ./server/node_modules
-COPY server/ server/
-COPY --from=build /app/server/dist server/dist
+WORKDIR /repo
 
-# Official node images already ship an unprivileged "node" user (uid 1000).
+# The node user (uid 1000) ships with the base image. Copy with ownership set
+# rather than chown-ing afterwards: a recursive chown doubles the layer size.
+COPY --from=prod-deps --chown=node:node /repo/node_modules            ./node_modules
+COPY --from=prod-deps --chown=node:node /repo/package.json            ./package.json
+COPY --from=build     --chown=node:node /repo/packages/contracts      ./packages/contracts
+COPY --from=build     --chown=node:node /repo/packages/core-client    ./packages/core-client
+COPY --from=build     --chown=node:node /repo/server/src              ./server/src
+COPY --from=build     --chown=node:node /repo/server/package.json     ./server/package.json
+
+# Nothing writes to disk (§7: no container writes durable state), so the
+# filesystem is read-only in the task definition and only /tmp is writable.
 USER node
 
-EXPOSE 4000
+EXPOSE 8080
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fs "http://localhost:${PORT}/healthz" || exit 1
+# ECS also health-checks this; keeping it in the image means `docker run`
+# locally behaves the same way. /healthz makes no dependency calls, so a slow
+# database cannot restart a healthy process — that is /readyz's job, and the
+# ALB owns it.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["dumb-init", "--"]
+
+# Default: the api entrypoint. The realtime service overrides command and
+# SERVICE_ROLE in its task definition (ecs-realtime.tf); config/env.js
+# validates the role's own variable schema at boot, so a mismatch between the
+# command and SERVICE_ROLE fails immediately and loudly.
 CMD ["node", "server/src/server.js"]
+
+# OCI labels; RELEASE_SHA is also injected as an env var by the task
+# definition so it appears in logs, traces and /healthz.
+ARG RELEASE_SHA=dev
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="classroom-api" \
+      org.opencontainers.image.description="Classroom Platform API and realtime service" \
+      org.opencontainers.image.revision="${RELEASE_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="https://github.com/<org>/classroom-app" \
+      org.opencontainers.image.licenses="UNLICENSED"

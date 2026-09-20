@@ -1,124 +1,118 @@
 /**
- * queues/connection — shared Redis connection and prefixes. (F7)
+ * server/src/queues/connection.js
  *
- * BullMQ has connection rules that are easy to violate by accident and painful to debug:
+ * The one Redis connection BullMQ is allowed to use.  (F7)
  *
- *  - A Worker holds a *blocking* connection (BRPOPLPUSH). It cannot be shared with a
- *    Queue, and it must have `maxRetriesPerRequest: null`, or ioredis aborts the blocking
- *    command mid-wait and the worker silently stops taking jobs.
- *  - Queues can share one connection. Workers cannot share with each other either, so
- *    each gets its own — that is the connection count to size ElastiCache against.
- *  - Every key is prefixed. The prefix is wrapped in a hash tag `{…}` so that, if the
- *    cluster is ever moved to cluster mode, a queue's keys land on one slot instead of
- *    failing with CROSSSLOT.
+ * v6 -> v7 correction: BullMQ shared a cluster with the caches. It cannot.
+ * Every job, every delayed set, every lock lives in ordinary Redis keys with
+ * no TTL; on an evicting cluster a job can be thrown away between "queued" and
+ * "processed" and nothing in the system would notice. This module binds BullMQ
+ * to the state cluster (noeviction) and makes it impossible to point it
+ * anywhere else.
  *
- * This module also owns shutdown: lifecycle/gracefulShutdown.js calls closeConnections()
- * after the workers have drained, and nothing else closes a connection directly.
+ * Imported by queues/queues.js, every worker in queues/workers/, and by
+ * mediasoup/recording/recordingPipeline.js on the SFU node (which receives
+ * REDIS_STATE_URL and nothing else).
+ *
+ * Node.js 22, ESM.
  */
-
-import IORedis from 'ioredis';
 
 import { env } from '../config/env.js';
+import { stateRedis } from '../db/redis.js';
 import { logger } from '../observability/logger.js';
 
-/** All BullMQ keys live under this. Separate from the app's own Redis key prefixes. */
-export const QUEUE_PREFIX = `{${env.REDIS_PREFIX ?? 'cp'}:bull}`;
+const log = logger.child({ component: 'queue-connection' });
 
-const baseOptions = () => ({
-  ...(env.REDIS_TLS ? { tls: { servername: new URL(env.REDIS_URL).hostname } } : {}),
-  lazyConnect: false,
-  connectTimeout: 10_000,
-  keepAlive: 30_000,
-  // Retries are for a failover, not for a dead cluster: back off and keep trying, because
-  // an ElastiCache failover takes tens of seconds and the worker should survive it.
-  retryStrategy: (attempt) => Math.min(attempt * 200, 5000),
-  reconnectOnError: (error) => {
-    // READONLY means we reconnected to a replica mid-failover; force a fresh handshake.
-    if (error.message.includes('READONLY')) return 2;
-    return false;
-  },
-});
+/* -------------------------------------------------------------------------- */
+/* Guards                                                                      */
+/* -------------------------------------------------------------------------- */
 
-const pool = new Set();
-
-function track(name, connection) {
-  connection.on('error', (error) => logger.error({ err: error, connection: name }, 'queues: redis error'));
-  connection.on('end', () => logger.warn({ connection: name }, 'queues: redis connection ended'));
-  connection.on('reconnecting', (delay) => logger.warn({ connection: name, delay }, 'queues: redis reconnecting'));
-  pool.add(connection);
-  return connection;
+if (!env.REDIS_STATE_URL) {
+  throw new Error('queues require REDIS_STATE_URL (the noeviction cluster)');
 }
 
-let sharedQueueConnection = null;
-
-/** One connection for every Queue and QueueEvents instance. Non-blocking, safe to share. */
-export function queueConnection() {
-  if (!sharedQueueConnection) {
-    sharedQueueConnection = track('queues', new IORedis(env.REDIS_URL, baseOptions()));
-  }
-  return sharedQueueConnection;
+if (env.REDIS_CACHE_URL && env.REDIS_STATE_URL === env.REDIS_CACHE_URL) {
+  throw new Error(
+    'REDIS_STATE_URL and REDIS_CACHE_URL point at the same cluster; ' +
+      'BullMQ must not share a cluster that evicts',
+  );
 }
+
+/* -------------------------------------------------------------------------- */
+/* Connection                                                                  */
+/* -------------------------------------------------------------------------- */
 
 /**
- * A dedicated blocking connection per worker.
- * `maxRetriesPerRequest: null` is required — with the ioredis default, a worker stops
- * consuming after a brief network blip and looks alive while doing nothing.
- */
-export function workerConnection(name) {
-  return track(`worker:${name}`, new IORedis(env.REDIS_URL, {
-    ...baseOptions(),
-    maxRetriesPerRequest: null,
-    enableReadyCheck: false,
-  }));
-}
-
-/** Plain connection for things that are not BullMQ (rate limit counters in a job, locks). */
-export function utilityConnection(name = 'utility') {
-  return track(name, new IORedis(env.REDIS_URL, baseOptions()));
-}
-
-/**
- * A single-runner lock, for scheduled jobs that must not double-fire when EventBridge
- * delivers twice or two tasks wake at the same moment.
+ * BullMQ accepts an existing ioredis instance. Reusing the shared state client
+ * keeps one connection pool, one TLS config and one retry strategy — and, more
+ * importantly, one place where `maxRetriesPerRequest: null` is set, which
+ * BullMQ requires for its blocking commands.
  *
- * @returns {Promise<null | (() => Promise<void>)>} release function, or null if not acquired
+ * BullMQ duplicates this connection internally for blocking reads, so a worker
+ * never starves the rest of the process.
  */
-export async function acquireLock(key, ttlMs = 60_000) {
-  const client = queueConnection();
-  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  const lockKey = `${QUEUE_PREFIX}:lock:${key}`;
+export const connection = stateRedis;
 
-  const acquired = await client.set(lockKey, token, 'PX', ttlMs, 'NX');
-  if (!acquired) return null;
+/**
+ * Key prefix. Must stay identical across api, worker and sfu, and stable
+ * across releases: changing it orphans every queued job.
+ *
+ * Note this is BullMQ's own prefix and is applied *in addition* to the
+ * ioredis keyPrefix configured in db/redis.js, so queue keys end up under
+ * "<REDIS_PREFIX>:state:bull:<queue>:...".
+ */
+export const prefix = 'bull';
 
-  return async () => {
-    // Compare-and-delete: never release a lock that has already expired and been retaken.
-    await client.eval(
-      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`,
-      1,
-      lockKey,
-      token,
-    );
-  };
+/**
+ * Defaults every queue inherits unless it overrides them in queues.js.
+ * Retained history is deliberately asymmetric: successes are pruned, failures
+ * are kept so maintenanceWorker and the on-call runbook can inspect them.
+ */
+export const defaultJobOptions = {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 5_000 },
+  removeOnComplete: { age: 24 * 3_600, count: 1_000 },
+  removeOnFail: { age: 14 * 24 * 3_600 },
+};
+
+/** Shared worker settings. */
+export const workerOptions = {
+  connection,
+  prefix,
+  // Lock must exceed the longest plausible single job step, or a slow
+  // MediaConvert poll gets its job stolen and processed twice.
+  lockDuration: 60_000,
+  stalledInterval: 30_000,
+  maxStalledCount: 2,
+  removeOnComplete: defaultJobOptions.removeOnComplete,
+  removeOnFail: defaultJobOptions.removeOnFail,
+};
+
+/** Shared queue settings. */
+export const queueOptions = {
+  connection,
+  prefix,
+  defaultJobOptions,
+};
+
+/* -------------------------------------------------------------------------- */
+/* Health                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/** Used by readiness.js in the worker role. */
+export async function ping() {
+  try {
+    await connection.ping();
+    return true;
+  } catch (err) {
+    log.error({ err }, 'queue connection ping failed');
+    return false;
+  }
 }
 
-export async function pingRedis() {
-  const started = Date.now();
-  await queueConnection().ping();
-  return { ok: true, latencyMs: Date.now() - started };
-}
-
-/** Called by gracefulShutdown, after the workers have closed. */
-export async function closeConnections() {
-  const closing = [...pool].map(async (connection) => {
-    try {
-      await connection.quit();
-    } catch {
-      connection.disconnect();
-    }
-  });
-  await Promise.allSettled(closing);
-  pool.clear();
-  sharedQueueConnection = null;
-  logger.info('queues: redis connections closed');
-}
+/**
+ * The connection is owned by db/redis.js, so nothing here closes it.
+ * Queues and workers close themselves in lifecycle/gracefulShutdown.js, then
+ * closeRedis() ends the connection once.
+ */
+export default { connection, prefix, queueOptions, workerOptions, defaultJobOptions, ping };

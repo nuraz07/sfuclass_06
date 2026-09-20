@@ -1,175 +1,248 @@
+###############################################################################
 # infra/modules/sfu-node-pool/autoscaling.tf
 #
-# Capacity of the SFU pool:
+# Scale out on load, scale in only through the drain.  (F1)
 #
-#   Auto Scaling group     network-optimised instances, one per SFU task. max_size = 2 × max_nodes + 1 (blue/green
-#                          switch plus one replacement). Protected from scale-in; only ECS removes empty instances.
-#   ECS capacity provider  managed scaling (instances follow tasks); managed draining OFF — draining is room-aware and
-#                          owned by drainSfu.js and the terminate hook.
-#   Service scaling        target tracking on Classroom/Sfu LoadScore (region average of
-#                          max(CPU of the busiest worker, consumers / capacity, egress / capacity), sfu-node/loadReporter.js).
-#                          Scale-OUT only: an ECS scale-in would stop a task with live rooms. Capacity is reduced by
-#                          deploy-sfu.yml (sizes the new colour) or by draining nodes on purpose. The idle colour sits at 0
-#                          and target tracking scales proportionally to the current count, so it stays at 0.
-#                          Placement (RoomPlacementService) keeps new rooms below 0.75 on every node, so scale-out has
-#                          headroom before a node is full.
+# Why not CPU: an SFU node runs out of network and of consumer count long
+# before it runs out of CPU. A node at 40 % CPU can already be dropping
+# packets. The scaling signal is the same load score the placement service
+# uses, published by sfu-node/loadReporter.js as EMF:
 #
-# Owner: F1 Live Classrooms + F8 Real-Time Connectivity.
+#   score = 0.25*producers + 0.35*consumers + 0.25*egressMbps + 0.15*cpu
+#           (each normalised against the node's reference capacity)
+#
+# Using the same number for placement and for scaling means the fleet never
+# ends up in the state where placement refuses every node while the ASG sees
+# no reason to add one.
+#
+# Scale-in never terminates directly: the policy lowers desired capacity, the
+# terminate lifecycle hook drains the chosen node, and only then does it go.
+###############################################################################
 
-resource "aws_autoscaling_group" "sfu" {
-  name_prefix               = "${local.name}-"
-  vpc_zone_identifier       = var.subnet_ids
-  min_size                  = 0
-  max_size                  = 2 * var.max_nodes + 1
-  health_check_type         = "EC2"
-  health_check_grace_period = 300
-  default_instance_warmup   = 300
-  protect_from_scale_in     = true
-  capacity_rebalance        = var.spot_allowed
-  wait_for_capacity_timeout = "0"
+###############################################################################
+# Scale out — target tracking on the fleet's average load score
+###############################################################################
 
-  mixed_instances_policy {
-    instances_distribution {
-      on_demand_base_capacity                  = 0
-      on_demand_percentage_above_base_capacity = var.spot_allowed ? 0 : 100
-      spot_allocation_strategy                 = "price-capacity-optimized"
-    }
+resource "aws_autoscaling_policy" "load_score" {
+  name                   = "${local.name}-load-score"
+  autoscaling_group_name = aws_autoscaling_group.this.name
+  policy_type            = "TargetTrackingScaling"
 
-    launch_template {
-      launch_template_specification {
-        launch_template_id = aws_launch_template.sfu.id
-        version            = "$Latest"
-      }
+  # Adding a node takes ~3 minutes (boot, EIP attach, image pull, worker
+  # start). Staying at 60 % leaves exactly that much headroom.
+  estimated_instance_warmup = 180
 
-      dynamic "override" {
-        for_each = var.instance_types
-        content {
-          instance_type = override.value
-        }
-      }
-    }
-  }
-
-  dynamic "initial_lifecycle_hook" {
-    for_each = local.lifecycle_hooks
-    content {
-      name                  = initial_lifecycle_hook.value.name
-      lifecycle_transition  = initial_lifecycle_hook.value.transition
-      heartbeat_timeout     = initial_lifecycle_hook.value.heartbeat_timeout
-      default_result        = initial_lifecycle_hook.value.default_result
-      notification_metadata = jsonencode(initial_lifecycle_hook.value.notification_payload)
-    }
-  }
-
-  tag {
-    key                 = "AmazonECSManaged"
-    value               = "true"
-    propagate_at_launch = true
-  }
-  tag {
-    key                 = "Name"
-    value               = local.name
-    propagate_at_launch = true
-  }
-  tag {
-    key                 = "MediaPool"
-    value               = "sfu"
-    propagate_at_launch = true
-  }
-
-  lifecycle {
-    ignore_changes = [desired_capacity]
-  }
-}
-
-resource "aws_ecs_capacity_provider" "sfu" {
-  name = local.name
-
-  auto_scaling_group_provider {
-    auto_scaling_group_arn         = aws_autoscaling_group.sfu.arn
-    managed_termination_protection = "ENABLED"
-    managed_draining               = "DISABLED"
-
-    managed_scaling {
-      status                    = "ENABLED"
-      target_capacity           = 100
-      minimum_scaling_step_size = 1
-      maximum_scaling_step_size = 3
-      instance_warmup_period    = 300
-    }
-  }
-}
-
-resource "aws_appautoscaling_target" "sfu" {
-  for_each = aws_ecs_service.sfu
-
-  service_namespace  = "ecs"
-  resource_id        = "service/${var.ecs_cluster.name}/${each.value.name}"
-  scalable_dimension = "ecs:service:DesiredCount"
-  min_capacity       = 0
-  max_capacity       = var.max_nodes
-}
-
-resource "aws_appautoscaling_policy" "sfu_load" {
-  for_each = aws_appautoscaling_target.sfu
-
-  name               = "${local.name}-${each.key}-load-score"
-  policy_type        = "TargetTrackingScaling"
-  service_namespace  = each.value.service_namespace
-  resource_id        = each.value.resource_id
-  scalable_dimension = each.value.scalable_dimension
-
-  target_tracking_scaling_policy_configuration {
-    target_value       = var.target_load_score
-    disable_scale_in   = true
-    scale_out_cooldown = 300
+  target_tracking_configuration {
+    target_value     = var.target_load_score * 100 # 60 == 0.60
+    disable_scale_in = true                        # scale-in is handled below
 
     customized_metric_specification {
-      namespace   = "Classroom/Sfu"
-      metric_name = "LoadScore"
-      statistic   = "Average"
+      metrics {
+        id    = "score"
+        label = "Average SFU load score across the pool (%)"
 
-      dimensions {
-        name  = "Region"
-        value = var.region
+        metric_stat {
+          metric {
+            namespace   = var.metric_namespace
+            metric_name = "SfuLoadScore"
+
+            dimensions {
+              name  = "Region"
+              value = var.region
+            }
+
+            dimensions {
+              name  = "Pool"
+              value = local.name
+            }
+          }
+
+          stat = "Average"
+        }
+
+        return_data = true
       }
     }
   }
 }
 
-# Pages when the active colour runs fewer healthy nodes than the floor for 10 minutes (instances failing to boot,
-# Elastic IPs exhausted, AMI or image problems).
-resource "aws_cloudwatch_metric_alarm" "below_min_nodes" {
-  alarm_name          = "${local.name}-below-min-nodes"
-  alarm_description   = "Fewer running SFU tasks than min_nodes (${var.min_nodes}) in ${var.region}. Runbook: ops/runbooks/sfu-incident.md"
+###############################################################################
+# Scale out — fast path
+#
+# Target tracking reacts on a 3-minute average, which is too slow for the case
+# that actually hurts: a scheduled hour where two hundred classes start at the
+# same minute. This step policy adds capacity as soon as the fleet crosses the
+# cascade threshold, before placement has to start fanning rooms out.
+###############################################################################
+
+resource "aws_autoscaling_policy" "burst_out" {
+  name                   = "${local.name}-burst-out"
+  autoscaling_group_name = aws_autoscaling_group.this.name
+  policy_type            = "StepScaling"
+  adjustment_type        = "ChangeInCapacity"
+  metric_aggregation_type = "Maximum"
+
+  estimated_instance_warmup = 180
+
+  step_adjustment {
+    metric_interval_lower_bound = 0
+    metric_interval_upper_bound = 15
+    scaling_adjustment          = 1
+  }
+
+  step_adjustment {
+    metric_interval_lower_bound = 15
+    scaling_adjustment          = 3
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "burst_out" {
+  alarm_name          = "${local.name}-load-burst"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.cascade_threshold * 100
+  namespace           = var.metric_namespace
+  metric_name         = "SfuLoadScore"
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "Any node above the cascade threshold — add capacity now"
+
+  dimensions = {
+    Region = var.region
+    Pool   = local.name
+  }
+
+  alarm_actions = [aws_autoscaling_policy.burst_out.arn]
+  tags          = var.tags
+}
+
+###############################################################################
+# Scale in — slow, conservative, drain-mediated
+#
+# Conditions: the fleet has been well below target for 30 consecutive minutes
+# AND more than the minimum number of nodes is running. Removing a node costs
+# up to four hours of drain, so being wrong is expensive and being slow is not.
+###############################################################################
+
+resource "aws_autoscaling_policy" "scale_in" {
+  name                   = "${local.name}-scale-in"
+  autoscaling_group_name = aws_autoscaling_group.this.name
+  policy_type            = "StepScaling"
+  adjustment_type        = "ChangeInCapacity"
+
+  step_adjustment {
+    metric_interval_upper_bound = 0
+    scaling_adjustment          = -1 # one node at a time, always
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scale_in" {
+  alarm_name          = "${local.name}-load-low"
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 10
-  threshold           = var.min_nodes
-  treat_missing_data  = "breaching"
-  alarm_actions       = [var.alarm_topic_arn]
-  ok_actions          = [var.alarm_topic_arn]
+  evaluation_periods  = 30 # 30 x 1 min
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.scale_in_load_score * 100
+  namespace           = var.metric_namespace
+  metric_name         = "SfuLoadScore"
+  treat_missing_data  = "missing" # no data must never trigger a scale-in
+  alarm_description   = "Pool sustained well below target — release one node through the drain"
+
+  dimensions = {
+    Region = var.region
+    Pool   = local.name
+  }
+
+  alarm_actions = [aws_autoscaling_policy.scale_in.arn]
+  tags          = var.tags
+}
+
+###############################################################################
+# Guard rails
+###############################################################################
+
+# At the ceiling there is no capacity left to place new rooms in this region;
+# placement starts refusing or spilling to another region.
+resource "aws_cloudwatch_metric_alarm" "at_max_capacity" {
+  alarm_name          = "${local.name}-at-max-capacity"
+  namespace           = "AWS/AutoScaling"
+  metric_name         = "GroupInServiceInstances"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 3
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = var.max_nodes
+  alarm_description   = "SFU pool at max size — raise max_nodes or add a media region"
+
+  dimensions = { AutoScalingGroupName = aws_autoscaling_group.this.name }
+
+  alarm_actions = [var.pager_topic_arn]
+  tags          = var.tags
+}
+
+# Node saturation: individual nodes above the cap stop receiving rooms, and
+# cascading should be engaging. If it is not, a large room is stuck on one box.
+resource "aws_cloudwatch_metric_alarm" "node_saturation" {
+  alarm_name          = "${local.name}-node-saturation"
+  namespace           = var.metric_namespace
+  metric_name         = "SfuLoadScore"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.max_load_score * 100
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "A node is above its load cap — scale out, confirm cascading is engaging (ops/runbooks/sfu-incident.md)"
+
+  dimensions = {
+    Region = var.region
+    Pool   = local.name
+  }
+
+  alarm_actions = [var.pager_topic_arn]
+  tags          = var.tags
+}
+
+# The pool cannot grow without free Elastic IPs. Alarming at 20 % remaining
+# gives time to allocate more and republish the customer IP ranges.
+resource "aws_cloudwatch_metric_alarm" "registry_gap" {
+  alarm_name          = "${local.name}-registry-gap"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "Instances InService but not heartbeating to the registry — check EIP attach and the control path"
 
   metric_query {
-    id          = "running"
-    expression  = "SUM(METRICS())"
-    label       = "Running SFU tasks (both colours)"
+    id          = "gap"
+    expression  = "instances - registered"
+    label       = "InService minus registered"
     return_data = true
   }
 
-  dynamic "metric_query" {
-    for_each = local.service_names
-    content {
-      id = "m_${metric_query.key}"
-      metric {
-        namespace   = "ECS/ContainerInsights"
-        metric_name = "RunningTaskCount"
-        period      = 60
-        stat        = "Minimum"
-        dimensions = {
-          ClusterName = var.ecs_cluster.name
-          ServiceName = metric_query.value
-        }
-      }
+  metric_query {
+    id = "instances"
+    metric {
+      namespace   = "AWS/AutoScaling"
+      metric_name = "GroupInServiceInstances"
+      period      = 300
+      stat        = "Maximum"
+      dimensions  = { AutoScalingGroupName = aws_autoscaling_group.this.name }
     }
   }
+
+  metric_query {
+    id = "registered"
+    metric {
+      namespace   = var.metric_namespace
+      metric_name = "SfuNodesRegistered"
+      period      = 300
+      stat        = "Maximum"
+      dimensions  = { Region = var.region }
+    }
+  }
+
+  alarm_actions = [var.pager_topic_arn]
+  tags          = var.tags
 }

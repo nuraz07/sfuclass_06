@@ -1,208 +1,463 @@
 /**
- * recordingWorker — ffmpeg mux + upload (F1, F4)
+ * server/src/queues/workers/recordingWorker.js
  *
- * The SFU's PlainTransportRecorder writes raw per-track files while a lesson runs. When the
- * room ends, this worker turns them into one playable asset and hands it to the media
- * domain, after which it is an ordinary video: transcoded, captioned, quota-counted,
- * signed-delivered.
+ * Turns the segments a capture sidecar wrote into a playable asset.  (F1, F4)
  *
- * This is the only worker that is genuinely CPU-heavy and the only one that touches the
- * disk, which drives three decisions:
+ * v6 -> v7 correction: v6 had this worker muxing raw RTP, which meant RTP
+ * would have had to cross the network and the worker would have had to stay
+ * alive for the whole lesson. In v7 the sidecar has already written fMP4
+ * segments to S3 during the lesson; this worker starts *after* the recording
+ * ended and only has to concatenate, compose, upload and register.
  *
- *  - Concurrency 1. ffmpeg will take every core it is given; two muxes on one task make
- *    both slow and neither finishes sooner.
- *  - Scratch space is checked before starting and always cleaned in `finally`. A worker
- *    task that fills its volume takes every later job down with it, and the failure looks
- *    like something else entirely.
- *  - The BullMQ lock is extended through progress updates. A two-hour lesson mux outlives
- *    any sane lockDuration, and a lost lock means a second worker starts the same mux.
+ *   s3://<recordings>/raw/<tenant>/<lesson>/<recordingId>/<trackId>/NNNNN.mp4
+ *     -> concat per track
+ *     -> compose (primary video + mixed audio)
+ *     -> s3://<recordings>/mux/<...>/recording.mp4
+ *     -> Asset (status=processing)
+ *     -> transcode job (MediaConvert -> HLS ladder) + transcribe job
+ *     -> delayed cleanup job for the raw segments
  *
- * Idempotency: keyed on the recording id. If the asset already exists and is complete, the
- * job cleans up and returns rather than re-encoding an hour of video.
+ * Runs in worker.js, in the ffmpeg image (Dockerfile.worker).
+ * Idempotent on recordingId: a retry after a partial failure reuses the
+ * existing asset instead of creating a second one.
+ *
+ * Node.js 22, ESM.
  */
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
-import path from 'node:path';
+import { createWriteStream } from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 
-import { defineWorker, enqueue, QUEUE_NAMES, PermanentJobError } from '../queues.js';
+import { Worker } from 'bullmq';
+import {
+  S3Client,
+  ListObjectsV2Command,
+  GetObjectCommand,
+  DeleteObjectsCommand,
+} from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+
 import { env } from '../../config/env.js';
-import * as recordingPipeline from '../../mediasoup/recording/recordingPipeline.js';
-import * as UploadService from '../../media/UploadService.js';
-import * as StorageGuard from '../../capacity/StorageGuard.js';
+import { workerOptions } from '../connection.js';
+import { QUEUE, JOB, jobs } from '../queues.js';
+import { assetRepository } from '../../media/models/Asset.js';
+import { logger } from '../../observability/logger.js';
 import { metrics } from '../../observability/metrics.js';
 
-const SCRATCH_ROOT = env.RECORDING_SCRATCH_DIR ?? path.join(os.tmpdir(), 'recordings');
-const MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB headroom before starting a mux
+const log = logger.child({ component: 'recording-worker' });
 
-const handlers = {
-  'recording.mux': mux,
-  'recording.cleanup': cleanup,
-};
+const s3 = new S3Client({ region: env.AWS_REGION ?? env.MEDIA_REGION });
+
+const FFMPEG = env.FFMPEG_PATH ?? 'ffmpeg';
+const MUX_TIMEOUT_MS = env.RECORDING_MUX_TIMEOUT_MS ?? 45 * 60_000;
+
+/* -------------------------------------------------------------------------- */
+/* Worker                                                                      */
+/* -------------------------------------------------------------------------- */
 
 export function createRecordingWorker() {
-  return defineWorker(QUEUE_NAMES.RECORDING, async (job, log) => {
-    const handler = handlers[job.name];
-    if (!handler) throw new PermanentJobError(`Unknown recording job: ${job.name}`);
-    return handler(job, log);
-  }, {
-    concurrency: 1,
-    // Long, but not the real protection — the progress heartbeat below is.
-    lockDuration: 300_000,
-  });
-}
-
-/* ------------------------------------------------------------------ *
- * Mux
- * ------------------------------------------------------------------ */
-
-async function mux(job, log) {
-  const { recordingId, roomId, lessonId, tenantId } = job.data;
-
-  const recording = await recordingPipeline.get(recordingId);
-  if (!recording) throw new PermanentJobError('Recording no longer exists', { recordingId });
-  if (recording.status === 'ready' && recording.assetId) {
-    log.info({ recordingId }, 'recording: already muxed');
-    await scheduleCleanup(recordingId, recording.workDir);
-    return { skipped: 'already-ready' };
-  }
-  if (!recording.tracks?.length) throw new PermanentJobError('Recording has no tracks', { recordingId });
-
-  const workDir = recording.workDir ?? path.join(SCRATCH_ROOT, recordingId);
-  const outputPath = path.join(workDir, `${recordingId}.mp4`);
-
-  await assertDiskSpace(workDir, log);
-  await recordingPipeline.markMuxing(recordingId);
-
-  // Keeps the BullMQ lock alive across an encode that can run for an hour.
-  const heartbeat = setInterval(() => {
-    job.updateProgress({ stage: 'mux', at: Date.now() }).catch(() => {});
-  }, 15_000);
-  heartbeat.unref?.();
-
-  const startedAt = Date.now();
-  try {
-    const args = recordingPipeline.buildFfmpegArgs(recording, { outputPath });
-    await runFfmpeg(args, { log, onProgress: (seconds) => job.updateProgress({ stage: 'mux', seconds }).catch(() => {}) });
-
-    const stat = await fs.stat(outputPath);
-    if (stat.size === 0) throw new Error('ffmpeg produced an empty file');
-
-    // Quota before upload — a recording is the largest object the platform creates.
-    const quota = await StorageGuard.reserve({ tenantId, bytes: stat.size, purpose: 'recording' });
-    if (!quota.ok) {
-      await recordingPipeline.markFailed(recordingId, 'quota-exceeded');
-      throw new PermanentJobError('Tenant storage quota exceeded; recording discarded', {
-        recordingId,
-        bytes: stat.size,
-      });
-    }
-
-    const asset = await UploadService.uploadLocalFile({
-      tenantId,
-      filePath: outputPath,
-      filename: `${lessonId ?? roomId}-${recordingId}.mp4`,
-      contentType: 'video/mp4',
-      purpose: 'recording',
-      contextId: lessonId ?? null,
-      reservationId: quota.reservationId,
-    });
-
-    await recordingPipeline.markReady({ recordingId, assetId: asset.id, durationSeconds: recording.durationSeconds });
-
-    // From here it is an ordinary video asset: HLS ladder, then captions.
-    await enqueue(QUEUE_NAMES.TRANSCODE, 'transcode.submit', { assetId: asset.id, ladder: 'standard' }, {
-      jobId: `transcode:${asset.id}`,
-    });
-
-    metrics.observe?.('recording_mux_ms', Date.now() - startedAt);
-    metrics.increment?.('recording_completed');
-    log.info({ recordingId, assetId: asset.id, bytes: stat.size, ms: Date.now() - startedAt }, 'recording: muxed');
-
-    await scheduleCleanup(recordingId, workDir);
-    return { assetId: asset.id, bytes: stat.size };
-  } catch (error) {
-    if (!(error instanceof PermanentJobError)) {
-      await recordingPipeline.markFailed(recordingId, error.message).catch(() => {});
-    }
-    throw error;
-  } finally {
-    clearInterval(heartbeat);
-    // The mp4 goes either way; the raw tracks stay until cleanup, so a retry can re-mux.
-    await fs.rm(outputPath, { force: true }).catch(() => {});
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * ffmpeg
- * ------------------------------------------------------------------ */
-
-function runFfmpeg(args, { log, onProgress }) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(env.FFMPEG_PATH ?? 'ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-
-    // ffmpeg writes progress to stderr; keep only the tail so a failure log is readable.
-    const tail = [];
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => {
-      tail.push(chunk);
-      if (tail.length > 40) tail.shift();
-      const match = /time=(\d+):(\d+):(\d+)/.exec(chunk);
-      if (match && onProgress) {
-        onProgress(Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]));
+  const worker = new Worker(
+    QUEUE.RECORDING,
+    async (job) => {
+      switch (job.name) {
+        case JOB.RECORDING_MUX:
+          return muxRecording(job);
+        case JOB.RECORDING_CLEANUP:
+          return cleanupSegments(job);
+        default:
+          throw new Error(`unknown job "${job.name}" on the recording queue`);
       }
-    });
-
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) return resolve();
-      const detail = tail.join('').slice(-2000);
-      log.error({ code, detail }, 'recording: ffmpeg failed');
-      // A bad input file will fail identically on every retry.
-      if (/Invalid data|No such file|Decoder .* not found/.test(detail)) {
-        reject(new PermanentJobError(`ffmpeg cannot process this input (exit ${code})`, { detail }));
-        return;
-      }
-      reject(new Error(`ffmpeg exited with ${code}`));
-    });
-  });
-}
-
-/* ------------------------------------------------------------------ *
- * Scratch space
- * ------------------------------------------------------------------ */
-
-async function assertDiskSpace(workDir, log) {
-  await fs.mkdir(workDir, { recursive: true });
-  const stats = await fs.statfs(workDir);
-  const freeBytes = stats.bavail * stats.bsize;
-
-  if (freeBytes < MIN_FREE_BYTES) {
-    log.error({ freeBytes, workDir }, 'recording: not enough scratch space');
-    // Transient: another mux finishing, or the cleanup job, will free space.
-    throw new Error(`Insufficient scratch space: ${Math.round(freeBytes / 1e9)} GB free`);
-  }
-}
-
-async function scheduleCleanup(recordingId, workDir) {
-  await enqueue(
-    QUEUE_NAMES.RECORDING,
-    'recording.cleanup',
-    { recordingId, workDir },
-    { jobId: `recording-cleanup:${recordingId}`, delay: 3_600_000 }, // an hour's grace for a manual re-mux
+    },
+    {
+      ...workerOptions,
+      // Muxing is CPU- and disk-bound. One at a time per task; the worker
+      // service scales out on queue depth instead.
+      concurrency: env.RECORDING_MUX_CONCURRENCY ?? 1,
+      lockDuration: 5 * 60_000,
+      lockRenewTime: 60_000,
+    },
   );
+
+  worker.on('completed', (job, result) => {
+    log.info({ jobId: job.id, name: job.name, assetId: result?.assetId }, 'recording job completed');
+    metrics.increment('recording.job.completed', { name: job.name });
+  });
+
+  worker.on('failed', (job, err) => {
+    log.error({ err, jobId: job?.id, name: job?.name, attempts: job?.attemptsMade }, 'recording job failed');
+    metrics.increment('recording.job.failed', { name: job?.name ?? 'unknown' });
+  });
+
+  return worker;
 }
 
-async function cleanup(job, log) {
-  const { recordingId, workDir } = job.data;
-  if (!workDir?.startsWith(SCRATCH_ROOT)) {
-    throw new PermanentJobError('Refusing to delete a path outside the scratch root', { workDir });
+/* -------------------------------------------------------------------------- */
+/* recording.mux                                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @param {import('bullmq').Job} job
+ */
+async function muxRecording(job) {
+  const {
+    recordingId,
+    tenantId,
+    lessonId,
+    roomId,
+    bucket,
+    keyPrefix,
+    startedAt,
+    endedAt,
+    durationMs,
+    tracks = [],
+    partial = false,
+  } = job.data;
+
+  const startedProcessingAt = Date.now();
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `rec-${recordingId}-`));
+
+  try {
+    // 1. Idempotency. A retry must not produce a second asset.
+    const existing = await assetRepository.findBySourceRef(`recording:${recordingId}`);
+    if (existing && existing.status !== 'failed') {
+      log.info({ recordingId, assetId: existing.id }, 'asset already exists, skipping mux');
+      return { assetId: existing.id, skipped: true };
+    }
+
+    // 2. Collect what the sidecar actually wrote.
+    const segments = await listSegments({ bucket, keyPrefix });
+    if (segments.size === 0) {
+      // Nothing to mux. This is a real outcome (host started and stopped
+      // within a second, or the sidecar died before its first flush) and must
+      // not be retried five times.
+      log.warn({ recordingId, keyPrefix }, 'no segments found, nothing to mux');
+      metrics.increment('recording.mux.empty');
+      return { assetId: null, empty: true };
+    }
+
+    await job.updateProgress(10);
+
+    // 3. Download and concatenate per track.
+    const trackFiles = [];
+    let downloaded = 0;
+    for (const [trackId, keys] of segments) {
+      const meta = tracks.find((t) => t.trackId === trackId) ?? inferTrack(trackId);
+      const file = await concatTrack({ bucket, keys, trackId, workDir });
+      trackFiles.push({ ...meta, trackId, file });
+      downloaded += 1;
+      await job.updateProgress(10 + Math.round((downloaded / segments.size) * 40));
+    }
+
+    // 4. Compose one file: the presenter's screen share if there was one,
+    //    otherwise the first camera; all audio tracks mixed.
+    const outputPath = path.join(workDir, 'recording.mp4');
+    await compose({ trackFiles, outputPath });
+    await job.updateProgress(75);
+
+    // 5. Upload the mux result next to the segments.
+    const outputKey = `${keyPrefix.replace(/^raw\//, 'mux/')}recording.mp4`;
+    const { size } = await fs.stat(outputPath);
+    await uploadFile({ bucket, key: outputKey, filePath: outputPath, contentType: 'video/mp4' });
+    await job.updateProgress(85);
+
+    // 6. Register the asset. It enters the normal media domain from here:
+    //    transcoding, captions, signed delivery, retention, quotas.
+    const asset = await assetRepository.create({
+      tenantId,
+      kind: 'recording',
+      status: 'processing',
+      sourceRef: `recording:${recordingId}`,
+      bucket,
+      key: outputKey,
+      sizeBytes: size,
+      durationMs: durationMs ?? null,
+      metadata: {
+        recordingId,
+        lessonId,
+        roomId,
+        startedAt,
+        endedAt,
+        trackCount: trackFiles.length,
+        partial,
+      },
+    });
+
+    await jobs.transcodeAsset({ assetId: asset.id, tenantId, sourceKey: outputKey });
+    if (env.RECORDING_AUTO_CAPTIONS !== false) {
+      await jobs.transcribeAsset({ assetId: asset.id });
+    }
+
+    // 7. Raw segments stay for a day so a failed transcode can be re-run from
+    //    the source, then a delayed job removes them.
+    await jobs.cleanupRecordingSegments({ recordingId, bucket, keyPrefix });
+
+    await job.updateProgress(100);
+
+    metrics.increment('recording.mux.completed', { partial: String(partial) });
+    metrics.gauge('recording.mux.duration_ms', Date.now() - startedProcessingAt);
+    log.info(
+      {
+        recordingId,
+        assetId: asset.id,
+        tracks: trackFiles.length,
+        sizeBytes: size,
+        muxMs: Date.now() - startedProcessingAt,
+      },
+      'recording muxed',
+    );
+
+    return { assetId: asset.id, key: outputKey, sizeBytes: size };
+  } finally {
+    // Containers are stateless: never leave gigabytes behind on the task's
+    // ephemeral volume, whatever happened above.
+    await fs.rm(workDir, { recursive: true, force: true }).catch((err) =>
+      log.warn({ err, workDir }, 'temp cleanup failed'),
+    );
   }
-  await fs.rm(workDir, { recursive: true, force: true });
-  await recordingPipeline.markCleaned(recordingId).catch(() => {});
-  log.info({ recordingId, workDir }, 'recording: scratch cleaned');
-  return { cleaned: true };
+}
+
+/* -------------------------------------------------------------------------- */
+/* recording.cleanup                                                           */
+/* -------------------------------------------------------------------------- */
+
+async function cleanupSegments(job) {
+  const { recordingId, bucket, keyPrefix } = job.data;
+
+  const asset = await assetRepository.findBySourceRef(`recording:${recordingId}`);
+  if (!asset || asset.status === 'failed') {
+    // The mux never succeeded — keep the segments, they are the only copy.
+    log.warn({ recordingId }, 'skipping segment cleanup, no ready asset');
+    return { deleted: 0, skipped: true };
+  }
+
+  const segments = await listSegments({ bucket, keyPrefix });
+  const keys = [...segments.values()].flat();
+  let deleted = 0;
+
+  for (let i = 0; i < keys.length; i += 1_000) {
+    const chunk = keys.slice(i, i + 1_000);
+    await s3.send(
+      new DeleteObjectsCommand({
+        Bucket: bucket,
+        Delete: { Objects: chunk.map((Key) => ({ Key })), Quiet: true },
+      }),
+    );
+    deleted += chunk.length;
+  }
+
+  log.info({ recordingId, deleted }, 'raw segments removed');
+  return { deleted };
+}
+
+/* -------------------------------------------------------------------------- */
+/* S3 helpers                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @returns {Promise<Map<string, string[]>>} trackId -> ordered segment keys
+ */
+async function listSegments({ bucket, keyPrefix }) {
+  /** @type {Map<string, string[]>} */
+  const byTrack = new Map();
+  let ContinuationToken;
+
+  do {
+    const res = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: keyPrefix, ContinuationToken }),
+    );
+    for (const obj of res.Contents ?? []) {
+      if (!obj.Key || obj.Size === 0) continue;
+      const rest = obj.Key.slice(keyPrefix.length);
+      const [trackId, file] = rest.split('/');
+      if (!trackId || !file) continue;
+      if (!byTrack.has(trackId)) byTrack.set(trackId, []);
+      byTrack.get(trackId).push(obj.Key);
+    }
+    ContinuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (ContinuationToken);
+
+  // Segment names are zero-padded counters, so lexical order is time order.
+  for (const keys of byTrack.values()) keys.sort();
+  return byTrack;
+}
+
+async function downloadObject({ bucket, key, destination }) {
+  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  await pipeline(res.Body, createWriteStream(destination));
+}
+
+async function uploadFile({ bucket, key, filePath, contentType }) {
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const upload = new Upload({
+      client: s3,
+      params: {
+        Bucket: bucket,
+        Key: key,
+        Body: handle.createReadStream(),
+        ContentType: contentType,
+        ServerSideEncryption: 'aws:kms',
+        SSEKMSKeyId: env.S3_KMS_KEY_ID,
+      },
+      queueSize: 4,
+      partSize: 16 * 1024 * 1024,
+    });
+    await upload.done();
+  } finally {
+    await handle.close();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ffmpeg                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Concatenate one track's segments. The segments are already fMP4 with the
+ * same codec parameters, so this is a stream copy — no re-encode, no quality
+ * loss, seconds instead of minutes.
+ */
+async function concatTrack({ bucket, keys, trackId, workDir }) {
+  const trackDir = path.join(workDir, trackId);
+  await fs.mkdir(trackDir, { recursive: true });
+
+  const localFiles = [];
+  for (const [index, key] of keys.entries()) {
+    const destination = path.join(trackDir, `${String(index).padStart(6, '0')}.mp4`);
+    await downloadObject({ bucket, key, destination });
+    localFiles.push(destination);
+  }
+
+  const listPath = path.join(trackDir, 'segments.txt');
+  await fs.writeFile(
+    listPath,
+    localFiles.map((f) => `file '${f.replaceAll("'", "'\\''")}'`).join('\n'),
+    'utf8',
+  );
+
+  const output = path.join(workDir, `${trackId}.mp4`);
+  await runFfmpeg([
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', listPath,
+    '-c', 'copy',
+    '-movflags', '+faststart',
+    output,
+  ]);
+
+  return output;
+}
+
+/**
+ * Compose the final file.
+ *
+ * Layout 'primary': the screen share if the lesson had one, otherwise the
+ * first camera track, with every audio track mixed down. This is what people
+ * actually rewatch; a full grid composition is a separate, much more expensive
+ * job and is deliberately not done here.
+ */
+async function compose({ trackFiles, outputPath }) {
+  const videos = trackFiles.filter((t) => t.kind === 'video');
+  const audios = trackFiles.filter((t) => t.kind === 'audio');
+
+  const primary =
+    videos.find((t) => t.source === 'screen') ??
+    videos.find((t) => t.source === 'cam') ??
+    videos[0];
+
+  if (!primary && audios.length === 0) {
+    throw new Error('compose: no usable track');
+  }
+
+  const args = ['-y'];
+  const inputs = [];
+
+  if (primary) {
+    args.push('-i', primary.file);
+    inputs.push(primary);
+  }
+  for (const audio of audios) {
+    args.push('-i', audio.file);
+    inputs.push(audio);
+  }
+
+  if (audios.length > 1) {
+    const audioStart = primary ? 1 : 0;
+    const mix = audios
+      .map((_, i) => `[${audioStart + i}:a]`)
+      .join('');
+    args.push(
+      '-filter_complex',
+      `${mix}amix=inputs=${audios.length}:duration=longest:dropout_transition=2,dynaudnorm[aout]`,
+      '-map', '[aout]',
+    );
+  } else if (audios.length === 1) {
+    args.push('-map', `${primary ? 1 : 0}:a`);
+  }
+
+  if (primary) {
+    args.push('-map', '0:v');
+    // Video is copied: the sidecar already produced H.264/VP8 fMP4 and
+    // MediaConvert builds the HLS ladder afterwards. Re-encoding here would
+    // cost CPU twice for nothing.
+    args.push('-c:v', 'copy');
+  }
+
+  args.push('-c:a', 'aac', '-b:a', '128k', '-ar', '48000');
+  args.push('-movflags', '+faststart', '-shortest', outputPath);
+
+  await runFfmpeg(args);
+}
+
+/**
+ * @param {string[]} args
+ */
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-nostdin', ...args], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+      if (stderr.length > 16_384) stderr = stderr.slice(-16_384);
+    });
+
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`ffmpeg timed out after ${MUX_TIMEOUT_MS} ms`));
+    }, MUX_TIMEOUT_MS);
+    timer.unref();
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve();
+      reject(new Error(`ffmpeg exited with ${code}: ${stderr.trim()}`));
+    });
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Fallback when the job payload lost its track list (an old job, or a session
+ * that died before it could report). The sidecar encodes kind and source into
+ * the track directory name, so the directory is still authoritative.
+ */
+function inferTrack(trackId) {
+  const lower = trackId.toLowerCase();
+  const kind = lower.includes('audio') || lower.includes('mic') ? 'audio' : 'video';
+  const source = lower.includes('screen') ? 'screen' : kind === 'audio' ? 'mic' : 'cam';
+  return { kind, source };
 }
 
 export default createRecordingWorker;

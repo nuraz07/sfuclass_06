@@ -1,169 +1,210 @@
 /**
- * db/redis — application Redis client. [EXT]
+ * server/src/db/redis.js
  *
- * Same ElastiCache cluster as the queues, different keys. `queues/connection.js` owns the
- * BullMQ connections and their `{prefix:bull}` namespace; this file owns everything else,
- * and the two never share a client — a blocking BullMQ connection cannot be borrowed for a
- * GET, and a busy GET connection makes BullMQ's blocking reads unpredictable.
+ * Two Redis clients, two purposes, two eviction policies.  (F7)
  *
- * Four uses, four prefixes, so a `SCAN` during an incident tells you what you are looking
- * at and a stray key has an owner:
+ * v6 -> v7 correction: v6 had one cluster for BullMQ, the seat-reservation Lua
+ * script and every cache, with an eviction alarm on top. BullMQ jobs and seat
+ * reservations are state: if the cluster evicts, a job or a paid seat silently
+ * disappears. Caches, on the other hand, *must* be allowed to evict or they
+ * fill up and take the cluster down.
  *
- *   ent:    entitlement cache (billing), TTL 60s
- *   seat:   seat reservations (the Lua script in capacity/)
- *   pres:   presence and unread counters
- *   sock:   Socket.IO adapter and per-socket rate budgets
+ *   state (maxmemory-policy=noeviction)
+ *     BullMQ, capacity/reserveSeat.lua, room registry, SFU + TURN node
+ *     registries, drain flags, rate limits, session revocation list,
+ *     recording session state.
  *
- * On eviction: presence and unread counters are reconstructible, the entitlement cache is a
- * cache, and seat reservations have their own TTL. Nothing here is the only copy of
- * anything — which is why "Redis is lost" is degraded, not down. Keep it that way: if
- * something is ever written here that Postgres does not also know, that rule is broken.
+ *   cache (maxmemory-policy=volatile-lru)
+ *     entitlements, presence, unread counters, Socket.IO sharded Pub/Sub,
+ *     short-lived lookups. Every key written here gets a TTL — under
+ *     volatile-lru a key without one is never evictable, which recreates the
+ *     v6 problem inside the cache cluster.
+ *
+ * Both clusters run with TLS and automatic failover (data.tf).
+ *
+ * Node.js 22, ESM.
  */
 
-import IORedis from 'ioredis';
+import Redis, { Cluster } from 'ioredis';
 
 import { env } from '../config/env.js';
 import { logger } from '../observability/logger.js';
 import { metrics } from '../observability/metrics.js';
 
-export const PREFIX = Object.freeze({
-  entitlement: `${env.REDIS_PREFIX ?? 'cp'}:ent:`,
-  seat: `${env.REDIS_PREFIX ?? 'cp'}:seat:`,
-  presence: `${env.REDIS_PREFIX ?? 'cp'}:pres:`,
-  socket: `${env.REDIS_PREFIX ?? 'cp'}:sock:`,
-  rate: `${env.REDIS_PREFIX ?? 'cp'}:rate:`,
-});
+const log = logger.child({ component: 'redis' });
 
-/** `key(PREFIX.presence, userId)` — never build a key by hand with a template literal. */
-export const key = (prefix, ...parts) => `${prefix}${parts.join(':')}`;
+/* -------------------------------------------------------------------------- */
+/* Factory                                                                     */
+/* -------------------------------------------------------------------------- */
 
-function options() {
-  return {
-    ...(env.REDIS_TLS ? { tls: { servername: new URL(env.REDIS_URL).hostname } } : {}),
+/**
+ * @param {object} args
+ * @param {'state'|'cache'} args.role
+ * @param {string} args.url
+ * @param {boolean} [args.enableReadyCheck]
+ * @returns {Redis|Cluster}
+ */
+function createClient({ role, url }) {
+  const tls = env.REDIS_TLS ? { tls: {} } : {};
+
+  const common = {
+    ...tls,
+    keyPrefix: env.REDIS_PREFIX ? `${env.REDIS_PREFIX}:${role}:` : `${role}:`,
+    // BullMQ requires this to be null: it uses blocking commands (BRPOPLPUSH)
+    // whose duration must not count as a failed request.
+    maxRetriesPerRequest: role === 'state' ? null : 3,
+    enableReadyCheck: true,
+    enableOfflineQueue: role === 'state', // state: queue and retry; cache: fail fast
     connectTimeout: 10_000,
-    keepAlive: 30_000,
-    // Bounded: an application read should fail fast and let the caller degrade, rather
-    // than queue commands while the cluster is unreachable.
-    maxRetriesPerRequest: 3,
-    enableOfflineQueue: true,
-    retryStrategy: (attempt) => {
-      if (attempt > 20) return null; // give up reconnecting; the process is unhealthy
-      return Math.min(attempt * 200, 5_000);
-    },
-    reconnectOnError: (error) => {
-      // Mid-failover we can land on a replica; force a fresh handshake and retry the command.
-      if (error.message.includes('READONLY')) return 2;
-      return false;
+    commandTimeout: role === 'cache' ? 1_000 : undefined,
+    retryStrategy: (attempt) => Math.min(attempt * 200, 5_000),
+    reconnectOnError(err) {
+      // ElastiCache failover surfaces as READONLY on the old primary.
+      return err.message.includes('READONLY');
     },
   };
-}
 
-const clients = new Set();
+  const client = env.REDIS_CLUSTER_MODE
+    ? new Cluster([parseNode(url)], {
+        redisOptions: common,
+        // Reads go to the primary: a replica lagging behind on a seat
+        // reservation or a drain flag is a correctness bug, not a latency win.
+        scaleReads: 'master',
+        slotsRefreshTimeout: 5_000,
+        clusterRetryStrategy: (attempt) => Math.min(attempt * 200, 5_000),
+        enableOfflineQueue: common.enableOfflineQueue,
+      })
+    : new Redis(url, common);
 
-function instrument(name, client) {
-  client.on('error', (error) => {
-    metrics.increment?.('redis_error', 1, { client: name });
-    logger.error({ err: error, client: name }, 'redis: error');
-  });
-  client.on('reconnecting', (delay) => logger.warn({ client: name, delay }, 'redis: reconnecting'));
-  client.on('ready', () => logger.info({ client: name }, 'redis: ready'));
-  clients.add(client);
+  instrument(role, client);
   return client;
 }
 
-/** The main client. Commands only — never subscribe on this one. */
-export const redis = instrument('main', new IORedis(env.REDIS_URL, options()));
-
-/**
- * A subscriber connection can only run subscribe-family commands, so pub/sub needs its own.
- * The Socket.IO Redis adapter needs a matching pair.
- */
-export function createSubscriber(name = 'subscriber') {
-  return instrument(name, new IORedis(env.REDIS_URL, options()));
+function parseNode(url) {
+  const parsed = new URL(url);
+  return { host: parsed.hostname, port: Number(parsed.port || 6379) };
 }
 
-export function duplicate(name) {
-  return instrument(name, redis.duplicate());
-}
-
-/* ------------------------------------------------------------------ *
- * Helpers
- * ------------------------------------------------------------------ */
-
-/**
- * Cache-aside with a TTL. Used for entitlements, where a 60-second stale read is fine and a
- * database round trip per request is not.
- */
-export async function cached(cacheKey, ttlSeconds, produce) {
-  try {
-    const hit = await redis.get(cacheKey);
-    if (hit !== null) {
-      metrics.increment?.('redis_cache_hit');
-      return JSON.parse(hit);
-    }
-  } catch (error) {
-    // A cache that is down must not take the request with it.
-    logger.warn({ err: error, cacheKey }, 'redis: cache read failed, falling through');
-    return produce();
-  }
-
-  metrics.increment?.('redis_cache_miss');
-  const value = await produce();
-  redis.set(cacheKey, JSON.stringify(value), 'EX', ttlSeconds).catch((error) => {
-    logger.warn({ err: error, cacheKey }, 'redis: cache write failed');
+function instrument(role, client) {
+  client.on('connect', () => log.info({ role }, 'redis connecting'));
+  client.on('ready', () => log.info({ role }, 'redis ready'));
+  client.on('error', (err) => {
+    log.warn({ err, role }, 'redis error');
+    metrics.increment('redis.error', { role });
   });
-  return value;
+  client.on('reconnecting', (delay) => {
+    log.warn({ role, delay }, 'redis reconnecting');
+    metrics.increment('redis.reconnect', { role });
+  });
+  client.on('end', () => log.info({ role }, 'redis connection closed'));
+  if (client instanceof Cluster) {
+    client.on('node error', (err, address) =>
+      log.warn({ err, role, address }, 'redis cluster node error'),
+    );
+  }
 }
 
-/** Delete by prefix without KEYS — SCAN in batches, so a big namespace cannot block the server. */
-export async function deleteByPrefix(prefix, { batch = 500 } = {}) {
-  let cursor = '0';
-  let removed = 0;
-  do {
-    const [next, found] = await redis.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', batch);
-    cursor = next;
-    if (found.length > 0) {
-      await redis.unlink(...found); // UNLINK, not DEL: frees memory off the main thread
-      removed += found.length;
+/* -------------------------------------------------------------------------- */
+/* Clients                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Durable, must never evict. */
+export const stateRedis = createClient({ role: 'state', url: env.REDIS_STATE_URL });
+
+/**
+ * The sfu role receives REDIS_STATE_URL only (registries, drain flags,
+ * recording session state) and has no cache client — see §9 of the
+ * architecture. Guard against importing it there by accident.
+ */
+export const cacheRedis = env.REDIS_CACHE_URL
+  ? createClient({ role: 'cache', url: env.REDIS_CACHE_URL })
+  : new Proxy(
+      {},
+      {
+        get(_t, prop) {
+          throw new Error(
+            `cacheRedis is not configured for SERVICE_ROLE=${env.SERVICE_ROLE} ` +
+              `(attempted "${String(prop)}"); use stateRedis or add REDIS_CACHE_URL`,
+          );
+        },
+      },
+    );
+
+/* -------------------------------------------------------------------------- */
+/* Policy assertion                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Verify at boot that each cluster actually runs the policy this design
+ * depends on. A parameter group edited by hand is the kind of drift that only
+ * shows up as "a few jobs vanished last Tuesday".
+ *
+ * Called from readiness.js / startup. Logs loudly, and in production refuses
+ * to start the process when the state cluster can evict.
+ */
+export async function assertEvictionPolicies() {
+  const checks = [
+    { role: 'state', client: stateRedis, expected: 'noeviction', fatal: true },
+    {
+      role: 'cache',
+      client: env.REDIS_CACHE_URL ? cacheRedis : null,
+      expected: 'volatile-lru',
+      fatal: false,
+    },
+  ];
+
+  for (const { role, client, expected, fatal } of checks) {
+    if (!client) continue;
+    const policy = await readMaxmemoryPolicy(client);
+
+    if (policy === null) {
+      // Managed clusters can refuse CONFIG GET. Not an error — the parameter
+      // group is asserted in Terraform (data.tf) as well.
+      log.info({ role }, 'maxmemory-policy not readable, relying on the parameter group');
+      continue;
     }
-  } while (cursor !== '0');
-  return removed;
+
+    if (policy !== expected) {
+      const message = `redis ${role} cluster runs maxmemory-policy=${policy}, expected ${expected}`;
+      if (fatal && env.NODE_ENV === 'production') throw new Error(message);
+      log.error({ role, policy, expected }, message);
+    } else {
+      log.info({ role, policy }, 'eviction policy verified');
+    }
+  }
 }
 
-/** Used by /readyz. */
-export async function ping({ timeoutMs = 2000 } = {}) {
-  const started = Date.now();
+async function readMaxmemoryPolicy(client) {
   try {
-    await Promise.race([
-      redis.ping(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('redis ping timed out')), timeoutMs).unref?.()),
-    ]);
-    return { ok: true, latencyMs: Date.now() - started };
-  } catch (error) {
-    return { ok: false, latencyMs: Date.now() - started, reason: error.message };
+    const target = client instanceof Cluster ? client.nodes('master')[0] : client;
+    const result = await target.config('GET', 'maxmemory-policy');
+    // ioredis returns ['maxmemory-policy', 'noeviction'] or an object on RESP3.
+    if (Array.isArray(result)) return result[1] ?? null;
+    return result?.['maxmemory-policy'] ?? null;
+  } catch {
+    return null;
   }
 }
 
-/** Verify Redis during process startup and fail fast when it is unreachable. */
-export async function verifyRedisConnection() {
-  const result = await ping({ timeoutMs: 10_000 });
-  if (!result.ok) {
-    throw new Error(`Redis connection failed: ${result.reason}`);
+/* -------------------------------------------------------------------------- */
+/* Health and shutdown                                                         */
+/* -------------------------------------------------------------------------- */
+
+/** Input for GET /readyz. */
+export async function pingAll() {
+  const out = { state: false, cache: null };
+  out.state = await stateRedis.ping().then(() => true).catch(() => false);
+  if (env.REDIS_CACHE_URL) {
+    out.cache = await cacheRedis.ping().then(() => true).catch(() => false);
   }
+  return out;
 }
 
 export async function closeRedis() {
-  await Promise.allSettled(
-    [...clients].map(async (client) => {
-      try {
-        await client.quit();
-      } catch {
-        client.disconnect();
-      }
-    }),
-  );
-  clients.clear();
-  logger.info('redis: connections closed');
+  await Promise.allSettled([
+    stateRedis.quit(),
+    env.REDIS_CACHE_URL ? cacheRedis.quit() : Promise.resolve(),
+  ]);
 }
 
-export default redis;
+export default { stateRedis, cacheRedis, pingAll, closeRedis, assertEvictionPolicies };

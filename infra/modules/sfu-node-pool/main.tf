@@ -1,321 +1,298 @@
+###############################################################################
 # infra/modules/sfu-node-pool/main.tf
 #
-# SFU nodes of one media region (replaces the v6 file infra/ecs-sfu.tf). Each node is one EC2 instance with host
-# networking, its own Elastic IP from the pool, and exactly one task:
+# One pool of SFU nodes in one media region.  (F1, F8)
 #
-#   container "sfu"       server/src/sfu.js — mediasoup workers, one WebRtcServer (UDP + TCP port) per worker,
-#                         control RPC (mTLS) on the private IP, registry heartbeat, drain watcher
-#   container "capture"   server/Dockerfile.capture — receives recording RTP over loopback, writes segments to the
-#                         shared scratch volume; not essential: a capture failure ends recordings, never lessons
-#   volume "capture-scratch"   task-scoped disk volume shared by both (segments until uploaded)
+# Replaces v6's ecs-sfu.tf. The correction that drives every decision here:
+# there is NO load balancer on the media path. An NLB gives many nodes one
+# address, and an ICE candidate that points at a shared address cannot
+# identify the node that owns the transport — the candidate is simply wrong for
+# every node but one. On top of that, NLB listeners are per port and capped,
+# which contradicted the announced port range in the first place.
 #
-# No load balancer anywhere on the media path: clients reach the node's Elastic IP directly (ICE candidates), the
-# realtime service reaches the control port over the Transit Gateway, and TURN nodes relay to the Elastic IP.
+# So: each instance gets an Elastic IP from a pre-allocated pool, runs exactly
+# one SFU task with host networking, and announces its own address. Load is
+# distributed by placement (RoomPlacementService picks the least loaded node
+# from the registry), not by packet routing. Health is enforced by registry
+# heartbeats with a 15 s TTL, not by a target group.
 #
-# Two services, <service_base>-blue and <service_base>-green, like the TURN pool: an SFU node can only be replaced
-# after its rooms have ended, which a rolling ECS deployment cannot wait for. deploy-sfu.yml switches colours and
-# drains the old one (drain flag → no new rooms → rooms end → scale to 0). Terraform creates both and then leaves
-# images and task counts to the workflow and to autoscaling.
-#
-# Owner: F1 Live Classrooms + F8 Real-Time Connectivity.
-
-terraform {
-  required_version = ">= 1.6.0"
-
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">= 5.80, < 7.0"
-    }
-  }
-}
-
-data "aws_caller_identity" "current" {}
-data "aws_partition" "current" {}
-
-data "aws_vpc" "this" {
-  id = var.vpc_id
-}
+# Each task is SFU + capture sidecar: recording RTP goes over loopback and
+# never touches the network.
+###############################################################################
 
 locals {
-  name       = "${var.name_prefix}-sfu-${var.region_short}"
-  partition  = data.aws_partition.current.partition
-  account_id = data.aws_caller_identity.current.account_id
+  name = "${var.name_prefix}-sfu-${var.region}"
 
-  # <account>.dkr.ecr.<region>.amazonaws.com/<repository>[:tag|@digest]
-  image_parts = [
-    for image in [var.images.sfu, var.images.capture] :
-    regex("^([0-9]+)\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com/([^:@]+)", image)
-  ]
-  repository_arns = distinct([for p in local.image_parts : "arn:${local.partition}:ecr:${p[1]}:${p[0]}:repository/${p[2]}"])
-  image_tag       = try(regex(":([^:@/]+)$", var.images.sfu)[0], "digest")
-
-  rtc_port_max     = var.rtc_port_base + var.workers - 1
-  colours          = ["blue", "green"]
-  service_names    = { for c in local.colours : c => "${var.service_base}-${c}" }
-  container_uid    = 1000 # sfu and capture share uid/gid 1000 so both can read and delete segments
-  stop_timeout_sec = 120
-  recordings_name  = var.recordings_bucket_arn == null ? "" : element(split(":", var.recordings_bucket_arn), 5)
+  # WebRtcServer ports: one UDP and one TCP per mediasoup worker,
+  # MEDIASOUP_RTC_PORT_BASE + workerIndex. The security group opens exactly
+  # this range and nothing else.
+  rtc_port_min = var.rtc_port_base
+  rtc_port_max = var.rtc_port_base + var.workers_per_node - 1
 }
 
-# ------------------------------------------------------------------ logs
+###############################################################################
+# ECS capacity provider backed by the ASG
+###############################################################################
 
-resource "aws_cloudwatch_log_group" "sfu" {
-  name              = "/ecs/${local.name}"
-  retention_in_days = var.log_retention_days
-  kms_key_id        = var.logs_kms_key_arn
-}
+resource "aws_ecs_capacity_provider" "this" {
+  name = local.name
 
-# ------------------------------------------------------------------ task roles
+  auto_scaling_group_provider {
+    auto_scaling_group_arn = aws_autoscaling_group.this.arn
 
-data "aws_iam_policy_document" "ecs_tasks_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
+    # Terraform owns scaling (autoscaling.tf); managed scaling would fight it
+    # and, worse, would terminate instances without going through the drain.
+    managed_scaling {
+      status = "DISABLED"
     }
-    condition {
-      test     = "ArnLike"
-      variable = "aws:SourceArn"
-      values   = ["arn:${local.partition}:ecs:${var.region}:${local.account_id}:*"]
-    }
+
+    # Never let ECS terminate an instance on its own: a terminated node drops
+    # every live lesson on it. Scale-in happens only through the lifecycle
+    # hook and the drain.
+    managed_termination_protection = "ENABLED"
   }
+
+  tags = var.tags
 }
 
-# Execution role: pull both images, write logs, inject the control-plane certificates and the Redis URL.
-resource "aws_iam_role" "execution" {
-  name               = "${local.name}-execution"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
-}
+resource "aws_ecs_cluster_capacity_providers" "this" {
+  cluster_name       = var.ecs_cluster_name
+  capacity_providers = [aws_ecs_capacity_provider.this.name]
 
-data "aws_iam_policy_document" "execution" {
-  statement {
-    sid       = "PullImages"
-    actions   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"]
-    resources = local.repository_arns
-  }
-  statement {
-    sid       = "EcrAuth"
-    actions   = ["ecr:GetAuthorizationToken"]
-    resources = ["*"]
-  }
-  statement {
-    sid       = "Logs"
-    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["${aws_cloudwatch_log_group.sfu.arn}:*"]
-  }
-  statement {
-    sid       = "InjectSecrets"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [var.secret_arns.redis_state_url, var.secret_arns.control_tls, var.secret_arns.control_ca]
-  }
-  statement {
-    sid       = "DecryptSecrets"
-    actions   = ["kms:Decrypt"]
-    resources = [var.secrets_kms_key_arn]
-  }
-}
-
-resource "aws_iam_role_policy" "execution" {
-  name   = "execution"
-  role   = aws_iam_role.execution.id
-  policy = data.aws_iam_policy_document.execution.json
-}
-
-# Task role: drainSfu.js completes the node's terminate hook after its rooms ended; recordingPipeline.js uploads
-# segments.
-resource "aws_iam_role" "task" {
-  name               = "${local.name}-task"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
-}
-
-data "aws_iam_policy_document" "task" {
-  statement {
-    sid       = "CompleteOwnLifecycleHooks"
-    actions   = ["autoscaling:CompleteLifecycleAction", "autoscaling:RecordLifecycleActionHeartbeat"]
-    resources = [aws_autoscaling_group.sfu.arn]
-  }
-
-  dynamic "statement" {
-    for_each = var.recordings_bucket_arn == null ? [] : [1]
-    content {
-      sid       = "UploadRecordingSegments"
-      actions   = ["s3:PutObject", "s3:AbortMultipartUpload"]
-      resources = ["${var.recordings_bucket_arn}/recordings/segments/*"]
-    }
-  }
-}
-
-resource "aws_iam_role_policy" "task" {
-  name   = "task"
-  role   = aws_iam_role.task.id
-  policy = data.aws_iam_policy_document.task.json
-}
-
-# ------------------------------------------------------------------ task definition
-
-locals {
-  sfu_environment = merge({
-    NODE_ENV                    = "production"
-    SERVICE_ROLE                = "sfu"
-    SERVICE_NAME                = "sfu"
-    LOG_LEVEL                   = "info"
-    RELEASE_SHA                 = local.image_tag
-    MEDIA_REGION                = var.region
-    MEDIA_PUBLIC_ADDRESS_SOURCE = "imds"
-    MEDIASOUP_WORKERS           = tostring(var.workers)
-    MEDIASOUP_RTC_PORT_BASE     = tostring(var.rtc_port_base)
-    MEDIASOUP_PIPE_PORT_MIN     = tostring(var.pipe_port_range.min)
-    MEDIASOUP_PIPE_PORT_MAX     = tostring(var.pipe_port_range.max)
-    SFU_CONTROL_PORT            = tostring(var.control_port)
-    SFU_MAX_LOAD_SCORE          = tostring(var.max_load_score)
-    SFU_CONSUMERS_PER_WORKER    = tostring(var.consumers_per_worker)
-    SFU_EGRESS_CAPACITY_MBPS    = tostring(var.egress_capacity_mbps)
-    SFU_DRAIN_TIMEOUT_MS        = tostring(var.drain_timeout_minutes * 60000)
-    SFU_SIGTERM_GRACE_MS        = "25000"
-    REDIS_TLS                   = "true"
-    REDIS_CLUSTER               = var.redis_cluster_mode ? "true" : "false"
-    CAPTURE_AGENT_URL           = "http://127.0.0.1:7460"
-    CAPTURE_SCRATCH_DIR         = "/scratch"
-    CAPTURE_RTP_PORT_MIN        = tostring(var.capture_rtp_port_range.min)
-    CAPTURE_RTP_PORT_MAX        = tostring(var.capture_rtp_port_range.max)
-    }, var.recordings_bucket_arn == null ? {} : {
-    S3_BUCKET_RECORDINGS = local.recordings_name
-  })
-
-  sfu_secrets = {
-    REDIS_STATE_URL      = var.secret_arns.redis_state_url
-    SFU_CONTROL_TLS_CERT = "${var.secret_arns.control_tls}:cert::"
-    SFU_CONTROL_TLS_KEY  = "${var.secret_arns.control_tls}:key::"
-    SFU_CONTROL_CA       = var.secret_arns.control_ca
-  }
-
-  capture_environment = {
-    CAPTURE_LISTEN_PORT     = "7460"
-    CAPTURE_SCRATCH_DIR     = "/scratch"
-    CAPTURE_RTP_PORT_MIN    = tostring(var.capture_rtp_port_range.min)
-    CAPTURE_RTP_PORT_MAX    = tostring(var.capture_rtp_port_range.max)
-    CAPTURE_MAX_SESSIONS    = "32"
-    CAPTURE_SEGMENT_SECONDS = "6"
-    CAPTURE_STOP_TIMEOUT_MS = "10000"
-  }
-
-  log_options = {
-    awslogs-group   = aws_cloudwatch_log_group.sfu.name
-    awslogs-region  = var.region
-    mode            = "non-blocking"
-    max-buffer-size = "4m"
-  }
-  scratch_mount = [{ sourceVolume = "capture-scratch", containerPath = "/scratch", readOnly = false }]
-
-  # Health: GET https://<private IP>:<control port>/healthz/sfu (served without client certificate; the node's own
-  # certificate is not verified here — this only asks whether the process answers healthily).
-  sfu_health_command = join("", [
-    "const i=Object.values(require('os').networkInterfaces()).flat().find(x=>x&&x.family==='IPv4'&&!x.internal);",
-    "require('https').get({host:i.address,port:${var.control_port},path:'/healthz/sfu',rejectUnauthorized:false,timeout:3000},",
-    "r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1)).on('timeout',()=>process.exit(1));",
-  ])
-}
-
-resource "aws_ecs_task_definition" "sfu" {
-  family                   = local.name
-  requires_compatibilities = ["EC2"]
-  network_mode             = "host"
-  execution_role_arn       = aws_iam_role.execution.arn
-  task_role_arn            = aws_iam_role.task.arn
-
-  volume {
-    name = "capture-scratch"
-
-    docker_volume_configuration {
-      scope  = "task"
-      driver = "local"
-    }
-  }
-
-  container_definitions = jsonencode([
-    {
-      name                   = "sfu"
-      image                  = var.images.sfu
-      essential              = true
-      command                = ["node", "--import", "./src/observability/tracing.js", "./src/sfu.js"]
-      user                   = "${local.container_uid}:${local.container_uid}"
-      readonlyRootFilesystem = true
-      memoryReservation      = 1024
-      stopTimeout            = local.stop_timeout_sec
-      environment            = [for k in sort(keys(local.sfu_environment)) : { name = k, value = local.sfu_environment[k] }]
-      secrets                = [for k in sort(keys(local.sfu_secrets)) : { name = k, valueFrom = local.sfu_secrets[k] }]
-      mountPoints            = local.scratch_mount
-      ulimits                = [{ name = "nofile", softLimit = 1048576, hardLimit = 1048576 }]
-      linuxParameters        = { capabilities = { drop = ["ALL"] }, initProcessEnabled = true }
-      healthCheck = {
-        command     = ["CMD", "node", "-e", local.sfu_health_command]
-        interval    = 15
-        timeout     = 5
-        retries     = 3
-        startPeriod = 300 # waits up to 300 s for the Elastic IP before the control server listens
-      }
-      logConfiguration = { logDriver = "awslogs", options = merge(local.log_options, { awslogs-stream-prefix = "sfu" }) }
-    },
-    {
-      name                   = "capture"
-      image                  = var.images.capture
-      essential              = false
-      user                   = "${local.container_uid}:${local.container_uid}"
-      readonlyRootFilesystem = true
-      memoryReservation      = 256
-      stopTimeout            = 30
-      environment            = [for k in sort(keys(local.capture_environment)) : { name = k, value = local.capture_environment[k] }]
-      mountPoints            = local.scratch_mount
-      linuxParameters        = { capabilities = { drop = ["ALL"] } }
-      healthCheck = {
-        command     = ["CMD", "node", "/app/healthcheck.mjs"]
-        interval    = 15
-        timeout     = 3
-        retries     = 3
-        startPeriod = 10
-      }
-      logConfiguration = { logDriver = "awslogs", options = merge(local.log_options, { awslogs-stream-prefix = "capture" }) }
-    },
-  ])
-}
-
-# ------------------------------------------------------------------ services (blue / green)
-
-resource "terraform_data" "capacity_provider_ready" {
-  input = var.capacity_provider_association
-}
-
-resource "aws_ecs_service" "sfu" {
-  for_each = local.service_names
-
-  name                               = each.value
-  cluster                            = var.ecs_cluster.arn
-  task_definition                    = aws_ecs_task_definition.sfu.arn
-  desired_count                      = each.key == "blue" ? var.min_nodes : 0
-  deployment_minimum_healthy_percent = 100
-  deployment_maximum_percent         = 200
-  enable_ecs_managed_tags            = true
-  propagate_tags                     = "SERVICE"
-  wait_for_steady_state              = false
-
-  capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.sfu.name
+  default_capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.this.name
     weight            = 1
     base              = 0
   }
+}
 
+###############################################################################
+# Auto Scaling group
+###############################################################################
+
+resource "aws_autoscaling_group" "this" {
+  name                = local.name
+  vpc_zone_identifier = var.public_media_subnet_ids # public: nodes need their EIP
+
+  min_size         = var.min_nodes
+  max_size         = var.max_nodes
+  desired_capacity = var.desired_nodes
+
+  # The instance is only "in service" once the SFU has registered a heartbeat.
+  health_check_type         = "EC2"
+  health_check_grace_period = 300
+  default_instance_warmup   = 180
+
+  # Protected from scale-in: ECS managed termination protection plus this flag
+  # means the ASG cannot pick a node holding a live lesson.
+  protect_from_scale_in = true
+
+  capacity_rebalance = false # Spot rebalancing would move media mid-lesson
+
+  launch_template {
+    id      = aws_launch_template.this.id
+    version = aws_launch_template.this.latest_version
+  }
+
+  # One task per instance and one instance per AZ-slot: an even spread is what
+  # lets a single AZ loss cost a third of capacity rather than all of it.
+  instance_maintenance_policy {
+    min_healthy_percentage = 100
+    max_healthy_percentage = 200
+  }
+
+  dynamic "tag" {
+    for_each = merge(var.tags, {
+      Name                                = local.name
+      AmazonECSManaged                    = "true"
+      "classroom:role"                    = "sfu"
+      "classroom:region"                  = var.region
+      "classroom:eip-pool"                = var.eip_pool_tag
+    })
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
+
+  # A release replaces nodes one at a time, and each replacement waits for the
+  # old node to drain (deploy-sfu.yml, step 5). Checkpoints make the refresh
+  # observable rather than a black box.
+  instance_refresh {
+    strategy = "Rolling"
+
+    preferences {
+      min_healthy_percentage = 100
+      instance_warmup        = 180
+      checkpoint_percentages = [25, 50, 75, 100]
+      checkpoint_delay       = 300
+      standby_instances      = "Terminate"
+    }
+
+    triggers = ["launch_template", "tag"]
+  }
+
+  lifecycle {
+    create_before_destroy = true
+    ignore_changes        = [desired_capacity] # owned by autoscaling.tf
+  }
+
+  depends_on = [aws_launch_template.this]
+}
+
+###############################################################################
+# Task definition — SFU + capture sidecar
+###############################################################################
+
+resource "aws_cloudwatch_log_group" "sfu" {
+  name              = "/ecs/${var.name_prefix}/sfu/${var.region}"
+  retention_in_days = var.log_retention_days
+  kms_key_id        = var.logs_kms_key_arn
+  tags              = var.tags
+}
+
+resource "aws_ecs_task_definition" "sfu" {
+  family       = local.name
+  network_mode = "host" # the whole point: the task owns the instance's ports
+
+  requires_compatibilities = ["EC2"]
+  execution_role_arn       = var.execution_role_arn
+  task_role_arn            = var.task_role_arn
+
+  # Reserve almost the whole instance: one task per host, no noisy neighbour.
+  cpu    = var.task_cpu
+  memory = var.task_memory
+
+  pid_mode = "task" # sidecar and SFU share a PID namespace for loopback RTP
+
+  container_definitions = jsonencode([
+    {
+      name      = "sfu"
+      image     = "${var.sfu_image_repository}@${var.sfu_image_digest}"
+      essential = true
+      command   = ["node", "server/src/sfu.js"]
+
+      environment = [
+        { name = "NODE_ENV", value = "production" },
+        { name = "SERVICE_ROLE", value = "sfu" },
+        { name = "MEDIA_REGION", value = var.region },
+        { name = "MEDIASOUP_WORKERS", value = tostring(var.workers_per_node) },
+        { name = "MEDIASOUP_RTC_PORT_BASE", value = tostring(var.rtc_port_base) },
+        { name = "MEDIASOUP_PIPE_PORT_MIN", value = tostring(var.pipe_port_min) },
+        { name = "MEDIASOUP_PIPE_PORT_MAX", value = tostring(var.pipe_port_max) },
+        { name = "MEDIA_PUBLIC_ADDRESS_SOURCE", value = "imds" },
+        { name = "SFU_CONTROL_PORT", value = tostring(var.control_port) },
+        { name = "SFU_MAX_LOAD_SCORE", value = tostring(var.max_load_score) },
+        { name = "CAPTURE_SIDECAR_URL", value = "http://127.0.0.1:${var.capture_port}" },
+        { name = "S3_BUCKET_RECORDINGS", value = var.recordings_bucket },
+        { name = "SERVICE_NAME", value = "classroom-sfu" },
+        { name = "RELEASE_SHA", value = var.release_sha },
+        { name = "LOG_LEVEL", value = var.log_level },
+        # No TURN variable exists in this role, by design (Appendix A #3).
+      ]
+
+      secrets = [
+        { name = "REDIS_STATE_URL", valueFrom = "${var.redis_secret_arn}:state_url::" },
+        { name = "SFU_CONTROL_TLS_CERT", valueFrom = "${var.control_tls_secret_arn}:cert::" },
+        { name = "SFU_CONTROL_TLS_KEY", valueFrom = "${var.control_tls_secret_arn}:key::" },
+        { name = "SFU_CONTROL_CA", valueFrom = "${var.control_tls_secret_arn}:ca::" },
+      ]
+
+      # mediasoup needs to open its own UDP/TCP sockets on host ports; nothing
+      # else is granted.
+      linuxParameters = {
+        initProcessEnabled = true
+        capabilities       = { drop = ["ALL"], add = ["NET_BIND_SERVICE"] }
+      }
+
+      ulimits = [
+        { name = "nofile", softLimit = 65536, hardLimit = 65536 }
+      ]
+
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -fsS --cacert /run/sfu/ca.pem https://127.0.0.1:${var.control_port}/healthz/sfu || exit 1"]
+        interval    = 15
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
+      }
+
+      # Long stop timeout: SIGTERM starts a drain, and a drain waits for the
+      # last lesson to end. The lifecycle hook, not this value, decides how
+      # long that may take; this just keeps ECS from killing it early.
+      stopTimeout = 120
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.sfu.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "sfu"
+          "mode"                  = "non-blocking"
+        }
+      }
+    },
+    {
+      name      = "capture"
+      image     = "${var.capture_image_repository}@${var.capture_image_digest}"
+      essential = false # a dead recorder must not end the lesson
+
+      environment = [
+        { name = "CAPTURE_PORT", value = tostring(var.capture_port) },
+        { name = "S3_BUCKET_RECORDINGS", value = var.recordings_bucket },
+        { name = "AWS_REGION", value = var.region },
+        { name = "SEGMENT_SECONDS", value = tostring(var.recording_segment_seconds) },
+        { name = "RELEASE_SHA", value = var.release_sha },
+      ]
+
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:${var.capture_port}/healthz || exit 1"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 30
+      }
+
+      stopTimeout = 60
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.sfu.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "capture"
+        }
+      }
+    }
+  ])
+
+  tags = var.tags
+}
+
+###############################################################################
+# Service
+#
+# No load_balancer block. No target group. Media reaches this task directly on
+# the instance's Elastic IP.
+###############################################################################
+
+resource "aws_ecs_service" "sfu" {
+  name            = local.name
+  cluster         = var.ecs_cluster_id
+  task_definition = aws_ecs_task_definition.sfu.arn
+
+  scheduling_strategy = "DAEMON" # exactly one task per instance, always
+
+  capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.this.name
+    weight            = 1
+  }
+
+  # DAEMON placement already guarantees one per host; the constraint documents
+  # and enforces it if the strategy ever changes.
   placement_constraints {
     type = "distinctInstance"
-  }
-  placement_constraints {
-    type       = "memberOf"
-    expression = "attribute:media-pool == sfu"
-  }
-  ordered_placement_strategy {
-    type  = "spread"
-    field = "attribute:ecs.availability-zone"
   }
 
   deployment_circuit_breaker {
@@ -323,14 +300,15 @@ resource "aws_ecs_service" "sfu" {
     rollback = true
   }
 
-  lifecycle {
-    # deploy-sfu.yml owns task definitions and colour sizes; autoscaling adjusts the active colour.
-    ignore_changes = [task_definition, desired_count]
-  }
+  # A rolling deploy of the SFU happens through the ASG instance refresh, not
+  # by restarting tasks under live rooms.
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 100
 
-  tags = {
-    Colour = each.key
-  }
+  enable_execute_command = var.enable_ecs_exec
 
-  depends_on = [terraform_data.capacity_provider_ready, aws_iam_role_policy.execution, aws_iam_role_policy.task]
+  propagate_tags = "SERVICE"
+  tags           = var.tags
+
+  depends_on = [aws_ecs_cluster_capacity_providers.this]
 }
