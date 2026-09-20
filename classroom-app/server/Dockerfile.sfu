@@ -1,0 +1,109 @@
+# classroom-app/server/Dockerfile.sfu
+#
+# SFU image  (F1, F7)  [EXT]
+#
+# The only image that compiles mediasoup. The worker is a C++ binary built by
+# meson and ninja at install time, so the build stage carries a toolchain and
+# Python and the runtime stage carries neither: the compiler never ships to a
+# node with a public IP.
+#
+# Version 7: the entrypoint is sfu.js, not server.js. This container is a media
+# node — mediasoup workers, one WebRtcServer per worker, and the private control
+# RPC — and it holds no TURN configuration at all, because the SFU is ICE-lite
+# and never speaks to TURN.
+#
+# Networking: the task runs with host networking, so no port is published here.
+# The ports are UDP and TCP 40000 + workerIndex (the WebRtcServer pair per
+# worker), UDP 41000–41999 for node-to-node pipe transports on private IPs, and
+# TCP 7443 for the mTLS control RPC. The security group in
+# modules/sfu-node-pool opens exactly those.
+#
+# Build:  docker build -f server/Dockerfile.sfu -t classroom-sfu .
+#         (context is the monorepo root: the workspace needs packages/)
+
+# renovate: datasource=docker depName=node versioning=node
+ARG NODE_IMAGE=node:22-bookworm-slim
+# Renovate pins this to a digest in build-images.yml; never build production
+# from a floating tag.
+
+# ---------------------------------------------------------------------------
+# 1. deps — install workspaces and compile the mediasoup worker
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS deps
+
+# mediasoup builds its worker with meson/ninja through pip.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      python3 \
+      python3-pip \
+      pkg-config \
+      git \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHON=/usr/bin/python3 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    npm_config_build_from_source=true
+
+WORKDIR /build
+
+# Manifests first: this layer is cached until a dependency actually changes.
+COPY package.json package-lock.json ./
+COPY packages/contracts/package.json packages/contracts/
+COPY packages/core-client/package.json packages/core-client/
+COPY server/package.json server/
+
+RUN npm ci --workspaces --include-workspace-root
+
+# ---------------------------------------------------------------------------
+# 2. build — shared packages the server imports
+# ---------------------------------------------------------------------------
+FROM deps AS build
+
+COPY packages/ packages/
+COPY server/ server/
+COPY turbo.json tsconfig.json ./
+
+RUN npm run build --workspace @classroom/contracts
+
+# Drop everything that is only needed to build. The compiled mediasoup worker
+# stays: it lives in node_modules/mediasoup/worker/out/Release.
+RUN npm prune --omit=dev --workspaces --include-workspace-root
+
+# ---------------------------------------------------------------------------
+# 3. runtime — no toolchain, no Python, no root
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS runtime
+
+# tini reaps the mediasoup worker processes and forwards SIGTERM, which is what
+# lets gracefulShutdown.js run instead of the node being killed mid-lesson.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV NODE_ENV=production \
+    SERVICE_ROLE=sfu \
+    NODE_OPTIONS=--enable-source-maps
+
+WORKDIR /app
+
+# The image ships as the unprivileged `node` user that the base image provides.
+COPY --from=build --chown=node:node /build/node_modules ./node_modules
+COPY --from=build --chown=node:node /build/package.json ./package.json
+COPY --from=build --chown=node:node /build/packages ./packages
+COPY --from=build --chown=node:node /build/server ./server
+
+# Fail the build rather than the first lesson if the worker did not compile.
+RUN test -x /app/node_modules/mediasoup/worker/out/Release/mediasoup-worker
+
+USER node
+
+# Health is proven on the control port by sfu-node/controlServer.js
+# (GET /healthz/sfu: workers alive, ports bound, public address resolved,
+# load below cap). ECS calls it; there is no load balancer on the media path.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.SFU_CONTROL_PORT||7443)+'/healthz/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server/src/sfu.js"]
