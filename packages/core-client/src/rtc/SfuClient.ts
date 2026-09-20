@@ -1,27 +1,47 @@
+// classroom-app/packages/core-client/src/rtc/SfuClient.ts
 /**
- * SFU client  (F1)
+ * SFU client  (F1, F8)  [EXT]
  *
- * Owns one live session: the signalling socket, the two mediasoup transports,
- * every producer this peer publishes and every consumer it subscribes to. It is
- * the only place in the client that knows mediasoup exists.
+ * Owns one live session: the signalling socket to the realtime service, the
+ * two mediasoup transports, every producer this peer publishes and every
+ * consumer it subscribes to. It is the only place in the client that knows
+ * mediasoup exists.
  *
- * Two design decisions worth stating, because everything else follows from
- * them:
+ * The decisions everything else follows from:
  *
- *   1. A screen share is a second producer on this same peer, tagged
+ *   1. Clients never address an SFU node (architecture v7, Appendix A #6).
+ *      The socket goes to the realtime service; `classroom:join` returns the
+ *      placement result as data: router capabilities, both transports and the
+ *      ICE configuration. There is no node resolver and no per-node URL.
+ *
+ *   2. Every transport is created with the `iceServers` and
+ *      `iceTransportPolicy` from the server. ICE evaluates direct UDP, direct
+ *      TCP and TURN over UDP / TCP / TLS 443 in parallel; there is no
+ *      sequential fallback in application code. A 'relay' policy — tenant
+ *      policy or a forced relay retry — is never weakened here.
+ *
+ *   3. A screen share is a second producer on this same peer, tagged
  *      `source: 'screen'`. Not a second connection, not a second client
- *      instance. The transport, the socket and the reconnect logic are already
- *      there; reusing them is what keeps screen sharing from doubling the
- *      failure modes of a lesson.
+ *      instance. It inherits whatever ICE path the send transport uses.
  *
- *   2. This class holds no UI state and no framework types. It emits events;
+ *   4. This class holds no UI state and no framework types. It emits events;
  *      state/useClassroom.ts turns those into whatever React needs. That is
  *      what lets apps/mobile reuse it unchanged.
  *
- * Reconnection: when the SFU node drains during a deployment the server sends
- * `classroom:node.draining` before it goes. The client rotates to another node
- * through nodeResolver and rejoins, republishing what it was sending. A lesson
- * survives a deploy with a visible pause rather than an ending.
+ *   5. ICE policy lives outside this file. IceConfigProvider (credential
+ *      refresh at 80 % of the TTL) and IceRecovery (restartIce → relay-only
+ *      retry → rejoin) attach as plugins and drive the primitives below:
+ *      applyIceConfig(), restartIce(), recreateTransports(), rejoinMedia().
+ *      Without an IceRecovery plugin a bounded built-in fallback runs, so a
+ *      bare client (tests, early boot) still recovers from a failed transport.
+ *
+ * Local tracks belong to the caller. Producers are created with
+ * `stopTracks: false`, so transports can be rebuilt and the same camera and
+ * microphone tracks republished without asking for devices again. Tracks are
+ * stopped only when the session ends (leave, room closed, fatal error).
+ *
+ * Nothing here logs ICE candidates or addresses: they are personal data
+ * (piiRedaction.js) and rtcStats.ts reports candidate types, not IPs.
  */
 
 import type { types as MediasoupTypes } from 'mediasoup-client';
@@ -29,10 +49,25 @@ import { ApiError, SignalingEvents, type SocketAck } from '@classroom/contracts'
 import type { DeviceAdapter, MediaStreamTrackLike } from './DeviceAdapter.js';
 import { CAMERA_ENCODINGS, SCREEN_ENCODINGS } from './DeviceAdapter.js';
 import type { ScreenShareAdapter, ScreenShareHandle } from './ScreenShareAdapter.js';
-import type { NodeResolver } from './nodeResolver.js';
 
 const { SIGNALING_CLIENT_EVENTS: CLIENT, SIGNALING_SERVER_EVENTS: SERVER } = SignalingEvents;
 
+type IceConfig = SignalingEvents.IceConfig;
+type IceTransportPolicy = SignalingEvents.IceTransportPolicy;
+type RegionHint = SignalingEvents.RegionHint;
+type TransportOptions = SignalingEvents.TransportOptions;
+type ProducerInfo = SignalingEvents.ProducerInfo;
+
+export type TransportDirection = SignalingEvents.TransportDirection;
+export type TransportConnectionState = MediasoupTypes.ConnectionState;
+
+/** Steps of the built-in fallback: restartIce, relay-only transports, media rejoin. */
+const FALLBACK_RECOVERY_STEPS = 3;
+
+/**
+ * In development the realtime service is proxied by Vite, so a localhost URL
+ * is rewritten to the page origin. Production URLs pass through untouched.
+ */
 const signalingUrlForBrowser = (url: string): string => {
   if (typeof globalThis.location === 'undefined' || !url) return url;
 
@@ -47,6 +82,9 @@ const signalingUrlForBrowser = (url: string): string => {
 
   return url;
 };
+
+const isLiveTrack = (track: unknown): boolean =>
+  Boolean(track) && (track as { readyState?: string }).readyState !== 'ended';
 
 // ---------------------------------------------------------------------------
 // Transport seam
@@ -73,6 +111,12 @@ export type SignalingTransportFactory = () => SignalingTransport;
 // Public shapes
 // ---------------------------------------------------------------------------
 
+/**
+ * 'resolving'    access token and region hint are being gathered
+ * 'connecting'   socket to the realtime service, then the join
+ * 'joined'       signalling is up; media state is in transportStateChanged
+ * 'reconnecting' media is being rebuilt (ICE restart excluded: that is silent)
+ */
 export type SfuConnectionState =
   | 'idle'
   | 'resolving'
@@ -114,24 +158,56 @@ export interface SfuClientEvents {
   handRaised: (event: { peerId: string; raised: boolean }) => void;
   reaction: (event: { peerId: string; emoji: string }) => void;
   recordingChanged: (event: { recording: boolean }) => void;
+  /** A new ICE configuration is in effect (join, refresh, push, recreate). */
+  iceConfigChanged: (ice: Readonly<IceConfig>) => void;
+  /** Raw mediasoup transport state; IceRecovery and useConnectionQuality listen. */
+  transportStateChanged: (event: {
+    direction: TransportDirection;
+    state: TransportConnectionState;
+    iceTransportPolicy: IceTransportPolicy;
+  }) => void;
+  /** The server announced that the room's node is draining. */
+  nodeDraining: (event: SignalingEvents.NodeDraining) => void;
   error: (error: ApiError) => void;
   closed: (reason: string) => void;
 }
 
 type Listener = (...args: never[]) => void;
 
+/**
+ * Extension point for IceConfigProvider, IceRecovery and rtcStats. attach()
+ * runs once in the constructor and returns its own detach function.
+ */
+export interface SfuClientPlugin {
+  readonly name: string;
+  /** Set by IceRecovery. Disables the built-in fallback recovery. */
+  readonly handlesIceRecovery?: boolean;
+  attach(client: SfuClient): () => void;
+}
+
 export interface SfuClientOptions {
   deviceAdapter: DeviceAdapter;
   screenShareAdapter: ScreenShareAdapter;
-  nodeResolver: NodeResolver;
   createTransport: SignalingTransportFactory;
+  /**
+   * The realtime service's WebSocket URL (PUBLIC_WS_URL). This is never an
+   * SFU node: placement happens on the server and arrives in the join ack.
+   */
+  signalingUrl: string;
   /** Supplies the current access token for the socket handshake. */
   getAccessToken(): string | null | Promise<string | null>;
-  /** mediasoup-client's Device constructor, injected to keep this tree-shakable. */
-  DeviceCtor: new (options?: unknown) => MediasoupTypes.Device;
+  /** Region hint from ConnectivityProbe. Failures are ignored; it is advisory. */
+  getRegionHint?(): RegionHint | null | Promise<RegionHint | null>;
+  plugins?: readonly SfuClientPlugin[];
   logger?: { debug(...args: unknown[]): void; warn(...args: unknown[]): void };
-  /** Attempts before a drained-node rejoin is given up on. */
+  /** Attempts before a drained-node media rejoin is given up on. */
   rejoinAttempts?: number;
+}
+
+interface LocalMediaSnapshot {
+  camera: { track: MediaStreamTrackLike; paused: boolean } | null;
+  microphone: { track: MediaStreamTrackLike; paused: boolean } | null;
+  wasSharing: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,13 +217,19 @@ export interface SfuClientOptions {
 export class SfuClient {
   private readonly options: SfuClientOptions;
   private readonly listeners = new Map<keyof SfuClientEvents, Set<Listener>>();
+  private readonly detachPlugins: Array<() => void> = [];
+  private readonly builtInRecovery: boolean;
 
-  private transport: SignalingTransport | null = null;
+  private socket: SignalingTransport | null = null;
   private device: MediasoupTypes.Device | null = null;
   private sendTransport: MediasoupTypes.Transport | null = null;
   private recvTransport: MediasoupTypes.Transport | null = null;
 
   private readonly consumers = new Map<string, MediasoupTypes.Consumer>();
+  /** Producer ids that are consumed or being consumed; prevents double consumes. */
+  private readonly consuming = new Set<string>();
+  /** Every remote producer in the room, so media can be re-consumed after a rebuild. */
+  private readonly remoteProducers = new Map<string, ProducerInfo>();
   private readonly producers: LocalProducers = {
     camera: null,
     microphone: null,
@@ -159,14 +241,32 @@ export class SfuClient {
   private stopScreenListener: (() => void) | null = null;
 
   private roomId: string | null = null;
-  private nodeId: string | null = null;
   private peerId: string | null = null;
+  private region: string | null = null;
+  private regionHint: RegionHint | null = null;
   private state: SfuConnectionState = 'idle';
-  /** Consecutive ICE failures. Reset by a join that actually connects. */
-  private connectionLossCount = 0;
+
+  private ice: IceConfig | null = null;
+  /** Set by a relay-only retry; lasts for the rest of the session. */
+  private relayForced = false;
+  /** The policy the current transports were built with. */
+  private transportPolicy: IceTransportPolicy = 'all';
+
+  /** Local media captured before a rebuild; survives a failed attempt. */
+  private pendingLocalMedia: LocalMediaSnapshot | null = null;
+  /** Rebuilds run one at a time, in order. */
+  private recoveryChain: Promise<void> = Promise.resolve();
+  private fallbackInFlight = false;
+  /** Consecutive failures without a transport reaching 'connected'. */
+  private consecutiveFailures = 0;
 
   constructor(options: SfuClientOptions) {
     this.options = options;
+    const plugins = options.plugins ?? [];
+    this.builtInRecovery = !plugins.some((plugin) => plugin.handlesIceRecovery);
+    for (const plugin of plugins) {
+      this.detachPlugins.push(plugin.attach(this));
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -199,6 +299,10 @@ export class SfuClient {
     this.emit('stateChanged', next);
   }
 
+  // -------------------------------------------------------------------------
+  // Read-only view
+  // -------------------------------------------------------------------------
+
   get connectionState(): SfuConnectionState {
     return this.state;
   }
@@ -211,74 +315,56 @@ export class SfuClient {
     return this.producers.screen !== null;
   }
 
+  get currentRoomId(): string | null {
+    return this.roomId;
+  }
+
+  get mediaRegion(): string | null {
+    return this.region;
+  }
+
+  get iceConfig(): Readonly<IceConfig> | null {
+    return this.ice;
+  }
+
+  get iceTransportPolicy(): IceTransportPolicy {
+    return this.transportPolicy;
+  }
+
+  get isRelayForced(): boolean {
+    return this.relayForced;
+  }
+
   // -------------------------------------------------------------------------
-  // Join
+  // Join and leave
   // -------------------------------------------------------------------------
 
   async join(roomId: string): Promise<SignalingEvents.RoomState> {
+    if (this.state !== 'idle' && this.state !== 'closed') {
+      throw new ApiError('internal_error', { detail: 'This client is already in a session' });
+    }
+
     this.roomId = roomId;
+    this.relayForced = false;
+    this.consecutiveFailures = 0;
     this.setState('resolving');
 
     try {
-      const node = await this.options.nodeResolver.resolve(roomId);
-      this.nodeId = node.nodeId;
+      const [token, regionHint] = await Promise.all([
+        this.options.getAccessToken(),
+        this.resolveRegionHint(),
+      ]);
+      this.regionHint = regionHint;
 
       this.setState('connecting');
-      const transport = this.options.createTransport();
-      this.transport = transport;
-      this.bindServerEvents(transport);
+      await this.openSocket(token);
 
-      const token = await this.options.getAccessToken();
-      await transport.connect(signalingUrlForBrowser(node.wsUrl), { token, roomId });
-
-      const device = this.options.deviceAdapter.createMediasoupDevice();
-      this.device = device;
-
-      const roomState = await this.request<SignalingEvents.RoomState>(CLIENT.join, {
-        roomId,
-        nodeId: node.nodeId,
-        // Empty until the device is loaded; the server sends its router
-        // capabilities back in the room state, which is what loads it.
-        rtpCapabilities: {},
-        device: {
-          platform: this.options.deviceAdapter.platform,
-          supportsScreenShare: this.options.screenShareAdapter.isSupported(),
-        },
-      });
-
-      if (!device.loaded) {
-        await device.load({
-          routerRtpCapabilities:
-            roomState.routerRtpCapabilities as unknown as MediasoupTypes.RtpCapabilities,
-        });
-      }
-
-    this.peerId = roomState.selfPeerId;
-    // A join that got this far means the path worked; previous failures were
-    // transient and should not count against the next one.
-    this.connectionLossCount = 0;
-    await this.createTransports();
-
+      const room = await this.joinMedia(false);
       this.setState('joined');
-      this.emit('roomState', roomState);
-
-      // A late joiner has to see an ongoing share, not just future ones.
-      if (roomState.screenShare) {
-        this.emit('screenShareStarted', roomState.screenShare);
-      }
-
-      return roomState;
+      return room;
     } catch (cause) {
-      this.options.nodeResolver.invalidate(roomId);
-      this.transport?.disconnect();
-      this.transport = null;
-      this.setState('closed');
-      const error = ApiError.is(cause)
-        ? cause
-        : new ApiError('internal_error', {
-            detail: cause instanceof Error ? cause.message : 'Could not join the room',
-            cause,
-          });
+      const error = this.toApiError(cause, 'Could not join the room');
+      this.teardown('error');
       this.emit('error', error);
       throw error;
     }
@@ -294,11 +380,95 @@ export class SfuClient {
     this.teardown('left');
   }
 
+  /** Leaves if needed and detaches every plugin. The instance is done after this. */
+  async dispose(): Promise<void> {
+    await this.leave();
+    for (const detach of this.detachPlugins.splice(0)) {
+      try {
+        detach();
+      } catch (cause) {
+        this.options.logger?.warn('plugin detach threw', cause);
+      }
+    }
+    this.listeners.clear();
+  }
+
+  private async resolveRegionHint(): Promise<RegionHint | null> {
+    if (!this.options.getRegionHint) return null;
+    try {
+      return (await this.options.getRegionHint()) ?? null;
+    } catch (cause) {
+      this.options.logger?.debug('region hint unavailable', cause);
+      return null;
+    }
+  }
+
+  private async openSocket(token: string | null): Promise<void> {
+    if (this.socket?.connected) return;
+    const socket = this.options.createTransport();
+    this.socket = socket;
+    this.bindServerEvents(socket);
+    await socket.connect(signalingUrlForBrowser(this.options.signalingUrl), { token });
+  }
+
+  /**
+   * Sends `classroom:join` and builds media from the acknowledgement. Used for
+   * the first join and, with `rejoin`, for rebuilding media on the same socket.
+   */
+  private async joinMedia(rejoin: boolean): Promise<SignalingEvents.RoomState> {
+    const roomId = this.requireRoomId();
+
+    const ack = await this.request<SignalingEvents.JoinAck>(CLIENT.join, {
+      roomId,
+      rejoin,
+      ...(this.regionHint ? { regionHint: this.regionHint } : {}),
+      device: {
+        platform: this.options.deviceAdapter.platform,
+        supportsScreenShare: this.options.screenShareAdapter.isSupported(),
+      },
+    } satisfies SignalingEvents.SignalingClientPayloads['classroom:join']);
+
+    const device = this.device ?? this.options.deviceAdapter.createMediasoupDevice();
+    this.device = device;
+    if (!device.loaded) {
+      await device.load({
+        routerRtpCapabilities:
+          ack.room.routerRtpCapabilities as unknown as MediasoupTypes.RtpCapabilities,
+      });
+    }
+
+    this.peerId = ack.room.selfPeerId;
+    this.region = ack.room.mediaRegion;
+    this.setIce(ack.ice);
+
+    this.sendTransport = this.buildTransport('send', ack.sendTransport, ack.ice);
+    this.recvTransport = this.buildTransport('recv', ack.recvTransport, ack.ice);
+
+    this.rememberRoomProducers(ack.room);
+    this.emit('roomState', ack.room);
+
+    // A late joiner has to see an ongoing share, not just future ones.
+    if (ack.room.screenShare) {
+      this.emit('screenShareStarted', ack.room.screenShare);
+    }
+
+    // A late joiner also has to receive media that was already flowing.
+    void this.consumeKnownProducers();
+
+    return ack.room;
+  }
+
   // -------------------------------------------------------------------------
   // Publishing
   // -------------------------------------------------------------------------
 
   async publishCamera(track: MediaStreamTrackLike): Promise<MediasoupTypes.Producer> {
+    const existing = this.producers.camera;
+    if (existing && !existing.closed) {
+      await existing.replaceTrack({ track: track as unknown as MediaStreamTrack });
+      return existing;
+    }
+
     const sendTransport = this.requireSendTransport();
     const producer = await sendTransport.produce({
       track: track as unknown as MediaStreamTrack,
@@ -306,30 +476,45 @@ export class SfuClient {
         ? CAMERA_ENCODINGS
         : undefined,
       codecOptions: { videoGoogleStartBitrate: 300 },
+      stopTracks: false,
       appData: { source: 'camera' satisfies SignalingEvents.MediaSource },
     });
-    this.producers.camera = producer;
-    producer.on('transportclose', () => {
-      this.producers.camera = null;
-    });
+    this.holdProducer('camera', producer);
     return producer;
   }
 
   async publishMicrophone(track: MediaStreamTrackLike): Promise<MediasoupTypes.Producer> {
+    const existing = this.producers.microphone;
+    if (existing && !existing.closed) {
+      await existing.replaceTrack({ track: track as unknown as MediaStreamTrack });
+      return existing;
+    }
+
     const sendTransport = this.requireSendTransport();
     const producer = await sendTransport.produce({
       track: track as unknown as MediaStreamTrack,
       codecOptions: { opusDtx: true, opusFec: true },
+      stopTracks: false,
       appData: { source: 'microphone' satisfies SignalingEvents.MediaSource },
     });
-    this.producers.microphone = producer;
+    this.holdProducer('microphone', producer);
     return producer;
   }
 
   /** Pausing keeps the producer alive, so unmuting does not renegotiate. */
   async setCameraEnabled(enabled: boolean): Promise<void> {
-    const producer = this.producers.camera;
-    if (!producer) return;
+    await this.setProducerEnabled(this.producers.camera, enabled);
+  }
+
+  async setMicrophoneEnabled(enabled: boolean): Promise<void> {
+    await this.setProducerEnabled(this.producers.microphone, enabled);
+  }
+
+  private async setProducerEnabled(
+    producer: MediasoupTypes.Producer | null,
+    enabled: boolean,
+  ): Promise<void> {
+    if (!producer || producer.closed) return;
     if (enabled) {
       producer.resume();
       await this.request(CLIENT.resumeProducer, { producerId: producer.id });
@@ -339,16 +524,11 @@ export class SfuClient {
     }
   }
 
-  async setMicrophoneEnabled(enabled: boolean): Promise<void> {
-    const producer = this.producers.microphone;
-    if (!producer) return;
-    if (enabled) {
-      producer.resume();
-      await this.request(CLIENT.resumeProducer, { producerId: producer.id });
-    } else {
-      producer.pause();
-      await this.request(CLIENT.pauseProducer, { producerId: producer.id });
-    }
+  private holdProducer(key: keyof LocalProducers, producer: MediasoupTypes.Producer): void {
+    this.producers[key] = producer;
+    producer.on('transportclose', () => {
+      if (this.producers[key] === producer) this.producers[key] = null;
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -398,18 +578,22 @@ export class SfuClient {
         // resolution variants nobody will subscribe to.
         encodings: SCREEN_ENCODINGS,
         codecOptions: { videoGoogleStartBitrate: 1_000 },
+        // The capture belongs to the handle; handle.stop() ends it.
+        stopTracks: false,
         appData: {
           source: 'screen' satisfies SignalingEvents.MediaSource,
           label: handle.label,
         },
       });
-      this.producers.screen = producer;
+      this.holdProducer('screen', producer);
 
       if (handle.audioTrack) {
-        this.producers.screenAudio = await sendTransport.produce({
+        const audioProducer = await sendTransport.produce({
           track: handle.audioTrack as unknown as MediaStreamTrack,
+          stopTracks: false,
           appData: { source: 'screen-audio' satisfies SignalingEvents.MediaSource },
         });
+        this.holdProducer('screenAudio', audioProducer);
       }
 
       // The browser's own stop bar ends the track without going through us.
@@ -417,6 +601,8 @@ export class SfuClient {
         void this.stopScreenShare(reason);
       });
     } catch (cause) {
+      this.producers.screen?.close();
+      this.producers.screen = null;
       handle.stop();
       this.screenHandle = null;
       await this.request(CLIENT.stopScreenShare, {}).catch(() => undefined);
@@ -459,47 +645,170 @@ export class SfuClient {
     await this.request(CLIENT.react, { emoji });
   }
 
-  async hostAction(payload: SignalingEvents.SignalingClientPayloads['classroom:host.action']) {
+  async hostAction(
+    payload: SignalingEvents.SignalingClientPayloads['classroom:host.action'],
+  ): Promise<void> {
     await this.request(CLIENT.hostAction, payload);
+  }
+
+  // -------------------------------------------------------------------------
+  // ICE primitives — driven by IceConfigProvider and IceRecovery
+  // -------------------------------------------------------------------------
+
+  /**
+   * Applies a fresh ICE configuration. Servers and credentials are swapped in
+   * place with updateIceServers(); existing allocations keep working and new
+   * ones use the new credential. A policy cannot be changed on a live
+   * transport, so a tightening to 'relay' rebuilds the transports; a
+   * loosening is ignored until the next rebuild.
+   */
+  async applyIceConfig(ice: IceConfig): Promise<void> {
+    const tightened = this.effectivePolicy(ice) === 'relay' && this.transportPolicy !== 'relay';
+    this.setIce(ice);
+
+    if (tightened && (this.sendTransport || this.recvTransport)) {
+      await this.recreateTransports();
+      return;
+    }
+
+    const iceServers = ice.iceServers as unknown as RTCIceServer[];
+    await Promise.all(
+      [this.sendTransport, this.recvTransport]
+        .filter((transport): transport is MediasoupTypes.Transport =>
+          Boolean(transport && !transport.closed),
+        )
+        .map((transport) => transport.updateIceServers({ iceServers })),
+    );
+  }
+
+  /**
+   * ICE restart for one transport: the owning node issues new ICE parameters,
+   * the client restarts ICE against them. Media keeps its producers and
+   * consumers; nothing is renegotiated.
+   */
+  async restartIce(direction: TransportDirection): Promise<void> {
+    const transport = direction === 'send' ? this.sendTransport : this.recvTransport;
+    if (!transport || transport.closed) {
+      throw new ApiError('dependency_unavailable', {
+        detail: `No ${direction} transport to restart`,
+      });
+    }
+
+    const { iceParameters } = await this.request<SignalingEvents.IceRestarted>(
+      CLIENT.restartIce,
+      { transportId: transport.id },
+    );
+    await transport.restartIce({
+      iceParameters: iceParameters as unknown as MediasoupTypes.IceParameters,
+    });
+  }
+
+  /**
+   * Replaces both transports on the same node and republishes local media.
+   * With `forceRelay` the new transports, and every later one in this session,
+   * use iceTransportPolicy 'relay'.
+   */
+  async recreateTransports(options: { forceRelay?: boolean } = {}): Promise<void> {
+    await this.runRecovery(async () => {
+      if (options.forceRelay) this.relayForced = true;
+
+      this.pendingLocalMedia ??= this.captureLocalMedia();
+      this.closeMedia({ stopLocalTracks: false });
+
+      const [send, recv] = await Promise.all([
+        this.request<SignalingEvents.CreateTransportAck>(CLIENT.createTransport, {
+          direction: 'send',
+          forceRelay: this.relayForced,
+        }),
+        this.request<SignalingEvents.CreateTransportAck>(CLIENT.createTransport, {
+          direction: 'recv',
+          forceRelay: this.relayForced,
+        }),
+      ]);
+
+      this.setIce(recv.ice);
+      this.sendTransport = this.buildTransport('send', send.transport, send.ice);
+      this.recvTransport = this.buildTransport('recv', recv.transport, recv.ice);
+
+      await this.restoreLocalMedia();
+      await this.consumeKnownProducers();
+    });
+  }
+
+  /**
+   * Rebuilds media through a fresh placement on the same signalling socket.
+   * Used when the node is draining or when the node itself is gone. Other
+   * participants see a short media gap, not a leave and a join.
+   */
+  async rejoinMedia(): Promise<void> {
+    await this.runRecovery(async () => {
+      this.pendingLocalMedia ??= this.captureLocalMedia();
+      this.closeMedia({ stopLocalTracks: false });
+      await this.joinMedia(true);
+      await this.restoreLocalMedia();
+    });
+  }
+
+  private async runRecovery(task: () => Promise<void>): Promise<void> {
+    const run = async (): Promise<void> => {
+      if (this.state === 'idle' || this.state === 'closed') {
+        throw new ApiError('dependency_unavailable', { detail: 'The session is not active' });
+      }
+      this.setState('reconnecting');
+      await task();
+      if (this.state === 'reconnecting') this.setState('joined');
+    };
+
+    const next = this.recoveryChain.then(run, run);
+    this.recoveryChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private effectivePolicy(ice: IceConfig): IceTransportPolicy {
+    return this.relayForced || ice.iceTransportPolicy === 'relay' ? 'relay' : 'all';
+  }
+
+  private setIce(ice: IceConfig): void {
+    this.ice = ice;
+    this.emit('iceConfigChanged', ice);
   }
 
   // -------------------------------------------------------------------------
   // Transports
   // -------------------------------------------------------------------------
 
-  private async createTransports(): Promise<void> {
-    const device = this.device;
-    if (!device) throw new Error('join() must run first');
+  private buildTransport(
+    direction: TransportDirection,
+    params: TransportOptions,
+    ice: IceConfig,
+  ): MediasoupTypes.Transport {
+    const device = this.requireDevice();
+    const iceTransportPolicy = this.effectivePolicy(ice);
 
-    console.log('[sfu] requesting send transport');
-    const sendInfo = await this.request<SignalingEvents.TransportCreated>(
-      CLIENT.createTransport,
-      { direction: 'send', forceRelay: false },
-    );
-    console.log(
-      '[sfu] send transport candidates:',
-      JSON.stringify((sendInfo as { iceCandidates?: unknown[] }).iceCandidates),
-    );
-    const send = device.createSendTransport(
-      sendInfo as unknown as MediasoupTypes.TransportOptions,
-    );
-    console.log(
-      '[sfu] candidates:',
-      JSON.stringify((sendInfo as { iceCandidates?: unknown[] }).iceCandidates),
-    );
-    this.wireTransport(send, 'send');
-    this.sendTransport = send;
+    const options: MediasoupTypes.TransportOptions = {
+      // The wire name is transportId; mediasoup-client wants id.
+      id: params.transportId,
+      iceParameters: params.iceParameters as unknown as MediasoupTypes.IceParameters,
+      iceCandidates: params.iceCandidates as unknown as MediasoupTypes.IceCandidate[],
+      dtlsParameters: params.dtlsParameters as unknown as MediasoupTypes.DtlsParameters,
+      iceServers: ice.iceServers as unknown as RTCIceServer[],
+      iceTransportPolicy,
+      appData: { direction },
+    };
 
-    const recvInfo = await this.request<SignalingEvents.TransportCreated>(CLIENT.createTransport, {
-      direction: 'recv',
-      forceRelay: false,
-    });
-    const recv = device.createRecvTransport(recvInfo as unknown as MediasoupTypes.TransportOptions);
-    this.wireTransport(recv, 'recv');
-    this.recvTransport = recv;
+    const transport =
+      direction === 'send' ? device.createSendTransport(options) : device.createRecvTransport(options);
+
+    this.transportPolicy = iceTransportPolicy;
+    this.wireTransport(transport, direction, iceTransportPolicy);
+    return transport;
   }
 
-  private wireTransport(transport: MediasoupTypes.Transport, direction: 'send' | 'recv'): void {
+  private wireTransport(
+    transport: MediasoupTypes.Transport,
+    direction: TransportDirection,
+    iceTransportPolicy: IceTransportPolicy,
+  ): void {
     transport.on('connect', ({ dtlsParameters }, callback, errback) => {
       this.request(CLIENT.connectTransport, { transportId: transport.id, dtlsParameters })
         .then(() => callback())
@@ -508,127 +817,229 @@ export class SfuClient {
 
     if (direction === 'send') {
       transport.on('produce', ({ kind, rtpParameters, appData }, callback, errback) => {
-        this.request<{ producerId: string }>(CLIENT.produce, {
+        const source = (appData as { source?: SignalingEvents.MediaSource }).source ?? 'camera';
+        this.request<SignalingEvents.Produced>(CLIENT.produce, {
           transportId: transport.id,
           kind,
-          rtpParameters,
-          source: (appData as { source?: string }).source ?? 'camera',
-          appData: {
-            contentHint:
-              (appData as { source?: string }).source === 'screen' ? 'detail' : undefined,
-          },
+          rtpParameters: rtpParameters as unknown as Record<string, unknown>,
+          source,
+          appData: source === 'screen' ? { contentHint: 'detail' } : {},
         })
           .then(({ producerId }) => callback({ id: producerId }))
           .catch((cause: Error) => errback(cause));
       });
     }
 
-    transport.on('connectionstatechange', (connectionState) => {
-      console.log('[sfu] transport', direction, connectionState);
-      this.options.logger?.debug('transport', direction, connectionState);
-      // 'failed' means ICE gave up: usually a network change, occasionally a
-      // node that disappeared. Either way the session needs rebuilding.
-      if (connectionState === 'failed' && this.state === 'joined') {
-        void this.handleConnectionLoss();
+    transport.on('connectionstatechange', (state) => {
+      this.options.logger?.debug('transport', direction, state);
+      this.emit('transportStateChanged', { direction, state, iceTransportPolicy });
+
+      if (state === 'connected') {
+        // A path works again; earlier failures were transient.
+        this.consecutiveFailures = 0;
+        return;
+      }
+
+      if (state === 'failed' && this.builtInRecovery && this.state === 'joined') {
+        void this.fallbackRecover(direction);
       }
     });
   }
 
+  /**
+   * Bounded recovery used only when no IceRecovery plugin is attached:
+   * restartIce, then relay-only transports, then a media rejoin. Bounded,
+   * because an endless rebuild loop looks to everyone else like a person being
+   * thrown out repeatedly and hides the real cause. After the last step the
+   * signalling socket stays up, so chat, hand raise and the peer list keep
+   * working without media.
+   */
+  private async fallbackRecover(direction: TransportDirection): Promise<void> {
+    if (this.fallbackInFlight) return;
+    this.fallbackInFlight = true;
+
+    try {
+      while (this.consecutiveFailures < FALLBACK_RECOVERY_STEPS) {
+        this.consecutiveFailures += 1;
+        try {
+          if (this.consecutiveFailures === 1) {
+            await this.restartIce(direction);
+          } else if (this.consecutiveFailures === 2) {
+            await this.recreateTransports({ forceRelay: true });
+          } else {
+            await this.rejoinMedia();
+          }
+          return;
+        } catch (cause) {
+          this.options.logger?.warn('media recovery step failed', this.consecutiveFailures, cause);
+        }
+      }
+
+      this.emitError(
+        new ApiError('sfu_unavailable', {
+          detail:
+            'Could not establish a media connection. Audio and video are unavailable; ' +
+            'the rest of the lesson still works.',
+        }),
+      );
+      if (this.state === 'reconnecting') this.setState('joined');
+    } finally {
+      this.fallbackInFlight = false;
+    }
+  }
+
   private requireSendTransport(): MediasoupTypes.Transport {
-    if (!this.sendTransport) throw new Error('Not joined: no send transport');
+    if (!this.sendTransport || this.sendTransport.closed) {
+      throw new ApiError('dependency_unavailable', { detail: 'Not joined: no send transport' });
+    }
     return this.sendTransport;
+  }
+
+  private requireDevice(): MediasoupTypes.Device {
+    if (!this.device?.loaded) throw new Error('join() must run first');
+    return this.device;
+  }
+
+  private requireRoomId(): string {
+    if (!this.roomId) throw new Error('join() must run first');
+    return this.roomId;
   }
 
   // -------------------------------------------------------------------------
   // Consuming
   // -------------------------------------------------------------------------
 
-  private async consume(producer: SignalingEvents.ProducerInfo): Promise<void> {
+  private rememberRoomProducers(room: SignalingEvents.RoomState): void {
+    this.remoteProducers.clear();
+    for (const peer of room.peers) {
+      if (peer.peerId === room.selfPeerId) continue;
+      for (const producer of peer.producers) {
+        this.remoteProducers.set(producer.producerId, producer);
+      }
+    }
+  }
+
+  private async consumeKnownProducers(): Promise<void> {
+    await Promise.all(
+      [...this.remoteProducers.values()].map((producer) =>
+        this.consume(producer).catch((cause) => this.emitError(cause)),
+      ),
+    );
+  }
+
+  private async consume(producer: ProducerInfo): Promise<void> {
+    if (producer.peerId === this.peerId) return;
+    if (this.consuming.has(producer.producerId)) return;
+
     const device = this.device;
     const recvTransport = this.recvTransport;
-    if (!device || !recvTransport) return;
+    // Not ready yet: consumeKnownProducers() picks it up once transports exist.
+    if (!device?.loaded || !recvTransport || recvTransport.closed) return;
 
-    const info = await this.request<SignalingEvents.ConsumerCreated>(CLIENT.consume, {
-      transportId: recvTransport.id,
-      producerId: producer.producerId,
-      rtpCapabilities: device.rtpCapabilities as unknown as Record<string, unknown>,
-    });
+    this.consuming.add(producer.producerId);
+    try {
+      const info = await this.request<SignalingEvents.ConsumerCreated>(CLIENT.consume, {
+        transportId: recvTransport.id,
+        producerId: producer.producerId,
+        rtpCapabilities: device.rtpCapabilities as unknown as Record<string, unknown>,
+      });
 
-    const consumer = await recvTransport.consume({
-      id: info.consumerId,
-      producerId: info.producerId,
-      kind: info.kind,
-      rtpParameters: info.rtpParameters as unknown as MediasoupTypes.RtpParameters,
-    });
+      const consumer = await recvTransport.consume({
+        id: info.consumerId,
+        producerId: info.producerId,
+        kind: info.kind,
+        rtpParameters: info.rtpParameters as unknown as MediasoupTypes.RtpParameters,
+      });
 
-    this.consumers.set(consumer.id, consumer);
+      this.consumers.set(consumer.id, consumer);
 
-    // The server creates consumers paused so the client can attach the track
-    // before any media flows; resuming here avoids the first frames being lost.
-    await this.request(CLIENT.resumeConsumer, { consumerId: consumer.id });
+      // The server creates consumers paused so the client can attach the track
+      // before any media flows; resuming here avoids the first frames being lost.
+      await this.request(CLIENT.resumeConsumer, { consumerId: consumer.id });
 
-    this.emit('streamAdded', {
-      consumerId: consumer.id,
-      producerId: info.producerId,
-      peerId: producer.peerId,
-      userId: producer.userId,
-      kind: info.kind,
-      source: info.source,
-      track: consumer.track as unknown as MediaStreamTrackLike,
-      paused: info.producerPaused,
-    });
+      this.emit('streamAdded', {
+        consumerId: consumer.id,
+        producerId: info.producerId,
+        peerId: producer.peerId,
+        userId: producer.userId,
+        kind: info.kind,
+        source: info.source,
+        track: consumer.track as unknown as MediaStreamTrackLike,
+        paused: info.producerPaused,
+      });
+    } catch (cause) {
+      this.consuming.delete(producer.producerId);
+      throw cause;
+    }
+  }
+
+  private closeConsumersOf(producerId: string): void {
+    this.consuming.delete(producerId);
+    for (const [consumerId, consumer] of this.consumers) {
+      if (consumer.producerId !== producerId) continue;
+      consumer.close();
+      this.consumers.delete(consumerId);
+      this.emit('streamRemoved', { consumerId, producerId });
+    }
   }
 
   // -------------------------------------------------------------------------
   // Server events
   // -------------------------------------------------------------------------
 
-  private bindServerEvents(transport: SignalingTransport): void {
-    transport.on(SERVER.peerJoined, (peer: SignalingEvents.Peer) => this.emit('peerJoined', peer));
-    transport.on(SERVER.peerLeft, (event: { peerId: string; reason: string }) =>
-      this.emit('peerLeft', event),
-    );
-    transport.on(SERVER.peerUpdated, (peer: SignalingEvents.Peer) =>
-      this.emit('peerUpdated', peer),
-    );
+  private bindServerEvents(socket: SignalingTransport): void {
+    socket.on(SERVER.peerJoined, (peer: SignalingEvents.Peer) => this.emit('peerJoined', peer));
 
-    transport.on(SERVER.newProducer, (producer: SignalingEvents.ProducerInfo) => {
+    socket.on(SERVER.peerLeft, (event: SignalingEvents.PeerLeft) => {
+      for (const [producerId, producer] of this.remoteProducers) {
+        if (producer.peerId === event.peerId) this.remoteProducers.delete(producerId);
+      }
+      this.emit('peerLeft', event);
+    });
+
+    socket.on(SERVER.peerUpdated, (peer: SignalingEvents.Peer) => this.emit('peerUpdated', peer));
+
+    socket.on(SERVER.newProducer, (producer: ProducerInfo) => {
+      if (producer.peerId === this.peerId) return;
+      this.remoteProducers.set(producer.producerId, producer);
       void this.consume(producer).catch((cause) => this.emitError(cause));
     });
 
-    transport.on(SERVER.producerClosed, ({ producerId }: { producerId: string }) => {
-      for (const [consumerId, consumer] of this.consumers) {
-        if (consumer.producerId !== producerId) continue;
-        consumer.close();
-        this.consumers.delete(consumerId);
-        this.emit('streamRemoved', { consumerId, producerId });
-      }
+    socket.on(SERVER.producerClosed, ({ producerId }: { producerId: string }) => {
+      this.remoteProducers.delete(producerId);
+      this.closeConsumersOf(producerId);
     });
 
-    transport.on(SERVER.screenShareStarted, (event: SignalingEvents.ScreenShareStarted) =>
+    socket.on(SERVER.screenShareStarted, (event: SignalingEvents.ScreenShareStarted) =>
       this.emit('screenShareStarted', event),
     );
-    transport.on(SERVER.screenShareStopped, (event: SignalingEvents.ScreenShareStopped) =>
+    socket.on(SERVER.screenShareStopped, (event: SignalingEvents.ScreenShareStopped) =>
       this.emit('screenShareStopped', event),
     );
 
-    transport.on(SERVER.handRaised, (event: { peerId: string; raised: boolean }) =>
+    socket.on(SERVER.handRaised, (event: { peerId: string; raised: boolean }) =>
       this.emit('handRaised', event),
     );
-    transport.on(SERVER.reaction, (event: { peerId: string; emoji: string }) =>
+    socket.on(SERVER.reaction, (event: { peerId: string; emoji: string }) =>
       this.emit('reaction', event),
     );
-    transport.on(SERVER.recordingChanged, (event: { recording: boolean }) =>
+    socket.on(SERVER.recordingChanged, (event: { recording: boolean }) =>
       this.emit('recordingChanged', event),
     );
 
-    transport.on(SERVER.roomClosed, (event: { reason: string }) => {
+    // TURN node drained, secret rotation or tenant policy change.
+    socket.on(SERVER.iceUpdate, (event: SignalingEvents.IceUpdate) => {
+      void this.applyIceConfig(event.ice).catch((cause) => this.emitError(cause));
+    });
+
+    socket.on(SERVER.roomClosed, (event: SignalingEvents.RoomClosed) => {
       this.teardown(event.reason);
     });
 
-    // A deployment is replacing this node. Rejoin elsewhere rather than
-    // waiting to be cut off.
-    transport.on(SERVER.nodeDraining, () => {
+    // A deployment or scale-in is replacing the room's node. The socket is
+    // fine; only media moves.
+    socket.on(SERVER.nodeDraining, (event: SignalingEvents.NodeDraining) => {
+      this.emit('nodeDraining', event);
       void this.handleNodeDraining();
     });
   }
@@ -638,22 +1049,18 @@ export class SfuClient {
   // -------------------------------------------------------------------------
 
   private async handleNodeDraining(): Promise<void> {
-    const roomId = this.roomId;
-    const nodeId = this.nodeId;
-    if (!roomId || !nodeId) return;
-
-    this.setState('reconnecting');
+    if (this.state !== 'joined') return;
     const attempts = this.options.rejoinAttempts ?? 3;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
-        await this.options.nodeResolver.rotate(roomId, nodeId);
-        await this.rejoin(roomId);
+        await this.rejoinMedia();
         return;
       } catch (cause) {
-        this.options.logger?.warn('rejoin failed', attempt, cause);
-        // The room may still be held by the draining node while its last
-        // lesson finishes; backing off and asking again is the whole strategy.
+        this.options.logger?.warn('media rejoin failed', attempt, cause);
+        if (this.state === 'closed') return;
+        // Placement may still point at the draining node for a moment; backing
+        // off and asking again is the whole strategy.
         await new Promise((resolve) => setTimeout(resolve, attempt * 3_000));
       }
     }
@@ -666,93 +1073,68 @@ export class SfuClient {
     this.teardown('node-drained');
   }
 
-  private async handleConnectionLoss(): Promise<void> {
-    const roomId = this.roomId;
-    if (!roomId) return;
+  private captureLocalMedia(): LocalMediaSnapshot {
+    const pick = (producer: MediasoupTypes.Producer | null) =>
+      producer && isLiveTrack(producer.track)
+        ? {
+            track: producer.track as unknown as MediaStreamTrackLike,
+            paused: producer.paused,
+          }
+        : null;
 
-    this.connectionLossCount += 1;
-
-    /**
-     * Bounded, because an unbounded rejoin is worse than a clean failure.
-     *
-     * Each attempt tears the socket down and opens a new one, and the server
-     * sees that as the peer leaving and a different peer arriving. Everyone
-     * else in the room watches someone vanish and reappear every few seconds.
-     * With two people both looping, it looks like they are taking turns being
-     * thrown out — which is exactly the symptom, and it hides the real cause.
-     *
-     * Three attempts covers a network change or a node being replaced during a
-     * deploy. Beyond that the media path is not going to establish, and saying
-     * so once is more use than trying forever.
-     */
-    if (this.connectionLossCount > 3) {
-      this.emitError(
-        new ApiError('sfu_unavailable', {
-          detail:
-            'Could not establish a media connection. Audio and video are unavailable; ' +
-            'the rest of the lesson still works.',
-        }),
-      );
-      // Deliberately not teardown(): the signalling socket stays up, so the
-      // peer list, chat and hand raise keep working without media.
-      this.setState('joined');
-      return;
-    }
-
-    this.setState('reconnecting');
-    this.options.nodeResolver.invalidate(roomId);
-
-    try {
-      await this.rejoin(roomId);
-    } catch (cause) {
-      this.emitError(cause);
-      this.teardown('error');
-    }
+    return {
+      camera: pick(this.producers.camera),
+      microphone: pick(this.producers.microphone),
+      wasSharing: this.isScreenSharing,
+    };
   }
 
   /**
-   * Rebuilds the session and republishes whatever was live. The screen share is
-   * deliberately not restarted: the platform picker requires a fresh gesture,
-   * and silently re-capturing someone's screen would be wrong.
+   * Republishes camera and microphone with their previous paused state. The
+   * screen share is ended instead: the room's presenter lock and layout would
+   * otherwise point at a producer that no longer exists, and re-capturing
+   * someone's screen without a fresh gesture would be wrong.
    */
-  private async rejoin(roomId: string): Promise<void> {
-    const cameraTrack = this.producers.camera?.track ?? null;
-    const micTrack = this.producers.microphone?.track ?? null;
-    const wasSharing = this.isScreenSharing;
+  private async restoreLocalMedia(): Promise<void> {
+    const snapshot = this.pendingLocalMedia;
+    if (!snapshot) return;
 
-    this.closeMediaOnly();
-    this.transport?.disconnect();
-    this.transport = null;
+    if (snapshot.camera && isLiveTrack(snapshot.camera.track)) {
+      await this.publishCamera(snapshot.camera.track);
+      if (snapshot.camera.paused) await this.setCameraEnabled(false);
+    }
+    if (snapshot.microphone && isLiveTrack(snapshot.microphone.track)) {
+      await this.publishMicrophone(snapshot.microphone.track);
+      if (snapshot.microphone.paused) await this.setMicrophoneEnabled(false);
+    }
+    if (snapshot.wasSharing || this.screenHandle) {
+      await this.stopScreenShare('reconnected');
+    }
 
-    await this.join(roomId);
-
-    if (cameraTrack) {
-      await this.publishCamera(cameraTrack as unknown as MediaStreamTrackLike);
-    }
-    if (micTrack) {
-      await this.publishMicrophone(micTrack as unknown as MediaStreamTrackLike);
-    }
-    if (wasSharing) {
-      this.emit('localScreenShareEnded', 'reconnected');
-    }
+    this.pendingLocalMedia = null;
   }
 
   // -------------------------------------------------------------------------
   // Teardown
   // -------------------------------------------------------------------------
 
-  private closeMediaOnly(): void {
-    for (const consumer of this.consumers.values()) consumer.close();
+  private closeMedia({ stopLocalTracks }: { stopLocalTracks: boolean }): void {
+    for (const [consumerId, consumer] of this.consumers) {
+      consumer.close();
+      this.emit('streamRemoved', { consumerId, producerId: consumer.producerId });
+    }
     this.consumers.clear();
+    this.consuming.clear();
 
-    this.producers.camera?.close();
-    this.producers.microphone?.close();
-    this.producers.screen?.close();
-    this.producers.screenAudio?.close();
-    this.producers.camera = null;
-    this.producers.microphone = null;
-    this.producers.screen = null;
-    this.producers.screenAudio = null;
+    for (const key of ['camera', 'microphone', 'screen', 'screenAudio'] as const) {
+      const producer = this.producers[key];
+      if (!producer) continue;
+      if (stopLocalTracks && (key === 'camera' || key === 'microphone')) {
+        producer.track?.stop();
+      }
+      producer.close();
+      this.producers[key] = null;
+    }
 
     this.sendTransport?.close();
     this.recvTransport?.close();
@@ -766,16 +1148,23 @@ export class SfuClient {
     this.screenHandle?.stop();
     this.screenHandle = null;
 
-    this.closeMediaOnly();
+    this.closeMedia({ stopLocalTracks: true });
+    for (const snapshot of [this.pendingLocalMedia?.camera, this.pendingLocalMedia?.microphone]) {
+      (snapshot?.track as { stop?: () => void } | undefined)?.stop?.();
+    }
+    this.pendingLocalMedia = null;
+    this.remoteProducers.clear();
 
-    this.transport?.disconnect();
-    this.transport = null;
+    this.socket?.disconnect();
+    this.socket = null;
     this.device = null;
     this.peerId = null;
-
-    if (this.roomId) this.options.nodeResolver.invalidate(this.roomId);
     this.roomId = null;
-    this.nodeId = null;
+    this.region = null;
+    this.ice = null;
+    this.relayForced = false;
+    this.transportPolicy = 'all';
+    this.consecutiveFailures = 0;
 
     this.setState('closed');
     this.emit('closed', reason);
@@ -791,22 +1180,25 @@ export class SfuClient {
    * than in envelopes.
    */
   private async request<TResponse = unknown>(event: string, payload: unknown): Promise<TResponse> {
-    const transport = this.transport;
-    if (!transport) {
+    const socket = this.socket;
+    if (!socket) {
       throw new ApiError('dependency_unavailable', { detail: 'Signalling socket is closed' });
     }
-    const ack = await transport.emitWithAck<TResponse>(event, payload);
+    const ack = await socket.emitWithAck<TResponse>(event, payload);
     if (!ack.ok) throw ApiError.fromResponse(ack.error);
     return ack.data;
   }
 
-  private emitError(cause: unknown): void {
-    const error = ApiError.is(cause)
+  private toApiError(cause: unknown, fallback: string): ApiError {
+    return ApiError.is(cause)
       ? cause
       : new ApiError('internal_error', {
-          detail: cause instanceof Error ? cause.message : 'Unknown media error',
+          detail: cause instanceof Error ? cause.message : fallback,
           cause,
         });
-    this.emit('error', error);
+  }
+
+  private emitError(cause: unknown): void {
+    this.emit('error', this.toApiError(cause, 'Unknown media error'));
   }
 }

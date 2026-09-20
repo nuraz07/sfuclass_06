@@ -1,258 +1,386 @@
 // classroom-app/server/src/lifecycle/drainSfu.js
 /**
- * SFU draining  (F1, F7)  [NEW]
+ * SFU node drain  (F1, F8)  [EXT]
  *
- * The SFU is the one stateful service in the platform. A running task holds
- * rooms, and a room holds people who are mid-sentence. Replacing a node the way
- * ECS replaces a stateless one — stop the task, start a new one — ends every
- * lesson on it.
+ * Removes one SFU node from service without dropping a lesson. Runs in the sfu
+ * role only (sfu.js) and is the long half of taking a node away; the short
+ * half is gracefulShutdown.js, which runs when ECS finally sends SIGTERM.
  *
- * So the replacement is cooperative, and this module is the node's half of it:
+ * Version 7 changes the trigger and the exit. There is no load balancer on the
+ * media path any more, so "out of rotation" means "out of the SFU registry",
+ * and the node is only allowed to go once the ASG lifecycle hook is completed.
  *
- *   1. deploy-sfu.yml writes an SSM parameter for this node:
- *        /classroom/{env}/sfu/{nodeId}/state = draining
- *   2. this watcher notices within one poll interval
- *   3. the node stops accepting new rooms — RoomRegistry no longer offers it,
- *      so route-resolve sends the next lesson somewhere else
- *   4. existing rooms keep running, untouched
- *   5. peers are told the node is draining, so a client that reconnects for
- *      any other reason goes elsewhere rather than back here
- *   6. when the last room ends, the node reports empty and the workflow stops
- *      the task
+ *   ASG terminate (scale-in, instance refresh, spot interruption)
+ *     → lifecycle hook → EventBridge → functions/node-lifecycle
+ *     → drain flag  media:drain:{nodeId}  in the state Redis cluster
+ *     → this module notices the flag (polls every 5 s)
  *
- * Why SSM rather than an HTTP admin endpoint: the deploy role already has SSM
- * permission, no administrative route has to be exposed to the internet, and
- * the flag survives a task restart in the middle of a drain.
+ *   1. draining   NodeRegistrar heartbeats `draining: true`;
+ *                 RoomPlacementService and the drain flag keep new rooms away.
+ *                 Existing rooms keep working and still admit late joiners:
+ *                 a lesson in progress is never split across nodes by a drain.
+ *   2. waiting    until every room on the node is empty, or until
+ *                 SFU_DRAIN_TIMEOUT_SEC (capped by the hook's own deadline).
+ *                 The lifecycle action is kept alive with heartbeats meanwhile.
+ *   3. moving     shortly before the deadline, rooms still on the node are told
+ *                 `classroom:node.draining`. Clients rebuild their media with
+ *                 `classroom:join { rejoin: true }` and placement puts the room
+ *                 on a healthy node. The signalling socket is not touched.
+ *   4. drained    the node leaves the registry and completes the lifecycle
+ *                 action with CONTINUE. The ASG terminates the instance, ECS
+ *                 sends SIGTERM, gracefulShutdown.js closes what is left.
  *
- * The drain is patient but not infinite. SFU_DRAIN_TIMEOUT_SEC is the same
- * number the workflow uses, and when it expires the workflow stops the task
- * regardless — a deployment cannot wait for a room somebody left open over a
- * weekend.
+ * A drain without a lifecycle hook (ops/runbooks/sfu-incident.md, a manual
+ * `SET media:drain:<nodeId>`) behaves the same but can be cancelled by
+ * deleting the flag. A lifecycle drain cannot be cancelled: the ASG has
+ * already decided and will terminate at the hook timeout regardless.
+ *
+ * Everything this module touches on the node is injected (registrar, rooms,
+ * notifier, Redis), so it has no opinion on their internals and tests run it
+ * with a fake clock.
  */
 
+import { z } from 'zod';
 import { env } from '../config/env.js';
 
-const POLL_INTERVAL_MS = 15_000;
-
-let draining = false;
-let drainStartedAt = null;
-let watcher = null;
-const listeners = new Set();
-
 // ---------------------------------------------------------------------------
-// State
+// Constants
 // ---------------------------------------------------------------------------
 
-export const isDraining = () => draining;
+const POLL_INTERVAL_MS = 5_000;
+/** Clients get this long to move before the deadline. */
+const DEFAULT_MOVE_GRACE_SEC = 60;
+/** Must stay below the hook's HeartbeatTimeout in modules/sfu-node-pool/lifecycle-hooks.tf. */
+const DEFAULT_LIFECYCLE_HEARTBEAT_SEC = 300;
+/** AWS gives two minutes for a spot interruption; leave room for SIGTERM. */
+const SPOT_DRAIN_CEILING_SEC = 90;
+const COMPLETE_ATTEMPTS = 3;
 
-/**
- * Asked by RoomManager before it accepts a room, and by the route-resolve
- * route before it hands this node to a client.
- */
-export const canAcceptRoom = () => !draining;
+export const DRAIN_STATES = Object.freeze(['serving', 'draining', 'moving', 'drained', 'cancelled']);
 
-export const onDrain = (listener) => {
-  listeners.add(listener);
-  if (draining) listener();
-  return () => listeners.delete(listener);
-};
+/** Registry key from section 4.7. The Redis client applies REDIS_PREFIX. */
+export const drainFlagKey = (nodeId) => `media:drain:${nodeId}`;
 
-/**
- * Begins draining. Idempotent — the watcher calls it on every poll while the
- * flag is set, and an operator may call it by hand during an incident.
- */
-export const beginDrain = async ({ logger = console, reason = 'ssm' } = {}) => {
-  if (draining) return;
-  draining = true;
-  drainStartedAt = Date.now();
+// ---------------------------------------------------------------------------
+// Drain flag — written by functions/node-lifecycle or by an operator
+// ---------------------------------------------------------------------------
 
-  logger.warn?.({ nodeId: env.SFU_NODE_ID, reason }, 'sfu draining: no new rooms');
+const DrainFlagSchema = z.object({
+  reason: z
+    .enum(['scale-in', 'instance-refresh', 'spot-interruption', 'manual'])
+    .default('manual'),
+  requestedAt: z.iso.datetime().optional(),
+  /** Absolute end of the hook (its global timeout); the drain never runs past it. */
+  deadline: z.iso.datetime().optional(),
+  lifecycle: z
+    .object({
+      autoScalingGroupName: z.string().min(1).max(255),
+      lifecycleHookName: z.string().min(1).max(255),
+      lifecycleActionToken: z.string().min(1).max(64),
+      instanceId: z.string().regex(/^i-[0-9a-f]+$/),
+    })
+    .optional(),
+});
 
-  // Take this node out of the assignment pool first, before anything else can
-  // be routed to it.
+/** A plain `SET media:drain:<nodeId> 1` from a runbook is a valid manual drain. */
+const parseFlag = (raw) => {
+  if (raw === null || raw === undefined) return null;
+  let value;
   try {
-    const { markNodeDraining } = await import('../classroom/RoomRegistry.js');
-    await markNodeDraining(env.SFU_NODE_ID);
-  } catch (cause) {
-    // Serious but not fatal: the registry entry expires on its own TTL, so
-    // the node stops being offered within a minute either way.
-    logger.error?.({ err: cause }, 'could not deregister node from the room registry');
+    value = JSON.parse(raw);
+  } catch {
+    value = {};
   }
-
-  // Tell the people already here. A client that has to reconnect for an
-  // unrelated reason then resolves a different node instead of coming back.
-  try {
-    const { broadcastNodeDraining } = await import('../signaling/socketHandlers.js');
-    broadcastNodeDraining({
-      nodeId: env.SFU_NODE_ID,
-      graceSec: env.SFU_DRAIN_TIMEOUT_SEC,
-    });
-  } catch (cause) {
-    logger.error?.({ err: cause }, 'could not notify peers of the drain');
-  }
-
-  for (const listener of listeners) {
-    try {
-      listener();
-    } catch (cause) {
-      logger.warn?.({ err: cause }, 'drain listener threw');
-    }
-  }
+  const result = DrainFlagSchema.safeParse(typeof value === 'object' && value !== null ? value : {});
+  return result.success ? result.data : { reason: 'manual' };
 };
 
 // ---------------------------------------------------------------------------
-// SSM watcher
+// Auto Scaling
 // ---------------------------------------------------------------------------
 
-const parameterName = (nodeId = env.SFU_NODE_ID, environment = process.env.DEPLOY_ENV ?? env.NODE_ENV) =>
-  `/classroom/${environment}/sfu/${nodeId}/state`;
-
-const readFlag = async (name, region) => {
-  const { SSMClient, GetParameterCommand } = await import('@aws-sdk/client-ssm');
-  const client = new SSMClient({ region });
-  try {
-    const response = await client.send(new GetParameterCommand({ Name: name }));
-    return response.Parameter?.Value ?? 'active';
-  } catch (cause) {
-    // ParameterNotFound is the normal case: no drain has been requested.
-    if (cause?.name === 'ParameterNotFound') return 'active';
-    throw cause;
-  }
-};
-
 /**
- * Starts polling. Called from the SFU bootstrap. A no-op outside AWS, so a
- * laptop does not need credentials to run a lesson locally.
+ * The SDK is imported lazily: a development node has no ASG and never loads it.
+ * Permissions (instance/task role in modules/sfu-node-pool):
+ *   autoscaling:RecordLifecycleActionHeartbeat, autoscaling:CompleteLifecycleAction
  */
-export const startDrainWatcher = ({
-  logger = console,
-  intervalMs = POLL_INTERVAL_MS,
-  enabled = process.env.SECRETS_SOURCE === 'aws',
-} = {}) => {
-  if (!enabled) {
-    logger.debug?.('drain watcher disabled outside aws');
-    return () => {};
-  }
-  if (watcher) return () => clearInterval(watcher);
+const createAutoScaling = (region) => {
+  let client = null;
+  const getClient = async () => {
+    if (client) return client;
+    const sdk = await import('@aws-sdk/client-auto-scaling');
+    client = { sdk, instance: new sdk.AutoScalingClient({ region }) };
+    return client;
+  };
 
-  const name = parameterName();
-  const region = env.AWS_REGION;
-  let consecutiveFailures = 0;
+  const lifecycleParams = (lifecycle) => ({
+    AutoScalingGroupName: lifecycle.autoScalingGroupName,
+    LifecycleHookName: lifecycle.lifecycleHookName,
+    LifecycleActionToken: lifecycle.lifecycleActionToken,
+    InstanceId: lifecycle.instanceId,
+  });
 
-  logger.info?.({ parameter: name, intervalMs }, 'watching for a drain signal');
-
-  watcher = setInterval(() => {
-    void readFlag(name, region)
-      .then((value) => {
-        consecutiveFailures = 0;
-        if (value === 'draining' && !draining) void beginDrain({ logger });
-      })
-      .catch((cause) => {
-        consecutiveFailures += 1;
-        // Noisy once, quiet after that: a broken watcher should be visible in
-        // the logs without filling them.
-        if (consecutiveFailures === 1 || consecutiveFailures % 20 === 0) {
-          logger.error?.(
-            { err: cause, consecutiveFailures },
-            'could not read the drain flag',
-          );
-        }
-      });
-  }, intervalMs);
-
-  watcher.unref();
-  return () => {
-    clearInterval(watcher);
-    watcher = null;
+  return {
+    async heartbeat(lifecycle) {
+      const { sdk, instance } = await getClient();
+      await instance.send(new sdk.RecordLifecycleActionHeartbeatCommand(lifecycleParams(lifecycle)));
+    },
+    async complete(lifecycle, result = 'CONTINUE') {
+      const { sdk, instance } = await getClient();
+      await instance.send(
+        new sdk.CompleteLifecycleActionCommand({
+          ...lifecycleParams(lifecycle),
+          LifecycleActionResult: result,
+        }),
+      );
+    },
   };
 };
 
 // ---------------------------------------------------------------------------
-// Waiting for empty
+// Controller
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves when the node holds no rooms, or when the timeout expires.
+ * @typedef {object} DrainRegistrar   sfu-node/NodeRegistrar.js
+ * @property {(draining: boolean) => Promise<void>} setDraining  heartbeat carries the flag
+ * @property {() => Promise<void>} deregister                    stops the heartbeat, deletes the key
  *
- * Used as a shutdown step, so that a SIGTERM arriving before the drain has
- * finished still gives the lessons on this node a chance to end. The workflow
- * polls the ActiveRooms metric independently — both paths exist because a node
- * can be stopped by a deployment or by a scale-in event, and only one of those
- * writes an SSM parameter first.
+ * @typedef {object} DrainRooms       classroom/RoomManager.js
+ * @property {() => { rooms: number, peers: number }} load
+ * @property {() => string[]} roomIds
  *
- * @returns {Promise<{ empty: boolean, waitedSec: number, remainingRooms: number }>}
+ * @typedef {object} DrainRedis       the state-cluster client from db/redis.js
+ * @property {(key: string) => Promise<string | null>} get
+ *
+ * @param {object} deps
+ * @param {string} deps.nodeId
+ * @param {DrainRegistrar} deps.registrar
+ * @param {DrainRooms} deps.rooms
+ * @param {DrainRedis} deps.redis
+ * @param {(roomIds: string[], graceSec: number) => Promise<void>} deps.notifyRoomsDraining
+ *        tells the realtime service to emit classroom:node.draining to these rooms
+ * @param {object} [deps.logger]
+ * @param {{ increment?: Function, gauge?: Function }} [deps.metrics]
+ * @param {number} [deps.timeoutSec]        default SFU_DRAIN_TIMEOUT_SEC
+ * @param {number} [deps.moveGraceSec]
+ * @param {number} [deps.lifecycleHeartbeatSec]
+ * @param {ReturnType<typeof createAutoScaling>} [deps.autoScaling]  injectable for tests
+ * @param {() => number} [deps.now]
+ * @param {(ms: number) => Promise<void>} [deps.sleep]
  */
-export const waitUntilEmpty = async ({
-  timeoutSec = env.SFU_DRAIN_TIMEOUT_SEC,
-  pollMs = 5_000,
+export const createSfuDrain = ({
+  nodeId,
+  registrar,
+  rooms,
+  redis,
+  notifyRoomsDraining,
   logger = console,
-} = {}) => {
-  const { getRoomCount } = await import('../classroom/RoomManager.js');
-  const deadline = Date.now() + timeoutSec * 1_000;
-  const startedAt = Date.now();
-  let lastReported = -1;
-
-  for (;;) {
-    const rooms = getRoomCount();
-
-    if (rooms === 0) {
-      const waitedSec = Math.round((Date.now() - startedAt) / 1000);
-      logger.info?.({ waitedSec }, 'sfu node is empty');
-      return { empty: true, waitedSec, remainingRooms: 0 };
-    }
-
-    if (Date.now() >= deadline) {
-      logger.warn?.(
-        { rooms, timeoutSec },
-        'drain timeout reached with rooms still live; they will be interrupted',
-      );
-      return {
-        empty: false,
-        waitedSec: Math.round((Date.now() - startedAt) / 1000),
-        remainingRooms: rooms,
-      };
-    }
-
-    // Log only when the number changes, otherwise a thirty-minute drain
-    // produces four hundred identical lines.
-    if (rooms !== lastReported) {
-      logger.info?.(
-        { rooms, remainingSec: Math.round((deadline - Date.now()) / 1000) },
-        'waiting for rooms to end',
-      );
-      lastReported = rooms;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  metrics = {},
+  timeoutSec = env.SFU_DRAIN_TIMEOUT_SEC,
+  moveGraceSec = DEFAULT_MOVE_GRACE_SEC,
+  lifecycleHeartbeatSec = DEFAULT_LIFECYCLE_HEARTBEAT_SEC,
+  autoScaling = createAutoScaling(env.AWS_REGION),
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) => {
+  if (!nodeId) throw new TypeError('createSfuDrain needs a nodeId');
+  for (const [name, dep] of Object.entries({ registrar, rooms, redis, notifyRoomsDraining })) {
+    if (!dep) throw new TypeError(`createSfuDrain needs ${name}`);
   }
+
+  let state = 'serving';
+  let trigger = null;
+  let running = null;
+  let watchTimer = null;
+  let cancelRequested = false;
+  let startedAt = null;
+  let deadlineAt = null;
+
+  const setState = (next) => {
+    if (state === next) return;
+    logger.info?.({ nodeId, from: state, to: next }, 'sfu drain state');
+    state = next;
+    metrics.gauge?.('sfu_drain_state', DRAIN_STATES.indexOf(next), { nodeId });
+  };
+
+  const computeDeadline = (flag, startMs) => {
+    let limitSec = timeoutSec;
+    if (flag.reason === 'spot-interruption') limitSec = Math.min(limitSec, SPOT_DRAIN_CEILING_SEC);
+    let deadline = startMs + limitSec * 1_000;
+    if (flag.deadline) {
+      // Finish a little before the hook's own end so the completion lands.
+      deadline = Math.min(deadline, Date.parse(flag.deadline) - 30_000);
+    }
+    return Math.max(startMs, deadline);
+  };
+
+  const completeLifecycle = async (lifecycle) => {
+    for (let attempt = 1; attempt <= COMPLETE_ATTEMPTS; attempt += 1) {
+      try {
+        await autoScaling.complete(lifecycle, 'CONTINUE');
+        logger.info?.({ nodeId }, 'lifecycle action completed');
+        return;
+      } catch (cause) {
+        logger.warn?.({ nodeId, attempt, err: cause }, 'completing the lifecycle action failed');
+        if (attempt < COMPLETE_ATTEMPTS) await sleep(attempt * 2_000);
+      }
+    }
+    // The hook times out on its own and the ASG proceeds; nothing is lost.
+    logger.error?.({ nodeId }, 'lifecycle action not completed; the hook timeout will release it');
+  };
+
+  const run = async (flag) => {
+    trigger = flag;
+    cancelRequested = false;
+    startedAt = now();
+    deadlineAt = computeDeadline(flag, startedAt);
+    const moveAt = Math.max(startedAt, deadlineAt - moveGraceSec * 1_000);
+    let lastHeartbeat = startedAt;
+    let notified = false;
+
+    setState('draining');
+    metrics.increment?.('sfu_drain_started', { nodeId, reason: flag.reason });
+    logger.info?.(
+      { nodeId, reason: flag.reason, deadline: new Date(deadlineAt).toISOString() },
+      'sfu drain started',
+    );
+
+    // 1. Out of placement. A failed heartbeat update is not fatal: the drain
+    //    flag alone already keeps RoomPlacementService away from this node.
+    await registrar.setDraining(true).catch((cause) =>
+      logger.warn?.({ nodeId, err: cause }, 'could not mark the node draining in the registry'),
+    );
+
+    // 2 + 3. Wait for rooms to empty; move stragglers before the deadline.
+    for (;;) {
+      if (cancelRequested) {
+        await registrar.setDraining(false).catch(() => undefined);
+        setState('cancelled');
+        metrics.increment?.('sfu_drain_cancelled', { nodeId });
+        return;
+      }
+
+      const load = rooms.load();
+      if (load.rooms === 0 || load.peers === 0) break;
+
+      const current = now();
+
+      if (!notified && current >= moveAt) {
+        const roomIds = rooms.roomIds();
+        const graceSec = Math.max(0, Math.round((deadlineAt - current) / 1_000));
+        setState('moving');
+        logger.warn?.({ nodeId, rooms: roomIds.length, graceSec }, 'moving remaining rooms');
+        try {
+          await notifyRoomsDraining(roomIds, graceSec);
+        } catch (cause) {
+          logger.error?.({ nodeId, err: cause }, 'could not notify rooms; clients recover via ICE');
+        }
+        notified = true;
+      }
+
+      if (current >= deadlineAt) {
+        logger.warn?.({ nodeId, ...load }, 'drain timeout reached with rooms still on the node');
+        metrics.increment?.('sfu_drain_forced', { nodeId });
+        break;
+      }
+
+      if (flag.lifecycle && current - lastHeartbeat >= lifecycleHeartbeatSec * 1_000) {
+        try {
+          await autoScaling.heartbeat(flag.lifecycle);
+          lastHeartbeat = current;
+        } catch (cause) {
+          logger.warn?.({ nodeId, err: cause }, 'lifecycle heartbeat failed');
+        }
+      }
+
+      await sleep(POLL_INTERVAL_MS);
+    }
+
+    // 4. Leave the registry, then let the ASG proceed.
+    await registrar.deregister().catch((cause) =>
+      logger.warn?.({ nodeId, err: cause }, 'deregistration failed; the registry TTL (15 s) expires it'),
+    );
+
+    if (flag.lifecycle) await completeLifecycle(flag.lifecycle);
+
+    setState('drained');
+    metrics.increment?.('sfu_drain_completed', { nodeId, reason: flag.reason });
+    logger.info?.({ nodeId, ms: now() - startedAt }, 'sfu drain complete');
+  };
+
+  const start = (flag = { reason: 'manual' }) => {
+    if (running) return running;
+    if (state === 'drained') return Promise.resolve();
+    running = run(flag)
+      .catch((cause) => {
+        logger.error?.({ nodeId, err: cause }, 'sfu drain failed');
+      })
+      .finally(() => {
+        running = null;
+      });
+    return running;
+  };
+
+  /** Cancels a manual drain. A lifecycle drain cannot be cancelled. */
+  const cancel = () => {
+    if (!running || trigger?.lifecycle) return false;
+    cancelRequested = true;
+    return true;
+  };
+
+  const checkFlag = async () => {
+    let raw;
+    try {
+      raw = await redis.get(drainFlagKey(nodeId));
+    } catch (cause) {
+      // Redis unreachable: keep serving. The lifecycle hook still ends the node
+      // at its timeout, so a missed flag delays termination, it does not lose it.
+      logger.warn?.({ nodeId, err: cause }, 'drain flag check failed');
+      return;
+    }
+
+    const flag = parseFlag(raw);
+    if (flag && state === 'serving') {
+      void start(flag);
+    } else if (!flag && running && !trigger?.lifecycle) {
+      cancel();
+    }
+  };
+
+  /** Starts polling the drain flag. Returns a stop function. */
+  const watch = () => {
+    if (watchTimer) return () => stopWatching();
+    void checkFlag();
+    watchTimer = setInterval(() => void checkFlag(), POLL_INTERVAL_MS);
+    watchTimer.unref?.();
+    return () => stopWatching();
+  };
+
+  const stopWatching = () => {
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = null;
+  };
+
+  return Object.freeze({
+    start,
+    cancel,
+    watch,
+    stopWatching,
+    /** controlServer.js refuses room creation while this is true. */
+    isDraining: () => state === 'draining' || state === 'moving' || state === 'drained',
+    /** For /healthz/sfu: a draining node is healthy, just not accepting rooms. */
+    status: () =>
+      Object.freeze({
+        state,
+        reason: trigger?.reason ?? null,
+        startedAt: startedAt ? new Date(startedAt).toISOString() : null,
+        deadline: deadlineAt ? new Date(deadlineAt).toISOString() : null,
+        lifecycle: Boolean(trigger?.lifecycle),
+      }),
+    /** Resolves when a running drain has finished (for SIGTERM during a drain). */
+    settled: () => running ?? Promise.resolve(),
+  });
 };
 
-/**
- * The shutdown step for the SFU process. Drains first if nobody has already,
- * then waits.
- */
-export const drainStep = ({ logger = console } = {}) => ({
-  name: 'drain sfu',
-  run: async () => {
-    if (!draining) await beginDrain({ logger, reason: 'sigterm' });
-    await waitUntilEmpty({ logger });
-  },
-});
-
-export const drainStatus = () => ({
-  nodeId: env.SFU_NODE_ID,
-  draining,
-  drainingForSec: drainStartedAt ? Math.round((Date.now() - drainStartedAt) / 1000) : 0,
-  timeoutSec: env.SFU_DRAIN_TIMEOUT_SEC,
-});
-
-/** Tests only. */
-export const resetDrainState = () => {
-  draining = false;
-  drainStartedAt = null;
-  if (watcher) clearInterval(watcher);
-  watcher = null;
-  listeners.clear();
-};
-
-export default startDrainWatcher;
+export default createSfuDrain;

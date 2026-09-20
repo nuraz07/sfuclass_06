@@ -1,17 +1,33 @@
+// classroom-app/packages/contracts/src/events/signaling.events.ts
 /**
- * Classroom signalling  (F1)
+ * Classroom signalling  (F1, F8)  [EXT]
  *
- * Namespace: `/classroom`
+ * Namespace: `/classroom`, served by the realtime service (server/src/realtime.js).
  *
  * Everything that establishes or changes a media flow goes through here.
- * Nothing in this file carries media itself — the RTP path is between the
- * browser and the SFU node, and this socket only negotiates it.
+ * Nothing in this file carries media itself — the RTP path runs between the
+ * client and an SFU node, directly or through TURN, and this socket only
+ * negotiates it.
+ *
+ * Clients never address an SFU node. Signalling terminates on the realtime
+ * service, which places the room (RoomPlacementService), talks to the owning
+ * node over the private mTLS control RPC and returns everything the client
+ * needs in the join acknowledgement: router capabilities, both transports and
+ * the ICE configuration. There is no node id, node URL or node-resolution step
+ * anywhere in this contract.
  *
  * Screen sharing is not a second connection. It is a second video producer on
  * the same peer, tagged `appData.source = 'screen'`, which is what lets every
  * client lay it out differently from a webcam tile without a parallel code
  * path. `ScreenShareManager` holds a presenter lock; a client that starts
  * sharing while someone else holds it receives `screen_share_taken`.
+ *
+ * ICE (F8):
+ *   - `classroom:transport.restartIce` asks the owning node for new ICE
+ *     parameters for one transport; the client then calls transport.restartIce().
+ *   - `classroom:ice.update` pushes a fresh ICE configuration (TURN node
+ *     drained, secret rotation, tenant policy change). The client applies it
+ *     with transport.updateIceServers().
  *
  * Naming: `namespace:noun.verb`, past tense for things that already happened.
  * Client→server events take an acknowledgement callback; server→client events
@@ -25,6 +41,35 @@ import {
   UserIdSchema,
   displayText,
 } from '../zod/common.schema.ts';
+import {
+  IceConfigSchema,
+  IceParametersSchema,
+  RegionHintSchema,
+  RtpCapabilitiesSchema,
+  RtpParametersSchema,
+  DtlsParametersSchema,
+  TransportOptionsSchema,
+} from '../zod/rtc.schema.ts';
+
+// Re-exported so consumers of `SignalingEvents` get the connectivity shapes
+// from the same place. rtc.schema.ts stays their owner.
+export {
+  DtlsParametersSchema,
+  IceCandidateSchema,
+  IceConfigSchema,
+  IceParametersSchema,
+  IceServerSchema,
+  IceTransportPolicySchema,
+  RegionHintSchema,
+  RtpCapabilitiesSchema,
+  RtpParametersSchema,
+  TransportOptionsSchema,
+  type IceConfig,
+  type IceServer,
+  type IceTransportPolicy,
+  type RegionHint,
+  type TransportOptions,
+} from '../zod/rtc.schema.ts';
 
 export const CLASSROOM_NAMESPACE = '/classroom' as const;
 
@@ -43,20 +88,7 @@ export type MediaSource = z.infer<typeof MediaSourceSchema>;
 
 export const TRANSPORT_DIRECTIONS = ['send', 'recv'] as const;
 export const TransportDirectionSchema = z.enum(TRANSPORT_DIRECTIONS);
-
-/**
- * mediasoup payloads are large, provider-defined structures. Validating their
- * internals here would duplicate mediasoup's own checks and break on every
- * upgrade, so they pass through as opaque records and mediasoup rejects what it
- * does not like.
- */
-const OpaqueSchema = z.record(z.string(), z.unknown());
-
-export const RtpCapabilitiesSchema = OpaqueSchema;
-export const RtpParametersSchema = OpaqueSchema;
-export const DtlsParametersSchema = OpaqueSchema;
-export const IceParametersSchema = OpaqueSchema;
-export const IceCandidateSchema = OpaqueSchema;
+export type TransportDirection = z.infer<typeof TransportDirectionSchema>;
 
 export const ProducerInfoSchema = z.object({
   producerId: z.string().max(64),
@@ -86,9 +118,23 @@ export type Peer = z.infer<typeof PeerSchema>;
 
 export const JoinRoomSchema = z.object({
   roomId: z.uuid(),
-  /** Resolved beforehand through GET /rooms/:id/node. */
-  nodeId: z.string().max(64),
-  rtpCapabilities: RtpCapabilitiesSchema,
+  /**
+   * Result of the optional pre-join ConnectivityProbe. Advisory: tenant
+   * residency policy decides first, RegionHint.js validates the rest.
+   */
+  regionHint: RegionHintSchema.optional(),
+  /**
+   * True when a peer that is already in the room rebuilds its media (node
+   * drained, ICE unrecoverable). The server keeps the peer, its hand, its
+   * role and its presenter lock, re-places the media if needed and does not
+   * announce a leave and a join to everyone else.
+   */
+  rejoin: z.boolean().default(false),
+  /**
+   * Not needed at join: the device is loaded from the router capabilities in
+   * the acknowledgement, and every consume request carries the capabilities.
+   */
+  rtpCapabilities: RtpCapabilitiesSchema.optional(),
   device: z.object({
     platform: z.enum(['web', 'ios', 'android']),
     /** Drives the screen-share capability check on mobile. */
@@ -96,22 +142,32 @@ export const JoinRoomSchema = z.object({
   }),
 });
 
+/**
+ * Creates a transport for a direction outside the join, used to rebuild media
+ * (IceRecovery's relay-only retry). Creating a transport for a direction that
+ * already has one replaces it: the server closes the previous transport and
+ * every producer and consumer on it.
+ */
 export const CreateTransportSchema = z.object({
   direction: TransportDirectionSchema,
-  /** Requests TURN when a direct path already failed once. */
+  /**
+   * The client is about to use iceTransportPolicy 'relay'. The SFU is ICE-lite
+   * and does not care; IceServerService orders TURN/TLS 443 first and records
+   * the relay retry in the audit trail and rtc metrics.
+   */
   forceRelay: z.boolean().default(false),
 });
 
-export const TransportCreatedSchema = z.object({
-  transportId: z.string().max(64),
-  iceParameters: IceParametersSchema,
-  iceCandidates: z.array(IceCandidateSchema),
-  dtlsParameters: DtlsParametersSchema,
-});
+/** Kept as a name for existing imports; the shape is owned by rtc.schema.ts. */
+export const TransportCreatedSchema = TransportOptionsSchema;
 
 export const ConnectTransportSchema = z.object({
   transportId: z.string().max(64),
   dtlsParameters: DtlsParametersSchema,
+});
+
+export const RestartIceSchema = z.object({
+  transportId: z.string().max(64),
 });
 
 export const ProduceSchema = z.object({
@@ -138,6 +194,10 @@ export const ConsumeSchema = z.object({
 
 export const ProducerActionSchema = z.object({
   producerId: z.string().max(64),
+});
+
+export const ConsumerActionSchema = z.object({
+  consumerId: z.string().max(64),
 });
 
 /**
@@ -213,6 +273,8 @@ export const RoomStateSchema = z.object({
   roomId: z.uuid(),
   lessonId: z.uuid().nullable(),
   mode: z.enum(['lecture', 'seminar', 'office-hours']),
+  /** Where the room's media lives. For display and rtcStats; never an address. */
+  mediaRegion: z.string().max(32),
   routerRtpCapabilities: RtpCapabilitiesSchema,
   peers: z.array(PeerSchema),
   selfPeerId: z.string().max(64),
@@ -225,9 +287,11 @@ export const RoomStateSchema = z.object({
 });
 
 export const RoomClosedSchema = z.object({
+  /**
+   * 'node-drained' means the room's node was drained and the room could not be
+   * placed elsewhere. Clients do not reconnect to a named node; there is none.
+   */
   reason: z.enum(['ended-by-host', 'scheduled-end', 'node-drained', 'error']),
-  /** Set for 'node-drained': the client reconnects here instead of failing. */
-  reconnectNodeId: z.string().max(64).nullable().default(null),
 });
 
 export const PeerLeftSchema = z.object({
@@ -250,15 +314,74 @@ export const WaitingPeerSchema = z.object({
   knockedAt: IsoDateTimeSchema,
 });
 
+export const ICE_UPDATE_REASONS = [
+  'refresh',
+  'turn-node-drained',
+  'secret-rotated',
+  'policy-changed',
+] as const;
+
+/** Pushed by the server; applied with transport.updateIceServers(). */
+export const IceUpdateSchema = z.object({
+  ice: IceConfigSchema,
+  reason: z.enum(ICE_UPDATE_REASONS),
+});
+
+/**
+ * The room's SFU node is being drained and will stop after `graceSec`. The
+ * signalling socket is unaffected (it ends on the realtime service); the client
+ * rebuilds only its media with `classroom:join { rejoin: true }` and placement
+ * picks a healthy node.
+ */
+export const NodeDrainingSchema = z.object({
+  graceSec: z.number().int().min(0).max(86_400),
+});
+
+// ---------------------------------------------------------------------------
+// Acknowledgements — what a client→server event resolves with
+// ---------------------------------------------------------------------------
+
+/**
+ * The placement result, as data. Mirrors section 4.6 of the architecture:
+ * transports come from the owning node, `ice` from IceServerService, both
+ * minted only after the peer was admitted past the waiting room.
+ */
+export const JoinAckSchema = z.object({
+  room: RoomStateSchema,
+  sendTransport: TransportOptionsSchema,
+  recvTransport: TransportOptionsSchema,
+  ice: IceConfigSchema,
+});
+
+export const CreateTransportAckSchema = z.object({
+  transport: TransportOptionsSchema,
+  ice: IceConfigSchema,
+});
+
+export const IceRestartedSchema = z.object({
+  iceParameters: IceParametersSchema,
+});
+
+export const ProducedSchema = z.object({
+  producerId: z.string().max(64),
+});
+
 // ---------------------------------------------------------------------------
 // Inferred types — what consumers actually hold
 // ---------------------------------------------------------------------------
 
 export type JoinRoom = z.infer<typeof JoinRoomSchema>;
+export type JoinAck = z.infer<typeof JoinAckSchema>;
 export type CreateTransport = z.infer<typeof CreateTransportSchema>;
+export type CreateTransportAck = z.infer<typeof CreateTransportAckSchema>;
 export type TransportCreated = z.infer<typeof TransportCreatedSchema>;
 export type ConnectTransport = z.infer<typeof ConnectTransportSchema>;
+export type RestartIce = z.infer<typeof RestartIceSchema>;
+export type IceRestarted = z.infer<typeof IceRestartedSchema>;
+export type IceUpdate = z.infer<typeof IceUpdateSchema>;
+export type NodeDraining = z.infer<typeof NodeDrainingSchema>;
 export type Produce = z.infer<typeof ProduceSchema>;
+export type Produced = z.infer<typeof ProducedSchema>;
 export type Consume = z.infer<typeof ConsumeSchema>;
 export type ConsumerCreated = z.infer<typeof ConsumerCreatedSchema>;
 export type StartScreenShare = z.infer<typeof StartScreenShareSchema>;
@@ -280,6 +403,7 @@ export const SIGNALING_CLIENT_EVENTS = {
   leave: 'classroom:leave',
   createTransport: 'classroom:transport.create',
   connectTransport: 'classroom:transport.connect',
+  restartIce: 'classroom:transport.restartIce',
   produce: 'classroom:produce',
   closeProducer: 'classroom:producer.close',
   pauseProducer: 'classroom:producer.pause',
@@ -310,7 +434,9 @@ export const SIGNALING_SERVER_EVENTS = {
   recordingChanged: 'classroom:recording.changed',
   waitingPeer: 'classroom:waiting.peer',
   breakoutChanged: 'classroom:breakout.changed',
-  /** Sent before a node drains, so clients reconnect rather than freeze. */
+  /** Fresh ICE servers and credentials; see IceUpdateSchema. */
+  iceUpdate: 'classroom:ice.update',
+  /** The room's SFU node is draining; rebuild media with a rejoin. */
   nodeDraining: 'classroom:node.draining',
 } as const;
 
@@ -331,42 +457,68 @@ export type SignalingServerEvent =
 // ---------------------------------------------------------------------------
 
 export type SignalingClientPayloads = {
-  [SIGNALING_CLIENT_EVENTS.join]: z.infer<typeof JoinRoomSchema>;
+  [SIGNALING_CLIENT_EVENTS.join]: z.input<typeof JoinRoomSchema>;
   [SIGNALING_CLIENT_EVENTS.leave]: Record<string, never>;
-  [SIGNALING_CLIENT_EVENTS.createTransport]: z.infer<typeof CreateTransportSchema>;
-  [SIGNALING_CLIENT_EVENTS.connectTransport]: z.infer<typeof ConnectTransportSchema>;
-  [SIGNALING_CLIENT_EVENTS.produce]: z.infer<typeof ProduceSchema>;
+  [SIGNALING_CLIENT_EVENTS.createTransport]: z.input<typeof CreateTransportSchema>;
+  [SIGNALING_CLIENT_EVENTS.connectTransport]: ConnectTransport;
+  [SIGNALING_CLIENT_EVENTS.restartIce]: RestartIce;
+  [SIGNALING_CLIENT_EVENTS.produce]: z.input<typeof ProduceSchema>;
   [SIGNALING_CLIENT_EVENTS.closeProducer]: z.infer<typeof ProducerActionSchema>;
   [SIGNALING_CLIENT_EVENTS.pauseProducer]: z.infer<typeof ProducerActionSchema>;
   [SIGNALING_CLIENT_EVENTS.resumeProducer]: z.infer<typeof ProducerActionSchema>;
-  [SIGNALING_CLIENT_EVENTS.consume]: z.infer<typeof ConsumeSchema>;
-  [SIGNALING_CLIENT_EVENTS.resumeConsumer]: { consumerId: string };
-  [SIGNALING_CLIENT_EVENTS.startScreenShare]: z.infer<typeof StartScreenShareSchema>;
+  [SIGNALING_CLIENT_EVENTS.consume]: Consume;
+  [SIGNALING_CLIENT_EVENTS.resumeConsumer]: z.infer<typeof ConsumerActionSchema>;
+  [SIGNALING_CLIENT_EVENTS.startScreenShare]: z.input<typeof StartScreenShareSchema>;
   [SIGNALING_CLIENT_EVENTS.stopScreenShare]: Record<string, never>;
   [SIGNALING_CLIENT_EVENTS.raiseHand]: z.infer<typeof RaiseHandSchema>;
   [SIGNALING_CLIENT_EVENTS.react]: z.infer<typeof ReactionSchema>;
-  [SIGNALING_CLIENT_EVENTS.hostAction]: z.infer<typeof HostActionSchema>;
-  [SIGNALING_CLIENT_EVENTS.breakout]: z.infer<typeof BreakoutActionSchema>;
+  [SIGNALING_CLIENT_EVENTS.hostAction]: HostAction;
+  [SIGNALING_CLIENT_EVENTS.breakout]: z.input<typeof BreakoutActionSchema>;
+};
+
+/**
+ * What each acknowledgement carries in `SocketAck.data`. Events whose ack
+ * carries nothing beyond `{ ok: true }` are typed as an empty record.
+ */
+export type SignalingAckPayloads = {
+  [SIGNALING_CLIENT_EVENTS.join]: JoinAck;
+  [SIGNALING_CLIENT_EVENTS.leave]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.createTransport]: CreateTransportAck;
+  [SIGNALING_CLIENT_EVENTS.connectTransport]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.restartIce]: IceRestarted;
+  [SIGNALING_CLIENT_EVENTS.produce]: Produced;
+  [SIGNALING_CLIENT_EVENTS.closeProducer]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.pauseProducer]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.resumeProducer]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.consume]: ConsumerCreated;
+  [SIGNALING_CLIENT_EVENTS.resumeConsumer]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.startScreenShare]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.stopScreenShare]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.raiseHand]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.react]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.hostAction]: Record<string, never>;
+  [SIGNALING_CLIENT_EVENTS.breakout]: Record<string, never>;
 };
 
 export type SignalingServerPayloads = {
-  [SIGNALING_SERVER_EVENTS.roomState]: z.infer<typeof RoomStateSchema>;
-  [SIGNALING_SERVER_EVENTS.roomClosed]: z.infer<typeof RoomClosedSchema>;
-  [SIGNALING_SERVER_EVENTS.peerJoined]: z.infer<typeof PeerSchema>;
-  [SIGNALING_SERVER_EVENTS.peerLeft]: z.infer<typeof PeerLeftSchema>;
-  [SIGNALING_SERVER_EVENTS.peerUpdated]: z.infer<typeof PeerSchema>;
-  [SIGNALING_SERVER_EVENTS.newProducer]: z.infer<typeof ProducerInfoSchema>;
+  [SIGNALING_SERVER_EVENTS.roomState]: RoomState;
+  [SIGNALING_SERVER_EVENTS.roomClosed]: RoomClosed;
+  [SIGNALING_SERVER_EVENTS.peerJoined]: Peer;
+  [SIGNALING_SERVER_EVENTS.peerLeft]: PeerLeft;
+  [SIGNALING_SERVER_EVENTS.peerUpdated]: Peer;
+  [SIGNALING_SERVER_EVENTS.newProducer]: ProducerInfo;
   [SIGNALING_SERVER_EVENTS.producerClosed]: z.infer<typeof ProducerActionSchema>;
-  [SIGNALING_SERVER_EVENTS.consumerCreated]: z.infer<typeof ConsumerCreatedSchema>;
-  [SIGNALING_SERVER_EVENTS.screenShareStarted]: z.infer<typeof ScreenShareStartedSchema>;
-  [SIGNALING_SERVER_EVENTS.screenShareStopped]: z.infer<typeof ScreenShareStoppedSchema>;
+  [SIGNALING_SERVER_EVENTS.consumerCreated]: ConsumerCreated;
+  [SIGNALING_SERVER_EVENTS.screenShareStarted]: ScreenShareStarted;
+  [SIGNALING_SERVER_EVENTS.screenShareStopped]: ScreenShareStopped;
   [SIGNALING_SERVER_EVENTS.handRaised]: { peerId: string; raised: boolean };
   [SIGNALING_SERVER_EVENTS.reaction]: { peerId: string; emoji: string };
   [SIGNALING_SERVER_EVENTS.recordingChanged]: { recording: boolean; startedBy: string | null };
-  [SIGNALING_SERVER_EVENTS.waitingPeer]: z.infer<typeof WaitingPeerSchema>;
+  [SIGNALING_SERVER_EVENTS.waitingPeer]: WaitingPeer;
   [SIGNALING_SERVER_EVENTS.breakoutChanged]: {
     breakoutId: string | null;
     endsAt: string | null;
   };
-  [SIGNALING_SERVER_EVENTS.nodeDraining]: { reconnectNodeId: string | null; graceSec: number };
+  [SIGNALING_SERVER_EVENTS.iceUpdate]: IceUpdate;
+  [SIGNALING_SERVER_EVENTS.nodeDraining]: NodeDraining;
 };
