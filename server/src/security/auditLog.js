@@ -119,8 +119,42 @@ export async function auditLog(event, { client } = {}) {
   }
 }
 
-/** Alias, so `auditLog.record(event)` and `auditLog(event)` both work across the codebase. */
-auditLog.record = auditLog;
+/** The columns an event can fill directly; everything else goes into metadata. */
+const EVENT_FIELDS = new Set([
+  'action', 'tenantId', 'actorId', 'actorRole', 'targetType', 'targetId',
+  'ip', 'userAgent', 'requestId', 'traceId',
+]);
+
+/**
+ * Tolerant entry point for callers that describe an event in their own words:
+ *
+ *   record({ domain: 'chat', action: 'mute', actorId, targetUserId, channelId, reason })
+ *   audit({ action: 'media.infected', actorId, targetType: 'asset', targetId, detail })
+ *
+ * Known fields map to columns; anything else (targetUserId, channelId, detail,
+ * a route's `actor` or `target` object) is kept in metadata rather than
+ * dropped. A `domain` is prefixed to an action that has none ('mute' becomes
+ * 'chat.mute'), so actions stay greppable across domains.
+ */
+export function record(entry = {}, options) {
+  const { domain = null, metadata = {}, ...rest } = entry;
+  const event = { metadata: { ...metadata } };
+
+  for (const [key, value] of Object.entries(rest)) {
+    if (value === undefined) continue;
+    if (EVENT_FIELDS.has(key)) event[key] = value;
+    else event.metadata[key] = value;
+  }
+
+  if (domain && event.action && !event.action.includes('.')) event.action = `${domain}.${event.action}`;
+  return auditLog(event, options);
+}
+
+/** v6 name, used by media/AntivirusScan.js. */
+export const audit = record;
+
+/** So `auditLog.record(event)` and `auditLog(event)` both work across the codebase. */
+auditLog.record = record;
 
 /**
  * Several events from one transaction, in one statement. Used by bulk moderation and by

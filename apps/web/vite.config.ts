@@ -25,6 +25,13 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), ['VITE_', 'RELEASE_']);
   const isProduction = mode === 'production';
 
+  /**
+   * Where the dev proxy sends API and socket traffic. The api process serves
+   * HTTP and Socket.IO on one port (PORT in the root .env, 4000 by default).
+   * Override with VITE_DEV_API_TARGET when running it elsewhere.
+   */
+  const devApiTarget = env.VITE_DEV_API_TARGET || 'http://localhost:4000';
+
   return {
     plugins: [react()],
 
@@ -103,11 +110,36 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       strictPort: true,
+      /**
+       * Dev only. In every deployed environment the SPA talks to api. and
+       * ws. directly; there is no proxy in front of it.
+       *
+       * The browser only ever talks to this dev server (also through the
+       * Codespaces port forward), so API and socket traffic share its origin:
+       * no CORS preflights, and cookies land on the host the browser sees.
+       *
+       *   /api/auth/csrf  ->  <devApiTarget>/auth/csrf   (the api mounts its
+       *                                                  routes without /api)
+       *   /socket.io/*    ->  <devApiTarget>/socket.io/* (WebSocket upgrade)
+       *
+       * The /api prefix exists only so API paths cannot collide with SPA
+       * routes such as /courses; it is stripped before forwarding. Cookie
+       * paths and domains set by the api are rewritten to the dev origin, so a
+       * refresh cookie scoped to /auth is still sent to /api/auth.
+       */
       proxy: {
-        // Dev only. In every deployed environment the SPA talks to api. and
-        // ws. directly; there is no proxy in front of it.
-        '/api': { target: 'http://localhost:8080', changeOrigin: true },
-        '/socket.io': { target: 'http://localhost:8081', ws: true, changeOrigin: true },
+        '/api': {
+          target: devApiTarget,
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api(?=\/|$)/, '') || '/',
+          cookiePathRewrite: { '*': '/' },
+          cookieDomainRewrite: { '*': '' },
+        },
+        '/socket.io': {
+          target: devApiTarget,
+          ws: true,
+          changeOrigin: true,
+        },
       },
     },
 

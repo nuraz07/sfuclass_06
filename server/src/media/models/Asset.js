@@ -346,4 +346,62 @@ export const assertServable = (asset) => {
   return asset;
 };
 
-export default { findById, findMany, findForOwner, list, insert, setStatus, softDelete, usageFor, assertServable, canTransition };
+// ---------------------------------------------------------------------------
+// Repository shape  (queues/workers/recordingWorker.js)
+// ---------------------------------------------------------------------------
+
+/** The recording worker reads `asset.id`; the rest of the codebase reads `assetId`. */
+const withId = (asset) => (asset ? { ...asset, id: asset.assetId } : null);
+
+const baseName = (key) => String(key ?? '').split('/').pop() || 'recording.mp4';
+
+export const assetRepository = Object.freeze({
+  /**
+   * The asset created for a source, e.g. `recording:<recordingId>`. The source
+   * reference lives in metadata.sourceRef: it is how a retried mux finds the
+   * asset it already made instead of creating a second one.
+   */
+  findBySourceRef: async (sourceRef, client = pool) => {
+    const { rows } = await client.query(
+      `${SELECT} WHERE a.metadata->>'sourceRef' = $1 AND a.deleted_at IS NULL
+        ORDER BY a.created_at DESC LIMIT 1`,
+      [sourceRef],
+    );
+    return withId(rows[0] ? rowToAsset(rows[0]) : null);
+  },
+
+  /**
+   * Creates an asset from the recording worker's description:
+   * { tenantId | ownerId, kind, status, sourceRef, bucket, key, sizeBytes, durationMs, metadata }.
+   * A recording is a video owned by whoever the worker names as owner.
+   */
+  create: async (fields, client = pool) => {
+    const ownerId = fields.ownerId ?? fields.hostUserId ?? fields.tenantId;
+    const kind = fields.kind === 'recording' ? 'video' : fields.kind;
+    const asset = await insert(
+      {
+        ownerId,
+        purpose: fields.purpose ?? 'recording',
+        kind,
+        status: fields.status ?? 'processing',
+        fileName: fields.fileName ?? baseName(fields.key ?? fields.objectKey),
+        contentType: fields.contentType ?? 'video/mp4',
+        sizeBytes: fields.sizeBytes ?? 0,
+        bucket: fields.bucket,
+        objectKey: fields.key ?? fields.objectKey,
+        contextId: fields.contextId ?? null,
+        metadata: { ...(fields.metadata ?? {}), sourceRef: fields.sourceRef ?? null, durationMs: fields.durationMs ?? null },
+      },
+      client,
+    );
+    return withId(asset);
+  },
+
+  findById: async (assetId, client = pool) => withId(await findById(assetId, client)),
+  setStatus: (input, client = pool) => setStatus(input, client),
+});
+
+export default {
+  findById, findMany, findForOwner, list, insert, setStatus, softDelete, usageFor, assertServable, canTransition,
+  assetRepository,
+};

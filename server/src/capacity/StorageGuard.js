@@ -226,8 +226,19 @@ export const commitReservation = async ({ ownerId, assetId, sizeBytes }) => {
   return true;
 };
 
-/** The upload was aborted, failed, or the file was rejected by the scan. */
-export const releaseReservation = async ({ ownerId, assetId }) => {
+/**
+ * The upload was aborted, failed, or the file was rejected by the scan.
+ *
+ * maintenanceWorker passes a bare reservation id without its owner. The key
+ * cannot be rebuilt from that, and the reservation expires by its TTL anyway
+ * (RESERVATION_TTL_SEC), so that form is logged and left to expire.
+ */
+export const releaseReservation = async (input) => {
+  if (typeof input !== 'object' || input === null) {
+    log.debug({ reservationId: input }, 'reservation without owner; leaving it to expire');
+    return 0;
+  }
+  const { ownerId, assetId } = input;
   try {
     const released = await evaluate(
       RELEASE,
@@ -318,6 +329,80 @@ const quotaError = ({ sizeBytes, used, quotaBytes }) => {
   });
 };
 
+// ---------------------------------------------------------------------------
+// v6 API  (chat attachments, maintenance worker, retention job)
+// ---------------------------------------------------------------------------
+//
+// Older callers name the quota subject `tenantId`; this module names it
+// `ownerId`, the id EntitlementCache resolves a plan for. The adapters accept
+// either and pass it through as the owner.
+
+const isQuotaError = (error) =>
+  error instanceof ApiError && [error.code, error.type, error.errorCode].includes('quota_exceeded');
+
+/**
+ * Intent check before an attachment upload: { ok, availableBytes } or
+ * { ok: false, error }. Never throws for a full quota — the caller builds its
+ * own message from `ok`.
+ *
+ * Unlike assertStorageAvailable this fails *open* on an unavailable
+ * dependency: it is only a pre-check, and UploadService.createUpload runs the
+ * authoritative, fail-closed check for the same bytes right after it.
+ */
+export const reserve = async ({ ownerId, tenantId, userId, sizeBytes, assetId = null }) => {
+  const subject = ownerId ?? userId ?? tenantId;
+  try {
+    const result = await assertStorageAvailable({ ownerId: subject, sizeBytes, assetId });
+    return { ok: true, ...result };
+  } catch (error) {
+    if (isQuotaError(error)) return { ok: false, error };
+    log.warn({ err: error, ownerId: subject }, 'storage pre-check unavailable; upload will be checked again');
+    return { ok: true, reserved: false, unchecked: true };
+  }
+};
+
+/** A deletion by the retention job: release({ tenantId, bytes }). */
+export const release = ({ ownerId, tenantId, bytes = 0, sizeBytes = bytes }) =>
+  releaseBytes({ ownerId: ownerId ?? tenantId, sizeBytes });
+
+/**
+ * Recorded against actual usage, for the drift check in maintenanceWorker:
+ * { recordedBytes, actualBytes }.
+ */
+export const recompute = async (ownerId) => {
+  const { usageFor } = await import('../media/models/Asset.js');
+  const [usage, actual] = await Promise.all([currentUsage(ownerId), usageFor(ownerId)]);
+  return { ownerId, recordedBytes: usage.committedBytes, actualBytes: Number(actual.usedBytes ?? 0) };
+};
+
+/** Makes the recorded usage match the database again. */
+export const repair = async (ownerId) => recomputeUsage(ownerId);
+
+/** Owners holding stored bytes, for the nightly drift audit. */
+export const tenantsToAudit = async ({ limit = 50 } = {}) => {
+  const { pool } = await import('../db/pool.js');
+  const { rows } = await pool.query(
+    `SELECT DISTINCT owner_id FROM assets WHERE deleted_at IS NULL AND owner_id IS NOT NULL LIMIT $1`,
+    [limit],
+  );
+  return rows.map((row) => row.owner_id);
+};
+
+/** The same functions as one object: `const { StorageGuard } = await import(...)`. */
+export const StorageGuard = Object.freeze({
+  reserve,
+  release,
+  recompute,
+  repair,
+  tenantsToAudit,
+  assertStorageAvailable: (...args) => assertStorageAvailable(...args),
+  commitReservation: (...args) => commitReservation(...args),
+  releaseReservation: (...args) => releaseReservation(...args),
+  releaseBytes: (...args) => releaseBytes(...args),
+  currentUsage: (...args) => currentUsage(...args),
+  quotaBytesFor: (...args) => quotaBytesFor(...args),
+});
+
 /** Tests only. */
 export const resetStorageScripts = () => {
   reserveSha = null;
@@ -327,4 +412,5 @@ export const resetStorageScripts = () => {
 export default {
   assertStorageAvailable, commitReservation, releaseReservation, releaseBytes,
   quotaBytesFor, currentUsage, recomputeUsage, checkThresholds,
+  reserve, release, recompute, repair, tenantsToAudit,
 };

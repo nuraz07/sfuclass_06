@@ -17,6 +17,8 @@
  * Node.js 22, ESM.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import { env } from '../config/env.js';
 import { stateRedis } from '../db/redis.js';
 import { logger } from '../observability/logger.js';
@@ -43,25 +45,42 @@ if (env.REDIS_CACHE_URL && env.REDIS_STATE_URL === env.REDIS_CACHE_URL) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * BullMQ accepts an existing ioredis instance. Reusing the shared state client
- * keeps one connection pool, one TLS config and one retry strategy — and, more
- * importantly, one place where `maxRetriesPerRequest: null` is set, which
- * BullMQ requires for its blocking commands.
+ * What BullMQ connects with.
  *
- * BullMQ duplicates this connection internally for blocking reads, so a worker
- * never starves the rest of the process.
+ * BullMQ refuses an ioredis client that has a `keyPrefix` ("ioredis does not
+ * support ioredis prefixes, use the prefix option instead") and its workers
+ * need `maxRetriesPerRequest: null` for their blocking reads. The shared state
+ * client in db/redis.js may carry both a keyPrefix and a finite retry count,
+ * because every other caller wants them.
+ *
+ * So for a single-node client BullMQ gets connection *options* derived from
+ * the state client — same host, port, db, credentials and TLS — without the
+ * keyPrefix and with the retry setting BullMQ needs. The keyPrefix moves into
+ * BullMQ's own `prefix`, so queue keys stay under the same namespace as before
+ * ("<keyPrefix>bull:<queue>:..."). Every Queue and Worker then owns its
+ * connections and closes them itself.
+ *
+ * A cluster client (production) is passed through as is: cluster mode needs a
+ * hash-tagged prefix and is configured in db/redis.js for that purpose.
  */
-export const connection = stateRedis;
+const stateOptions = stateRedis.isCluster ? null : { ...(stateRedis.options ?? {}) };
+const clientKeyPrefix = stateRedis.isCluster
+  ? stateRedis.options?.redisOptions?.keyPrefix ?? ''
+  : stateOptions.keyPrefix ?? '';
+
+export const connection = stateRedis.isCluster
+  ? stateRedis
+  : { ...stateOptions, keyPrefix: '', maxRetriesPerRequest: null, enableReadyCheck: false, lazyConnect: false };
 
 /**
  * Key prefix. Must stay identical across api, worker and sfu, and stable
  * across releases: changing it orphans every queued job.
  *
- * Note this is BullMQ's own prefix and is applied *in addition* to the
- * ioredis keyPrefix configured in db/redis.js, so queue keys end up under
- * "<REDIS_PREFIX>:state:bull:<queue>:...".
+ * For a single-node client this includes the ioredis keyPrefix of the state
+ * client (moved here, see above), so queue keys end up under
+ * "<REDIS_PREFIX>:state:bull:<queue>:..." when db/redis.js sets that prefix.
  */
-export const prefix = 'bull';
+export const prefix = stateRedis.isCluster ? 'bull' : `${clientKeyPrefix}bull`;
 
 /**
  * Defaults every queue inherits unless it overrides them in queues.js.
@@ -102,7 +121,7 @@ export const queueOptions = {
 /** Used by readiness.js in the worker role. */
 export async function ping() {
   try {
-    await connection.ping();
+    await stateRedis.ping();
     return true;
   } catch (err) {
     log.error({ err }, 'queue connection ping failed');
@@ -110,9 +129,67 @@ export async function ping() {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Helpers for workers (v6 API)                                                */
+/* -------------------------------------------------------------------------- */
+
 /**
- * The connection is owned by db/redis.js, so nothing here closes it.
- * Queues and workers close themselves in lifecycle/gracefulShutdown.js, then
- * closeRedis() ends the connection once.
+ * The Redis client a worker uses for its own bookkeeping (dedupe markers,
+ * counters) — not for BullMQ. It is the shared state client: those keys must
+ * not be evicted either. The name only labels log lines.
+ *
+ * @param {string} [name]
  */
-export default { connection, prefix, queueOptions, workerOptions, defaultJobOptions, ping };
+export function utilityConnection(name = 'worker') {
+  log.debug({ name }, 'utility connection handed out (shared state client)');
+  return stateRedis;
+}
+
+// Delete the lock only if it is still ours: after an overrun, a plain DEL
+// could remove the lock of the next run that legitimately took over.
+const RELEASE_LOCK = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
+/**
+ * Single-runner lock on the state cluster.
+ *
+ *   const release = await acquireLock('maintenance:quotaDrift', 10 * 60_000);
+ *   if (!release) return { skipped: 'locked' };
+ *   try { ... } finally { await release(); }
+ *
+ * @param {string} name
+ * @param {number} ttlMs   upper bound for the work; the lock expires on its own after it
+ * @returns {Promise<(() => Promise<boolean>) | null>}  release function, or null if held elsewhere
+ */
+export async function acquireLock(name, ttlMs = 60_000) {
+  const key = `${env.REDIS_PREFIX}:lock:${name}`;
+  const token = randomUUID();
+  const acquired = (await stateRedis.set(key, token, 'PX', ttlMs, 'NX')) === 'OK';
+  if (!acquired) return null;
+
+  let released = false;
+  return async () => {
+    if (released) return false;
+    released = true;
+    try {
+      return (await stateRedis.eval(RELEASE_LOCK, 1, key, token)) === 1;
+    } catch (err) {
+      log.warn({ err, name }, 'lock release failed; it expires on its own');
+      return false;
+    }
+  };
+}
+
+/**
+ * The state client is owned by db/redis.js, so nothing here closes it.
+ * Queues and workers close their own connections (they are created from
+ * options, see above) in lifecycle/gracefulShutdown.js; closeRedis() then ends
+ * the shared client once.
+ */
+export default {
+  connection, prefix, queueOptions, workerOptions, defaultJobOptions, ping, utilityConnection, acquireLock,
+};

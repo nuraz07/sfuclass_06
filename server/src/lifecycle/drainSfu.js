@@ -38,6 +38,15 @@
  * Everything this module touches on the node is injected (registrar, rooms,
  * notifier, Redis), so it has no opinion on their internals and tests run it
  * with a fake clock.
+ *
+ * Process-wide API (bottom of this file). Code that only needs to ask "is this
+ * process draining?" — health.routes.js, signaling/socketHandlers.js,
+ * classroom/RoomManager.js, classroom/RoomRegistry.js — uses isDraining() and
+ * canAcceptRoom(), and mediasoup/index.js starts a drain with beginDrain().
+ * They all read one controller per process: the one sfu.js installs with
+ * installSfuDrain(), or the one beginDrain() builds on first use. A process
+ * that never drains (the api in AWS, development without a drain) answers
+ * "not draining".
  */
 
 import { z } from 'zod';
@@ -381,6 +390,88 @@ export const createSfuDrain = ({
     /** Resolves when a running drain has finished (for SIGTERM during a drain). */
     settled: () => running ?? Promise.resolve(),
   });
+};
+
+// ---------------------------------------------------------------------------
+// Process-wide drain
+// ---------------------------------------------------------------------------
+
+/** The drain controller of this process, if any. */
+let processDrain = null;
+
+/**
+ * Makes `controller` (from createSfuDrain) the one isDraining() and
+ * canAcceptRoom() report on. Called by sfu.js at boot.
+ */
+export const installSfuDrain = (controller) => {
+  processDrain = controller;
+  return controller;
+};
+
+export const getSfuDrain = () => processDrain;
+
+/** True from the start of a drain until the process exits. */
+export const isDraining = () => processDrain?.isDraining() ?? false;
+
+/**
+ * Whether this node may take a room it does not already carry. Capacity is
+ * not decided here: placement (RoomRegistry.listNodes) already skips full
+ * nodes, and an existing room must keep admitting late joiners.
+ */
+export const canAcceptRoom = () => !isDraining();
+
+/**
+ * Builds the controller for this process from its real collaborators. The
+ * imports are dynamic because RoomManager imports this module: a static import
+ * back would be a cycle evaluated half-initialised.
+ */
+const createProcessDrain = async ({ timeoutSec }) => {
+  const [{ stateRedis }, { logger }, { metrics }, RoomManager, RoomRegistry] = await Promise.all([
+    import('../db/redis.js'),
+    import('../observability/logger.js'),
+    import('../observability/metrics.js'),
+    import('../classroom/RoomManager.js'),
+    import('../classroom/RoomRegistry.js'),
+  ]);
+
+  const log = logger.child({ component: 'sfu-drain' });
+
+  return createSfuDrain({
+    nodeId: env.SFU_NODE_ID,
+    redis: stateRedis,
+    logger: log,
+    metrics,
+    timeoutSec,
+    registrar: {
+      // Out of the assignment pool. The v6 heartbeat keeps reporting
+      // `draining: true` from isDraining(), so the node does not come back.
+      setDraining: async (draining) => {
+        if (draining) await RoomRegistry.markNodeDraining(env.SFU_NODE_ID);
+      },
+      deregister: () => RoomRegistry.markNodeDraining(env.SFU_NODE_ID),
+    },
+    rooms: {
+      load: () => ({ rooms: RoomManager.getRoomCount(), peers: RoomManager.getPeerCount() }),
+      roomIds: () => RoomManager.listRoomIds(),
+    },
+    notifyRoomsDraining: async (roomIds, graceSec) => {
+      for (const roomId of roomIds) {
+        RoomManager.getRoom(roomId)?.broadcast('classroom:node.draining', { graceSec, rejoin: true });
+      }
+    },
+  });
+};
+
+/**
+ * Starts draining this process and resolves when the drain has finished:
+ * every room empty, or the timeout reached. Safe to call more than once.
+ *
+ * @param {{ timeoutSec?: number, reason?: 'manual' | 'scale-in' | 'instance-refresh' | 'spot-interruption' }} [options]
+ */
+export const beginDrain = async ({ timeoutSec = env.SFU_DRAIN_TIMEOUT_SEC, reason = 'manual' } = {}) => {
+  if (!processDrain) processDrain = await createProcessDrain({ timeoutSec });
+  await processDrain.start({ reason });
+  return processDrain.status();
 };
 
 export default createSfuDrain;

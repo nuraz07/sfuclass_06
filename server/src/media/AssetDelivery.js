@@ -195,6 +195,44 @@ export const decorateMany = (assets, { ttlSec } = {}) =>
       : asset,
   );
 
+// ---------------------------------------------------------------------------
+// By asset id  (chat attachments)
+// ---------------------------------------------------------------------------
+
+/** Only a ready asset is signed; anything else gets no URL rather than a broken one. */
+const readyAsset = async (assetId) => {
+  const { findById } = await import('./models/Asset.js');
+  const asset = await findById(assetId);
+  return asset && asset.status === 'ready' ? asset : null;
+};
+
+/**
+ * Signed download URL for one asset, by id. Used where only the id is at hand
+ * (messaging/ChatAttachmentService.js). Returns null for a missing or not yet
+ * ready asset.
+ *
+ * @param {string} assetId
+ * @param {{ disposition?: 'attachment' | 'inline', ttlSec?: number }} [options]
+ */
+export const signDownload = async (assetId, { disposition = 'attachment', ttlSec } = {}) => {
+  const asset = await readyAsset(assetId);
+  if (!asset) return null;
+  return signUrl({ key: asset.objectKey, ttlSec, disposition, fileName: asset.fileName }).url;
+};
+
+/**
+ * Signed URL that renders inline (images, PDFs). For an image with a
+ * thumbnail rendition the object itself is the preview.
+ *
+ * @param {string} assetId
+ * @param {{ ttlSec?: number }} [options]
+ */
+export const signPreview = async (assetId, { ttlSec } = {}) => {
+  const asset = await readyAsset(assetId);
+  if (!asset) return null;
+  return signUrl({ key: asset.objectKey, ttlSec, disposition: 'inline', fileName: asset.fileName }).url;
+};
+
 /** Warns once at boot if delivery is unsigned where it should not be. */
 export const checkConfiguration = () => {
   if (!delivery.keyPairId || !delivery.privateKey) {
@@ -204,4 +242,6 @@ export const checkConfiguration = () => {
   return true;
 };
 
-export default { signUrl, signPlaybackCookies, decorate, decorateMany, cannedPolicy, customPolicy };
+export default {
+  signUrl, signPlaybackCookies, decorate, decorateMany, cannedPolicy, customPolicy, signDownload, signPreview,
+};

@@ -280,6 +280,20 @@ export const storeGeneratedAsset = async ({ purpose, kind, fileName, contentType
 export const getAssetsForOwner = ({ assetIds, userId }) =>
   Assets.findForOwner({ assetIds, userId });
 
+/**
+ * Several assets by id, without an ownership filter, for
+ * messaging/ChatAttachmentService.js. That caller does its own ownership check
+ * and reads the row name `owner_id`, so it is provided next to `ownerId`.
+ * Missing or deleted ids are simply absent; the caller compares lengths.
+ *
+ * @param {string[]} assetIds
+ */
+export const getAssetsByIds = async (assetIds = []) => {
+  if (!Array.isArray(assetIds) || assetIds.length === 0) return [];
+  const assets = await Assets.findMany([...new Set(assetIds)]);
+  return assets.map((asset) => ({ ...asset, owner_id: asset.ownerId }));
+};
+
 export const getAsset = async ({ assetId, viewerId }) => {
   const asset = await Assets.findById(assetId);
   if (!asset) throw Object.assign(new Error('asset not found'), { code: 'not_found' });
@@ -347,5 +361,5 @@ const retentionFor = (purpose) => {
 
 export default {
   createUpload, completeUpload, abortUpload, getUploadStatus, registerAsset,
-  storeGeneratedAsset, getAssetsForOwner, getAsset, listAssets, deleteAsset, storageUsage,
+  storeGeneratedAsset, getAssetsForOwner, getAssetsByIds, getAsset, listAssets, deleteAsset, storageUsage,
 };

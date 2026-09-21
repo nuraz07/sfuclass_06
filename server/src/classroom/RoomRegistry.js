@@ -171,4 +171,22 @@ export const poolStatus = async () => {
   };
 };
 
-export default { resolveNode, markNodeDraining, releaseRoom };
+/**
+ * Placement lookup in the v7 shape, for the ops routes in
+ * routes/route-resolve.routes.js: { roomId, nodeId, region }.
+ *
+ * The v6 registry keeps no region per room — one deployment is one region —
+ * so the region is this process's own. It returns null for a room that has no
+ * placement, which the route turns into a 404.
+ */
+export const roomRegistry = Object.freeze({
+  get: async (roomId) => {
+    const nodeId = await whereIs(roomId);
+    if (!nodeId) return null;
+    return { roomId, nodeId, region: env.MEDIA_REGION ?? env.AWS_REGION ?? null };
+  },
+  resolve: resolveNode,
+  release: releaseRoom,
+});
+
+export default { resolveNode, markNodeDraining, releaseRoom, roomRegistry };

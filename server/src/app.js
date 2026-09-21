@@ -46,6 +46,7 @@ import { errorHandler } from './middleware/errorHandler.js';
 
 import healthRoutes from './routes/health.routes.js';
 import authRoutes from './routes/auth.routes.js';
+import roomRoutes from './routes/rooms.routes.js';
 import billingRoutes from './routes/billing.routes.js';
 import classroomRoutes from './routes/classroom.routes.js';
 import routeResolveRoutes from './routes/route-resolve.routes.js';
@@ -133,7 +134,8 @@ export const createApp = () => {
   app.use('/auth', authRoutes);
   app.use('/profiles', profileRoutes);
   app.use('/billing', billingRoutes);
-  app.use('/rooms', routeResolveRoutes);
+  app.use('/rooms', roomRoutes);
+  app.use('/internal', routeResolveRoutes);
   app.use('/classroom', classroomRoutes);
   app.use('/courses', courseRoutes);
   app.use('/progress', progressRoutes);

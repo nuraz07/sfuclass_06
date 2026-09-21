@@ -71,6 +71,28 @@ export const indexMessage = async (message, { lessonId = null } = {}) => {
   }
 };
 
+/**
+ * Any other document in the shared cluster, e.g. lesson transcripts from
+ * media/TranscriptService.js. `index` is the family name; the tenant-wide
+ * prefix is added here, as for messages. Failures are logged and swallowed for
+ * the same reason as above: the index is a projection that can be rebuilt.
+ *
+ * @param {{ index: string, id: string, body: object }} document
+ */
+export const indexDocument = async ({ index, id, body }) => {
+  const os = await getClient();
+  if (!os) return false;
+  if (!index || !id) throw new TypeError('indexDocument needs an index and an id');
+
+  try {
+    await os.index({ index: `${env.OPENSEARCH_INDEX_PREFIX}-${index}`, id, body, refresh: false });
+    return true;
+  } catch (cause) {
+    log.error({ err: cause, index, id }, 'search index write failed');
+    return false;
+  }
+};
+
 export const removeFromIndex = async (messageId) => {
   const os = await getClient();
   if (!os) return false;
@@ -287,4 +309,4 @@ export const reindexAll = async ({ batchSize = 500 } = {}) => {
   return total;
 };
 
-export default { indexMessage, removeFromIndex, search, ensureIndex, reindexAll };
+export default { indexMessage, indexDocument, removeFromIndex, search, ensureIndex, reindexAll };

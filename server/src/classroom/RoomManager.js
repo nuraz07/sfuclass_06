@@ -96,6 +96,16 @@ export const getProducerCount = () => {
 
 export const listRooms = () => [...rooms.values()].map((room) => room.stats());
 
+/** Ids of the rooms on this node. Read by the drain to tell them to move. */
+export const listRoomIds = () => [...rooms.keys()];
+
+/** People connected to this node. The drain is finished when this reaches zero. */
+export const getPeerCount = () => {
+  let total = 0;
+  for (const room of rooms.values()) total += room.peerCount ?? 0;
+  return total;
+};
+
 /**
  * A mediasoup worker died and took its routers with it. The rooms are already
  * gone; this tells the people who were in them, rather than leaving their
@@ -124,4 +134,4 @@ export const closeAllRooms = async (reason = 'node-drained') => {
 // Health reads its load numbers from here.
 registerCounters({ rooms: getRoomCount, producers: getProducerCount });
 
-export default { createRoom, getRoom, closeRoom, getRoomCount };
+export default { createRoom, getRoom, closeRoom, getRoomCount, getPeerCount, listRoomIds };
