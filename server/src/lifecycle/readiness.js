@@ -83,7 +83,7 @@ const probes = {
   },
 
   async redis() {
-    const { redis } = await import('../db/redis.js');
+    const { stateRedis: redis } = await import('../db/redis.js');
     const reply = await redis.ping();
     if (reply !== 'PONG') throw new Error(`unexpected reply: ${reply}`);
   },

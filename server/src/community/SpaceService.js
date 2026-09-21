@@ -16,7 +16,7 @@ import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
 import * as Spaces from './models/Space.js';
 import * as Memberships from './models/Membership.js';
-import * as Presence from './PresenceService.js';
+import * as Presence from '../realtime/PresenceService.js';
 
 const log = logger.child({ component: 'spaces' });
 

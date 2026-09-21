@@ -15,7 +15,7 @@
  */
 
 import { env } from '../config/env.js';
-import { redis } from '../db/redis.js';
+import { stateRedis as redis } from '../db/redis.js';
 import { logger } from '../observability/logger.js';
 
 const log = logger.child({ component: 'room-registry' });

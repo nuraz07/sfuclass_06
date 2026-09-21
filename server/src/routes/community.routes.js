@@ -17,7 +17,7 @@ import { z } from 'zod';
 
 import * as SpaceService from '../community/SpaceService.js';
 import * as FeedService from '../community/FeedService.js';
-import * as PresenceService from '../community/PresenceService.js';
+import * as PresenceService from '../realtime/PresenceService.js';
 import * as ModerationService from '../community/ModerationService.js';
 import * as NotificationService from '../community/NotificationService.js';
 import { route, validate, requireAuth, tenantOf, paging, q, notFound, forbidden } from './_helpers.js';

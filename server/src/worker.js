@@ -31,8 +31,7 @@ const bootstrap = async () => {
   await hydrateSecrets();
 
   const { env } = await import('./config/env.js');
-  const { initTracing } = await import('./observability/tracing.js');
-  await initTracing({ serviceName: `${env.SERVICE_NAME}-worker`, release: env.RELEASE_SHA });
+  await import('./observability/tracing.js');
 
   const { logger } = await import('./observability/logger.js');
   const log = logger.child({ component: 'worker' });
@@ -40,9 +39,9 @@ const bootstrap = async () => {
   log.info({ release: env.RELEASE_SHA, concurrency: env.WORKER_CONCURRENCY }, 'starting worker');
 
   const { pool, verifyDatabaseConnection } = await import('./db/pool.js');
-  const { redis, verifyRedisConnection } = await import('./db/redis.js');
+  const { stateRedis: redis, pingAll, closeRedis } = await import('./db/redis.js');
   await verifyDatabaseConnection();
-  await verifyRedisConnection();
+  await pingAll();
 
   // -------------------------------------------------------------------------
   // Workers
@@ -116,7 +115,7 @@ const bootstrap = async () => {
             healthServer.close((error) => (error ? reject(error) : resolve())),
           ),
       },
-      { name: 'redis', run: () => redis.quit() },
+      { name: 'redis', run: () => closeRedis() },
       { name: 'postgres', run: () => pool.end() },
     ],
   });

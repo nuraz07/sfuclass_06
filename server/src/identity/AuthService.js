@@ -319,7 +319,7 @@ export const listDevices = (userId) => Sessions.listSessions(userId);
 /** Single-use, hashed at rest, short-lived. */
 const issueToken = async ({ userId, purpose, ttlSec }) => {
   const token = randomBytes(32).toString('base64url');
-  const { redis } = await import('../db/redis.js');
+  const { stateRedis: redis } = await import('../db/redis.js');
 
   await redis.set(
     `${env.REDIS_PREFIX}:token:${purpose}:${createHash('sha256').update(token).digest('base64url')}`,
@@ -332,7 +332,7 @@ const issueToken = async ({ userId, purpose, ttlSec }) => {
 };
 
 const consumeToken = async ({ token, purpose }) => {
-  const { redis } = await import('../db/redis.js');
+  const { stateRedis: redis } = await import('../db/redis.js');
   const key = `${env.REDIS_PREFIX}:token:${purpose}:${createHash('sha256').update(token).digest('base64url')}`;
 
   // GETDEL: read and consume atomically, so a token cannot be used twice by two

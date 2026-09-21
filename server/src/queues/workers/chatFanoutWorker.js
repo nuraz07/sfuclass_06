@@ -26,7 +26,7 @@ import * as UnreadService from '../../messaging/UnreadService.js';
 import * as ConversationService from '../../messaging/ConversationService.js';
 import * as DirectMessageService from '../../messaging/DirectMessageService.js';
 import * as ChatSearchService from '../../messaging/ChatSearchService.js';
-import * as PresenceService from '../../community/PresenceService.js';
+import * as PresenceService from '../../realtime/PresenceService.js';
 import { metrics } from '../../observability/metrics.js';
 
 const redis = utilityConnection('chat-fanout');

@@ -27,7 +27,7 @@ import { utilityConnection } from '../connection.js';
 import { env } from '../../config/env.js';
 import * as NotificationService from '../../community/NotificationService.js';
 import * as DeviceRegistry from '../../identity/DeviceRegistry.js';
-import * as PresenceService from '../../community/PresenceService.js';
+import * as PresenceService from '../../realtime/PresenceService.js';
 import * as ScheduleService from '../../scheduling/ScheduleService.js';
 import * as ReminderRules from '../../scheduling/ReminderRules.js';
 import { metrics } from '../../observability/metrics.js';

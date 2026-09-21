@@ -21,6 +21,10 @@
 //
 // Visibility (who may see whom) is decided by the gateways (profile privacy, blocking), not here.
 //
+// v6 compatibility: the function API (get, getMany, spaceCounts, listForSpace, heartbeat, clear, …) that
+// community/, routes/ and the queue workers still call lives in ./presenceCompat.js and is re-exported at the
+// bottom of this file. Remove that line together with presenceCompat.js once the callers use this class.
+//
 // Owner: F6 Messaging and Chat (+ F1, F2 as consumers).
 
 const STATUSES = Object.freeze(['in-class', 'online', 'away']);
@@ -234,3 +238,6 @@ function aggregate(hash, now, staleMs) {
  * @typedef {{ userId: string, applied: boolean, changed: boolean,
  *             before: { status: string, roomId: string | null }, after: { status: string, roomId: string | null } }} Transition
  */
+
+// v6 function API for community/, routes/ and the queue workers (see header).
+export * from './presenceCompat.js';

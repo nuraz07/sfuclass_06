@@ -25,7 +25,7 @@
 import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
 import { notificationTypes, isWithinQuietHours } from '../config/push.config.js';
-import * as Presence from './PresenceService.js';
+import * as Presence from '../realtime/PresenceService.js';
 
 const log = logger.child({ component: 'notifications' });
 

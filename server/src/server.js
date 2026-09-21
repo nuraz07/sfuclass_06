@@ -53,10 +53,10 @@ const bootstrap = async () => {
   // 4. Dependencies. A failure here should stop the boot, not surface later as
   //    a confusing 500 on somebody's first request.
   const { pool, verifyDatabaseConnection } = await import('./db/pool.js');
-  const { redis, verifyRedisConnection } = await import('./db/redis.js');
+  const { stateRedis: redis, pingAll, closeRedis } = await import('./db/redis.js');
 
   await verifyDatabaseConnection();
-  await verifyRedisConnection();
+  await pingAll();
   log.info('database and redis reachable');
 
   // Refuse to start on an out-of-date schema. Migrations run as their own task
@@ -134,7 +134,7 @@ const bootstrap = async () => {
           await io.close();
         },
       },
-      { name: 'redis', run: () => redis.quit() },
+      { name: 'redis', run: () => closeRedis() },
       { name: 'postgres', run: () => pool.end() },
     ],
   });

@@ -22,7 +22,7 @@
 import { ApiError } from '@classroom/contracts';
 import { env } from '../config/env.js';
 import { rateLimitConfig } from '../config/rateLimit.config.js';
-import { redis } from '../db/redis.js';
+import { stateRedis as redis } from '../db/redis.js';
 
 /**
  * KEYS[1] bucket key

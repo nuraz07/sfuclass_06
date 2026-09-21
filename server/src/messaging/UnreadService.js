@@ -16,7 +16,7 @@
  */
 
 import { env } from '../config/env.js';
-import { redis } from '../db/redis.js';
+import { cacheRedis as redis } from '../db/redis.js';
 import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
 

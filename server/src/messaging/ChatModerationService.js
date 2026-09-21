@@ -20,7 +20,7 @@ import { randomUUID } from 'node:crypto';
 import { ApiError } from '@classroom/contracts';
 import { env } from '../config/env.js';
 import { pool } from '../db/pool.js';
-import { redis } from '../db/redis.js';
+import { stateRedis as redis } from '../db/redis.js';
 import { logger } from '../observability/logger.js';
 import * as Message from './models/Message.js';
 

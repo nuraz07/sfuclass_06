@@ -22,7 +22,7 @@
 
 import { ChatEvents } from '@classroom/contracts';
 import { env } from '../config/env.js';
-import { redis } from '../db/redis.js';
+import { cacheRedis as redis } from '../db/redis.js';
 
 const { TYPING_TTL_MS } = ChatEvents;
 
