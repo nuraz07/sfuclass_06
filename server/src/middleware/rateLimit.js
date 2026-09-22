@@ -171,13 +171,26 @@ export const rateLimit = () => (req, res, next) => {
 };
 
 /**
+ * Socket limits for a process that serves sockets without being the realtime
+ * role. config/rateLimit.config.js builds `socket` only for SERVICE_ROLE
+ * realtime; in development the api process hosts the socket gateways as well,
+ * and without this every socket event failed on `null.perEvent`.
+ * Same numbers as the realtime role: SOCKET_MAX_EVENTS_PER_MIN, else 240.
+ */
+const FALLBACK_SOCKET_LIMITS = Object.freeze({
+  maxEventsPerMinute: Number(process.env.SOCKET_MAX_EVENTS_PER_MIN) || 240,
+  perEvent: Object.freeze({}),
+});
+
+/**
  * The socket equivalent, used by realtime/socketRateLimit.js. Same bucket
  * mechanics, keyed per connection and per event, so one noisy tab cannot spend
  * the budget for the whole user.
  */
 export const consumeSocketBudget = async ({ socketId, userId, event }) => {
-  const perEvent = rateLimitConfig.socket.perEvent[event];
-  const capacity = perEvent ?? rateLimitConfig.socket.maxEventsPerMinute;
+  const socketLimits = rateLimitConfig.socket ?? FALLBACK_SOCKET_LIMITS;
+  const perEvent = socketLimits.perEvent?.[event];
+  const capacity = perEvent ?? socketLimits.maxEventsPerMinute;
   const key = rateLimitConfig.redisKey(
     'ws',
     `${userId ?? 'anon'}:${socketId}:${perEvent ? event : 'all'}`,

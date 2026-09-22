@@ -67,8 +67,8 @@ export const attachSocketGateways = async (httpServer, { redis }) => {
       origin: env.ALLOWED_ORIGINS,
       credentials: true,
     },
-    pingInterval: env.SOCKET_PING_INTERVAL_MS,
-    pingTimeout: env.SOCKET_PING_TIMEOUT_MS,
+    pingInterval: Number(env.SOCKET_PING_INTERVAL_MS ?? process.env.SOCKET_PING_INTERVAL_MS) || 25_000,
+    pingTimeout: Number(env.SOCKET_PING_TIMEOUT_MS ?? process.env.SOCKET_PING_TIMEOUT_MS) || 20_000,
     // Above any single message the product sends; an upload never travels here.
     maxHttpBufferSize: 1e6,
   });

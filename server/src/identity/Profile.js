@@ -79,7 +79,7 @@ const rowToOwn = (row) => ({
 });
 
 const SELECT = `
-  SELECT p.*, u.email, u.email_verified, u.display_name, u.avatar_url,
+  SELECT p.*, u.email, (u.email_verified_at IS NOT NULL) AS email_verified, u.display_name, NULL::text AS avatar_url,
          u.role, u.locale, u.time_zone, u.created_at
     FROM profiles p JOIN users u ON u.id = p.user_id
 `;

@@ -220,6 +220,16 @@ const variables = Object.freeze({
   SFU_MAX_LOAD_SCORE: define(SFU, int(100, { min: 1 })),
   SFU_DRAIN_TIMEOUT_SEC: define(SFU, int(1_800, { min: 0 })),
 
+  // v6 names still read by the SFU path in this codebase (config/announcedIp.js,
+  // config/mediasoup.config.js, classroom/RoomRegistry.js, mediasoup/index.js,
+  // mediasoup/health.js). They belong to the v6 per-transport port model and are
+  // removed together with it when the SFU moves to WebRtcServer (section 4.3).
+  ANNOUNCED_IP: define(SFU, z.ipv4().default('127.0.0.1')),
+  MEDIASOUP_MIN_PORT: define(SFU, int(40_000, { min: 1024, max: 65535 })),
+  MEDIASOUP_MAX_PORT: define(SFU, int(40_100, { min: 1024, max: 65535 })),
+  SFU_MAX_ROOMS_PER_NODE: define(SFU, int(40, { min: 1 })),
+  SFU_HTTP_PORT: define(SFU, int(4_200, { min: 1, max: 65535 })),
+
   // --- sfu control plane: mTLS (secret) -----------------------------------
   SFU_CONTROL_TLS_CERT: define(CONTROL, pem, { secret: true, requiredInProduction: true }),
   SFU_CONTROL_TLS_KEY: define(CONTROL, pem, { secret: true, requiredInProduction: true }),
@@ -474,6 +484,35 @@ export const envSchemas = Object.freeze(
 );
 
 /**
+ * Development runs one process for three roles: server.js starts the
+ * mediasoup workers and the socket gateways inside the api process. That
+ * process therefore receives the realtime and SFU variables too; with only
+ * the api schema they were dropped, and every setting of the other two roles
+ * read as undefined (socket heartbeat, socket budget, node id, announced IP,
+ * port range, room cap).
+ *
+ * Variables of the api role keep their exact schema. Those of the other two
+ * are optional here, so a secret that only a separate SFU or realtime task
+ * needs cannot stop a development boot; a value that is present is still
+ * validated, and defaults still apply. Production is untouched: one role
+ * per process, foreign variables rejected.
+ */
+const DEV_COMBINED_ROLES = Object.freeze(['api', 'realtime', 'sfu']);
+
+const devCombinedSchema = (() => {
+  const shape = {};
+  for (const [name, definition] of Object.entries(variables)) {
+    if (definition.roles.includes('api')) {
+      shape[name] = schemaOf(definition, 'api');
+      continue;
+    }
+    const owner = DEV_COMBINED_ROLES.find((role) => definition.roles.includes(role));
+    if (owner) shape[name] = schemaOf(definition, owner).optional();
+  }
+  return z.object(shape).superRefine((env, ctx) => checkRules(env, ctx, 'api'));
+})();
+
+/**
  * The union of every role's variables. For drift detection and tooling only —
  * never used to parse a running process.
  */
@@ -529,7 +568,8 @@ export const parseEnv = (source = process.env, role) => {
   }
 
   const input = { ...withoutEmptyValues(source), SERVICE_ROLE: resolvedRole };
-  const result = envSchemas[resolvedRole].safeParse(input);
+  const combined = resolvedRole === 'api' && input.NODE_ENV !== 'production';
+  const result = (combined ? devCombinedSchema : envSchemas[resolvedRole]).safeParse(input);
 
   // A shared development .env feeds every role; only production is strict.
   if (input.NODE_ENV !== 'production') return result;

@@ -41,7 +41,7 @@ const spaceKey = (spaceId) => `${env.REDIS_PREFIX}:${TAG}:space:${spaceId}`;
 const channel = `${env.REDIS_PREFIX}:presence:events`;
 
 /** A missed heartbeat should not flicker someone offline; two should. */
-const TTL_SEC = env.PRESENCE_TTL_SEC;
+const TTL_SEC = Number(env.PRESENCE_TTL_SEC ?? process.env.PRESENCE_TTL_SEC) || 60;
 /** A roster outlives its members' entries so a quiet minute does not drop it. */
 const SPACE_TTL_SEC = TTL_SEC * 2;
 

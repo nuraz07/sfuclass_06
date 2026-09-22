@@ -62,7 +62,7 @@ const displayName = values.name ?? 'Demo Teacher';
 const role = values.role;
 
 const { pool } = await import('../../server/src/db/pool.js');
-const { redis } = await import('../../server/src/db/redis.js');
+const { stateRedis: redis, closeRedis } = await import('../../server/src/db/redis.js');
 const AuthService = await import('../../server/src/identity/AuthService.js');
 
 /**
@@ -164,5 +164,5 @@ try {
   // The pools keep the event loop alive; without this the script hangs after
   // printing its result, which looks like a failure and is not.
   await pool.end().catch(() => {});
-  redis.disconnect?.();
+  closeRedis?.().catch(() => {});
 }
