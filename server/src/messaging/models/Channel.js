@@ -51,7 +51,9 @@ export const findById = async (channelId) => {
 /** The tenant lobby. Every member can post here; it is the default channel. */
 export const findPublicLobby = async (tenantId) => {
   const { rows } = await pool.query(
-    `SELECT ${SELECT} FROM channels ch WHERE ch.tenant_id = $1 AND ch.scope = 'public' LIMIT 1`,
+    `SELECT ${SELECT} FROM channels ch
+      WHERE ch.tenant_id = $1 AND ch.scope = 'public' AND ch.archived_at IS NULL
+      ORDER BY ch.created_at LIMIT 1`,
     [tenantId],
   );
   return rows[0] ?? null;
@@ -66,16 +68,29 @@ export const findByScope = async ({ scope, scopeRefId }) => {
 };
 
 /**
+ * The ON CONFLICT target for each scope. PostgreSQL only uses a partial unique
+ * index for ON CONFLICT when the statement repeats the index's predicate, so
+ * each target names its index's WHERE clause:
+ *
+ *   public          one active lobby per tenant   channels_public_lobby_key (019)
+ *   space, course   one channel per target        channels_scope_ref_key (015)
+ */
+const conflictTargetFor = (scope) =>
+  scope === 'public'
+    ? `ON CONFLICT (tenant_id) WHERE scope = 'public' AND archived_at IS NULL`
+    : `ON CONFLICT (scope, scope_ref_id) WHERE scope_ref_id IS NOT NULL`;
+
+/**
  * Idempotent by design: SpaceService and CourseService both call this on
  * publish, and a republish must not create a second channel.
  */
 export const ensureForScope = async ({ channelId, tenantId, scope, scopeRefId, name }) => {
   const { rows } = await pool.query(
     `INSERT INTO channels (channel_id, tenant_id, scope, scope_ref_id, name, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, now(), now())
-     ON CONFLICT (scope, scope_ref_id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
+     VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, now(), now())
+     ${conflictTargetFor(scope)} DO UPDATE SET name = EXCLUDED.name, updated_at = now()
      RETURNING channel_id`,
-    [channelId, tenantId, scope, scopeRefId, name],
+    [channelId ?? null, tenantId, scope, scope === 'public' ? null : scopeRefId, name],
   );
   return findById(rows[0].channel_id);
 };
