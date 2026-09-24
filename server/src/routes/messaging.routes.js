@@ -1,24 +1,25 @@
 /**
- * messaging.routes — conversations · messages · search (F6)
+ * messaging.routes — conversations · channels · messages (F6)
  *
- * The route that carries the product decision: `POST /conversations/direct` is a single
- * idempotent open-or-create. Clicking a person anywhere in the app — participant list,
- * community thread, public channel, course roster — hits this one endpoint, and it returns
- * the existing conversation or makes one. There is no separate "new message" flow to keep
- * in sync, and no way for two clicks to produce two threads.
+ * Mounted under /messaging (app.js), so every path here is relative to it.
  *
- * History is keyset-paginated by (conversation_id, created_at, id). Not a nicety: a channel
- * that reaches six figures still has to open in one frame.
+ * `POST /conversations/direct` is a single idempotent open-or-create: the same
+ * pair of people always resolves to the same conversation. The person who
+ * opens it sees it at once; the other person sees it when the first message
+ * arrives. `roomId` in the body tells the permission check that both are in
+ * the same live lesson, which counts as shared context.
  *
- * Sending is at-least-once from the client's side. `clientId` is the dedupe key, so an
- * outbox that retries after a reconnect produces one message, and the ack carries the
- * clientId back so the optimistic bubble can be reconciled.
+ * Per-person state has its own verbs: PATCH mutes (with an optional end time),
+ * DELETE removes the conversation for the caller only. Nobody can delete a
+ * conversation for someone else.
  *
- * Blocking and DM policy are enforced here, on send — never hidden in the UI.
+ * History is keyset-paginated. Sending is at-least-once from the client's
+ * side; `clientId` is the dedupe key.
  */
 
 import { Router } from 'express';
 import { z } from 'zod';
+import { ApiError } from '@classroom/contracts';
 
 import * as ConversationService from '../messaging/ConversationService.js';
 import * as DirectMessageService from '../messaging/DirectMessageService.js';
@@ -40,7 +41,38 @@ const pageQuery = z.object({
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
   direction: z.enum(['forward', 'backward']).optional(),
+  order: z.enum(['asc', 'desc']).optional(),
 });
+const isoDateTime = z.iso.datetime({ offset: true });
+
+/**
+ * Domain refusals carry their own codes (dm_not_allowed, blocked_by_user, …).
+ * They leave this API as the plain HTTP answers every client understands.
+ */
+const asHttpError = (error) => {
+  if (!ApiError.is(error)) return error;
+  const detail = error.detail ?? error.message;
+  switch (error.code) {
+    case 'dm_not_allowed':
+    case 'blocked_by_user':
+    case 'forbidden':
+      return forbidden(detail);
+    case 'not_found':
+      return notFound(detail);
+    case 'validation_failed':
+      return badRequest(detail);
+    default:
+      return error;
+  }
+};
+
+const mapped = (fn) => async (req, res) => {
+  try {
+    return await fn(req, res);
+  } catch (error) {
+    throw asHttpError(error);
+  }
+};
 
 /* ------------------------------------------------------------------ *
  * Conversations
@@ -48,34 +80,41 @@ const pageQuery = z.object({
 
 router.get(
   '/conversations',
-  validate({ query: pageQuery.extend({ kind: z.enum(['direct', 'group', 'channel']).optional() }) }),
-  route(async (req) =>
-    ConversationService.listForUser({ userId: req.user.id, tenantId: tenantOf(req), kind: q(req).kind, ...paging(req) }),
+  validate({ query: pageQuery }),
+  route(
+    mapped(async (req) =>
+      ConversationService.list({
+        userId: req.user.id,
+        cursor: q(req).cursor ?? null,
+        limit: q(req).limit ?? 25,
+      }),
+    ),
   ),
 );
 
 /**
- * Open or create. Idempotent by construction: a 1:1 conversation is identified by its
- * participant set, so the same pair always resolves to the same row.
+ * Open or create. 201 when it was created, 200 when it already existed.
+ * Refused with 403 when the target's DM setting or a block forbids it.
  */
 router.post(
   '/conversations/direct',
   rateLimit({ key: 'chat:open-dm', points: 60, durationSec: 300, by: ['user'] }),
-  validate({ body: z.object({ userId: z.string().uuid() }) }),
-  route(async (req, res) => {
-    if (req.body.userId === req.user.id) throw badRequest('You cannot message yourself');
+  validate({ body: z.object({ userId: z.string().uuid(), roomId: z.string().uuid().nullish() }) }),
+  route(
+    mapped(async (req, res) => {
+      if (req.body.userId === req.user.id) throw badRequest('You cannot message yourself');
 
-    const result = await ConversationService.openOrCreateDirect(req.user.id, req.body.userId, {
-      tenantId: tenantOf(req),
-    });
-    if (!result.allowed) {
-      // Blocked, or the recipient's DM policy is narrower than this relationship.
-      throw forbidden(result.reason ?? 'You cannot message this person');
-    }
+      const conversation = await ConversationService.openDirect({
+        fromUserId: req.user.id,
+        toUserId: req.body.userId,
+        tenantId: tenantOf(req),
+        roomId: req.body.roomId ?? null,
+      });
 
-    res.status(result.created ? 201 : 200);
-    return result.conversation;
-  }),
+      res.status(conversation.created ? 201 : 200);
+      return conversation;
+    }),
+  ),
 );
 
 /** A small group chat is the same object with more participants. */
@@ -83,47 +122,80 @@ router.post(
   '/conversations/group',
   validate({
     body: z.object({
-      userIds: z.array(z.string().uuid()).min(2).max(50),
+      participantIds: z.array(z.string().uuid()).min(2).max(49).optional(),
+      userIds: z.array(z.string().uuid()).min(2).max(49).optional(),
       title: z.string().max(120).optional(),
     }),
   }),
-  route(async (req, res) => {
-    res.status(201);
-    return ConversationService.createGroup({
-      tenantId: tenantOf(req),
-      createdBy: req.user.id,
-      userIds: req.body.userIds,
-      title: req.body.title ?? null,
-    });
-  }),
+  route(
+    mapped(async (req, res) => {
+      const participantIds = req.body.participantIds ?? req.body.userIds;
+      if (!participantIds) throw badRequest('participantIds is required');
+      res.status(201);
+      return ConversationService.createGroup({
+        tenantId: tenantOf(req),
+        createdBy: req.user.id,
+        participantIds,
+        title: req.body.title ?? null,
+      });
+    }),
+  ),
 );
 
 router.get(
   '/conversations/:id',
   validate({ params: idParam }),
-  route(async (req) => {
-    const conversation = await ConversationService.getForUser(req.params.id, req.user.id);
-    if (!conversation) throw notFound('No such conversation');
-    return conversation;
-  }),
+  route(mapped(async (req) => ConversationService.getById({ conversationId: req.params.id, viewerId: req.user.id }))),
 );
 
+/**
+ * The caller's own settings for a conversation.
+ *   { muted: true }                         muted until turned back on
+ *   { muted: true, mutedUntil: <ISO time> } muted until then
+ *   { muted: false }                        unmuted
+ * `until` is accepted as a synonym (Chat.MuteTargetSchema).
+ */
 router.patch(
   '/conversations/:id',
   validate({
     params: idParam,
-    body: z.object({ title: z.string().max(120).optional(), muted: z.boolean().optional() }),
+    body: z.object({
+      muted: z.boolean().optional(),
+      mutedUntil: isoDateTime.nullish(),
+      until: isoDateTime.nullish(),
+    }),
   }),
-  route(async (req) => ConversationService.updateParticipantState(req.params.id, req.user.id, req.body)),
+  route(
+    mapped(async (req) => {
+      const until = req.body.mutedUntil ?? req.body.until ?? null;
+      const muted = req.body.muted ?? Boolean(until);
+      return ConversationService.setMuted({
+        conversationId: req.params.id,
+        userId: req.user.id,
+        muted,
+        until,
+      });
+    }),
+  ),
 );
 
+/** Delete for me. The other participants keep the conversation and its history. */
+router.delete(
+  '/conversations/:id',
+  validate({ params: idParam }),
+  route(mapped(async (req) => ConversationService.deleteForMe({ conversationId: req.params.id, userId: req.user.id }))),
+);
+
+/** Leave a group; for a direct chat this is the same as delete for me. */
 router.delete(
   '/conversations/:id/participants/me',
   validate({ params: idParam }),
-  route(async (req) => {
-    await ConversationService.leave(req.params.id, req.user.id);
-    return null;
-  }),
+  route(
+    mapped(async (req) => {
+      await ConversationService.leave({ conversationId: req.params.id, userId: req.user.id });
+      return null;
+    }),
+  ),
 );
 
 /* ------------------------------------------------------------------ *
@@ -139,17 +211,13 @@ router.get(
 );
 
 /**
- * Full history is readable by any member, including the part that happened before they
- * arrived — a new joiner should see the room they walked into.
+ * Full history is readable by any member, including the part that happened
+ * before they arrived — a new joiner should see the room they walked into.
  */
 router.get(
   '/channels/:id/messages',
   validate({ params: idParam, query: pageQuery }),
   route(async (req) =>
-    // PublicChatService has roomHistory for a lesson and nothing for a channel.
-    // DirectMessageService.history takes a target and already reads both, so
-    // the channel case goes through it rather than growing a second reader
-    // that would drift from the first.
     DirectMessageService.history({
       target: { kind: 'channel', channelId: req.params.id },
       viewerId: req.user.id,
@@ -170,29 +238,25 @@ router.post(
       clientId: z.string().max(128),
     }),
   }),
-  route(async (req, res) => {
-    if (!req.body.body.trim() && req.body.attachmentIds.length === 0) {
-      throw badRequest('A message needs text or an attachment');
-    }
-    // The same service the socket path uses. A channel message and a direct
-    // message differ in their target and nothing else; two send
-    // implementations would mean two places for dedupe and block checks to
-    // disagree with each other.
-    const message = await DirectMessageService.send({
-      target: { kind: 'channel', channelId: req.params.id },
-      authorId: req.user.id,
-      tenantId: tenantOf(req),
-      body: req.body.body,
-      attachmentIds: req.body.attachmentIds,
-      replyToId: req.body.replyToId ?? null,
-      // The idempotency key. An outbox retrying after a reconnect must produce
-      // one message, not two.
-      clientMessageId: req.body.clientId,
-    });
+  route(
+    mapped(async (req, res) => {
+      if (!req.body.body.trim() && req.body.attachmentIds.length === 0) {
+        throw badRequest('A message needs text or an attachment');
+      }
+      const message = await DirectMessageService.send({
+        target: { kind: 'channel', channelId: req.params.id },
+        authorId: req.user.id,
+        tenantId: tenantOf(req),
+        body: req.body.body,
+        attachmentIds: req.body.attachmentIds,
+        replyToId: req.body.replyToId ?? null,
+        clientMessageId: req.body.clientId,
+      });
 
-    res.status(201);
-    return { message, clientId: req.body.clientId, deduped: false };
-  }),
+      res.status(201);
+      return { message, clientId: req.body.clientId, deduped: false };
+    }),
+  ),
 );
 
 router.put(
@@ -218,32 +282,36 @@ router.put(
 router.get(
   '/conversations/:id/messages',
   validate({ params: idParam, query: pageQuery.extend({ around: z.string().uuid().optional() }) }),
-  route(async (req) =>
-    DirectMessageService.history({
-      // Addressed by target, like every other read. `conversationId` alone
-      // would make this the one caller the service has to special-case.
-      target: { kind: 'conversation', conversationId: req.params.id },
-      viewerId: req.user.id,
-      around: q(req).around ?? null, // jump-to-message from search, then page both ways
-      ...paging(req, { defaultLimit: 50 }),
-    }),
+  route(
+    mapped(async (req) =>
+      DirectMessageService.history({
+        target: { kind: 'conversation', conversationId: req.params.id },
+        viewerId: req.user.id,
+        around: q(req).around ?? null,
+        ...paging(req, { defaultLimit: 50 }),
+      }),
+    ),
   ),
 );
 
+/** Read up to a message; clears this conversation's unread badge for the caller. */
 router.put(
   '/conversations/:id/read',
   validate({ params: idParam, body: z.object({ messageId: z.string().uuid() }) }),
-  route(async (req) => {
-    const target = { kind: 'conversation', conversationId: req.params.id };
-    await DirectMessageService.authoriseRead({ target, userId: req.user.id });
-    await Participant.markRead({
-      conversationId: req.params.id,
-      userId: req.user.id,
-      readAt: new Date().toISOString(),
-      messageId: req.body.messageId,
-    });
-    return null;
-  }),
+  route(
+    mapped(async (req) => {
+      const target = { kind: 'conversation', conversationId: req.params.id };
+      await DirectMessageService.authoriseRead({ target, userId: req.user.id });
+      await Participant.markRead({
+        conversationId: req.params.id,
+        userId: req.user.id,
+        readAt: new Date().toISOString(),
+        messageId: req.body.messageId,
+      });
+      await UnreadService.clear({ userId: req.user.id, target }).catch(() => undefined);
+      return null;
+    }),
+  ),
 );
 
 router.post(
@@ -258,68 +326,57 @@ router.post(
       clientId: z.string().max(128),
     }),
   }),
-  route(async (req, res) => {
-    if (!req.body.body.trim() && req.body.attachmentIds.length === 0) {
-      throw badRequest('A message needs text or an attachment');
-    }
+  route(
+    mapped(async (req, res) => {
+      if (!req.body.body.trim() && req.body.attachmentIds.length === 0) {
+        throw badRequest('A message needs text or an attachment');
+      }
 
-    const message = await DirectMessageService.send({
-      target: { kind: 'conversation', conversationId: req.params.id },
-      authorId: req.user.id,
-      tenantId: tenantOf(req),
-      body: req.body.body,
-      attachmentIds: req.body.attachmentIds,
-      replyToId: req.body.replyToId ?? null,
-      // Same clientMessageId twice is one message; the outbox may retry after
-      // a reconnect and must not double-post.
-      clientMessageId: req.body.clientId,
-    });
+      const message = await DirectMessageService.send({
+        target: { kind: 'conversation', conversationId: req.params.id },
+        authorId: req.user.id,
+        tenantId: tenantOf(req),
+        body: req.body.body,
+        attachmentIds: req.body.attachmentIds,
+        replyToId: req.body.replyToId ?? null,
+        clientMessageId: req.body.clientId,
+      });
 
-    res.status(201);
-    return { message, clientId: req.body.clientId, deduped: false };
-  }),
+      res.status(201);
+      return { message, clientId: req.body.clientId, deduped: false };
+    }),
+  ),
 );
 
 router.patch(
   '/messages/:id',
   validate({ params: idParam, body: z.object({ body: z.string().min(1).max(env.CHAT_MAX_MESSAGE_LEN) }) }),
-  route(async (req) => DirectMessageService.edit({ messageId: req.params.id, userId: req.user.id, body: req.body.body })),
+  route(mapped(async (req) => DirectMessageService.edit({ messageId: req.params.id, userId: req.user.id, body: req.body.body }))),
 );
 
 router.delete(
   '/messages/:id',
   validate({ params: idParam }),
-  route(async (req) => {
-    // Soft delete with an audit record: moderation needs to know what was removed.
-    await DirectMessageService.remove({
-      messageId: req.params.id,
-      userId: req.user.id,
-      asModerator: ['owner', 'teacher'].includes(req.user.role),
-    });
-        return null;
-  }),
-);
-
-/* ------------------------------------------------------------------ *
- * Read state and unread counters
- * ------------------------------------------------------------------ */
-
-router.post(
-  '/conversations/:id/read',
-  validate({ params: idParam, body: z.object({ upToMessageId: z.string().uuid() }) }),
-  route(async (req) =>
-    UnreadService.markRead({
-      conversationId: req.params.id,
-      userId: req.user.id,
-      upToMessageId: req.body.upToMessageId,
+  route(
+    mapped(async (req) => {
+      await DirectMessageService.remove({
+        messageId: req.params.id,
+        userId: req.user.id,
+        asModerator: ['owner', 'teacher'].includes(req.user.role),
+      });
+      return null;
     }),
   ),
 );
 
-/** One call for the whole badge state — the dock renders every row from this. */
+/* ------------------------------------------------------------------ *
+ * Unread counters
+ * ------------------------------------------------------------------ */
+
+/** One call for the whole badge state. */
 router.get(
   '/unread',
-  route(async (req) => UnreadService.snapshot({ userId: req.user.id, tenantId: tenantOf(req) })),
+  route(async (req) => UnreadService.summary({ userId: req.user.id })),
 );
 
 /* ------------------------------------------------------------------ *
@@ -327,8 +384,9 @@ router.get(
  * ------------------------------------------------------------------ */
 
 /**
- * Chat attachments have no storage path of their own — this delegates to the media domain,
- * so quota, virus scanning, signed delivery and lifecycle rules apply for free.
+ * Chat attachments have no storage path of their own — this delegates to the
+ * media domain, so quota, virus scanning, signed delivery and lifecycle rules
+ * apply for free.
  */
 router.post(
   '/attachments',
@@ -368,7 +426,6 @@ router.get(
     }),
   }),
   route(async (req) =>
-    // Scoped to what this user may read; the index is filtered, not the results.
     ChatSearchService.search({
       userId: req.user.id,
       tenantId: tenantOf(req),
@@ -396,7 +453,12 @@ router.post(
   }),
   route(async (req, res) => {
     res.status(202);
-    return ChatModerationService.report({ reporterId: req.user.id, tenantId: tenantOf(req), ...req.body });
+    return ChatModerationService.report({
+      messageId: req.body.messageId,
+      reporterId: req.user.id,
+      reason: req.body.reason,
+      detail: req.body.note ?? null,
+    });
   }),
 );
 
@@ -405,7 +467,7 @@ router.post(
   validate({ params: idParam, body: z.object({ seconds: z.number().int().min(0).max(3600) }) }),
   route(async (req) => {
     if (!['owner', 'teacher'].includes(req.user.role)) throw forbidden('Moderators only');
-    return ChatModerationService.setSlowMode({
+    return PublicChatService.setSlowMode({
       channelId: req.params.id,
       seconds: req.body.seconds,
       actorId: req.user.id,
@@ -421,7 +483,12 @@ router.post(
   }),
   route(async (req) => {
     if (!['owner', 'teacher'].includes(req.user.role)) throw forbidden('Moderators only');
-    return ChatModerationService.mute({ channelId: req.params.id, actorId: req.user.id, ...req.body });
+    return ChatModerationService.mute({
+      channelId: req.params.id,
+      userId: req.body.userId,
+      until: new Date(Date.now() + req.body.minutes * 60_000).toISOString(),
+      actorId: req.user.id,
+    });
   }),
 );
 

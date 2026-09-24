@@ -88,11 +88,6 @@ export const attachChatGateway = (io) => {
     const { userId } = socket.data;
     log.debug({ userId, socketId: socket.id }, 'chat socket connected');
 
-    // Personal room: conversation list updates, new conversations and
-    // unread counts are addressed to the person, not to a thread they may
-    // not have opened yet. Every device of the user is in it.
-    void socket.join(`u:${userId}`);
-
     /** Wraps a handler with the per-connection event budget and error shaping. */
     const handle = (event, handler) => {
       socket.on(event, async (payload, ack) => {
@@ -325,16 +320,6 @@ export const notifyConversationCreated = ({ conversation, userIds }) => {
   for (const userId of userIds) {
     namespace.to(`u:${userId}`).emit(SERVER.conversationCreated, { conversation });
   }
-  return true;
-};
-
-/**
- * One conversation, as this person sees it (their unread count, their mute),
- * to every device of theirs. Drives the conversation list and its badges.
- */
-export const notifyConversationUpdated = ({ userId, conversation }) => {
-  if (!namespace) return false;
-  namespace.to(`u:${userId}`).emit(SERVER.conversationUpdated, { conversation });
   return true;
 };
 

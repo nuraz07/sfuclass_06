@@ -1,15 +1,18 @@
 /**
- * profile.routes — public profile · block · report (F6)
+ * profile.routes — own profile · privacy · other people · blocking (F6)
  *
- * The profile is the anchor for direct messages, so what this file returns decides what a
- * "Message" button may do. Three things follow from that:
+ * Mounted under /profiles (app.js), so every path here is relative to it:
+ * '/me' is GET /profiles/me. (The previous version repeated the prefix, which
+ * made every route answer at /profiles/profiles/… and the client's calls 404.)
  *
- *  - A profile read is filtered by the viewer. Visibility and DM policy are applied before
- *    serialisation; the client is never handed a field it then has to hide. `canMessage`
- *    comes back computed, so the button's presence and the send permission agree.
- *  - A block is symmetric and enforced server-side on send. This route only records it.
- *  - Profiles are enumerable by id, so lookups are rate-limited — a chat product is a
- *    user-directory scraper if you let it be.
+ * A profile read is filtered by the viewer, and `canMessage` comes back
+ * computed by ConversationService.canMessage — the same rule the send path
+ * enforces — so the Message button and the send always agree. `roomId` in the
+ * query lets that rule count a shared live lesson as shared context.
+ *
+ * Both the contract's paths (profileApi: PATCH /me/privacy, POST /me/blocks,
+ * DELETE /me/blocks/:userId) and the older ones (PUT /me/privacy,
+ * PUT|DELETE /:userId/block) are served, so no client breaks while it moves.
  */
 
 import { Router } from 'express';
@@ -20,7 +23,7 @@ import * as ConversationService from '../messaging/ConversationService.js';
 import * as ChatModerationService from '../messaging/ChatModerationService.js';
 import * as UploadService from '../media/UploadService.js';
 import { rateLimit } from '../middleware/rateLimit.js';
-import { route, validate, requireAuth, tenantOf, paging, q, notFound, badRequest } from './_helpers.js';
+import { route, validate, requireAuth, tenantOf, q, notFound, badRequest } from './_helpers.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -32,46 +35,57 @@ const userIdParam = z.object({ userId: z.string().uuid() });
  * ------------------------------------------------------------------ */
 
 router.get(
-  '/profiles/me',
-  route(async (req) => Profile.getOwn(req.user.id)),
+  '/me',
+  route(async (req) => {
+    const own = await Profile.getOwn(req.user.id);
+    if (!own) throw notFound('No profile for this account');
+    return own;
+  }),
 );
 
 router.patch(
-  '/profiles/me',
+  '/me',
   validate({
     body: z.object({
       displayName: z.string().min(1).max(80).optional(),
-      bio: z.string().max(1000).optional(),
-      headline: z.string().max(140).optional(),
+      handle: z.string().min(3).max(32).optional(),
+      bio: z.string().max(2000).nullish(),
+      headline: z.string().max(140).nullish(),
       avatarAssetId: z.string().uuid().nullish(),
-      timeZone: z.string().max(64).optional(),
-      locale: z.string().max(10).optional(),
       links: z.array(z.object({ label: z.string().max(40), url: z.string().url() })).max(5).optional(),
     }),
   }),
-  route(async (req) => Profile.updateOwn(req.user.id, req.body)),
+  route(async (req) => {
+    const { avatarAssetId, ...patch } = req.body;
+    if (avatarAssetId) await Profile.setAvatar({ userId: req.user.id, assetId: avatarAssetId });
+    return Profile.update({ userId: req.user.id, patch });
+  }),
 );
 
 /**
- * Who may DM me. `nobody` still lets a teacher reach a learner in a course they share —
- * that exception lives in ConversationService, not in the setting.
+ * Who may message me, and what others see. "Receive private messages: off" is
+ * dmPolicy 'nobody'; teachers of the tenant can still reach the person.
  */
-router.put(
-  '/profiles/me/privacy',
-  validate({
-    body: z.object({
-      visibility: z.enum(['tenant', 'shared-only', 'private']).optional(),
-      dmPolicy: z.enum(['anyone', 'shared-only', 'nobody']).optional(),
-      showPresence: z.boolean().optional(),
-      showReadReceipts: z.boolean().optional(),
-    }),
-  }),
-  route(async (req) => Profile.updatePrivacy(req.user.id, req.body)),
+const privacyBody = z.object({
+  dmPolicy: z.enum(['anyone', 'shared-context', 'shared-only', 'shared', 'nobody']).optional(),
+  visibility: z.enum(['tenant', 'shared-only', 'shared', 'private']).optional(),
+  showPresence: z.boolean().optional(),
+  sendReadReceipts: z.boolean().optional(),
+  readReceipts: z.boolean().optional(),
+});
+
+const updatePrivacy = route(async (req) => Profile.updatePrivacy({ userId: req.user.id, patch: req.body }));
+router.patch('/me/privacy', validate({ body: privacyBody }), updatePrivacy);
+router.put('/me/privacy', validate({ body: privacyBody }), updatePrivacy);
+
+router.get(
+  '/me/privacy',
+  route(async (req) => (await Profile.getOwn(req.user.id))?.privacy ?? null),
 );
 
 /** Avatar upload goes through the media presign flow like any other asset. */
 router.post(
-  '/profiles/me/avatar',
+  '/me/avatar',
   validate({
     body: z.object({
       filename: z.string().min(1).max(255),
@@ -81,13 +95,70 @@ router.post(
   }),
   route(async (req, res) => {
     res.status(201);
-    return UploadService.createMultipart({
-      tenantId: tenantOf(req),
-      userId: req.user.id,
+    return UploadService.createUpload({
+      ownerId: req.user.id,
       purpose: 'avatar',
-      contextId: null,
-      ...req.body,
+      fileName: req.body.filename,
+      contentType: req.body.contentType,
+      sizeBytes: req.body.sizeBytes,
     });
+  }),
+);
+
+router.put(
+  '/me/avatar',
+  validate({ body: z.object({ assetId: z.string().uuid() }) }),
+  route(async (req) => Profile.setAvatar({ userId: req.user.id, assetId: req.body.assetId })),
+);
+
+/* ------------------------------------------------------------------ *
+ * Blocking (account-wide)
+ * ------------------------------------------------------------------ */
+
+router.get(
+  '/me/blocks',
+  validate({ query: z.object({ cursor: z.string().optional(), limit: z.coerce.number().int().min(1).max(100).optional() }) }),
+  route(async (req) =>
+    Profile.listBlocks({ userId: req.user.id, cursor: q(req).cursor ?? null, limit: q(req).limit ?? 25 }),
+  ),
+);
+
+const block = async (req, blockedUserId, reason) => {
+  if (blockedUserId === req.user.id) throw badRequest('You cannot block yourself');
+  // Mutual in effect: neither side can message the other afterwards.
+  return Profile.block({ userId: req.user.id, blockedUserId, reason: reason ?? null });
+};
+
+router.post(
+  '/me/blocks',
+  validate({ body: z.object({ userId: z.string().uuid(), reason: z.string().max(500).optional() }).passthrough() }),
+  route(async (req, res) => {
+    res.status(201);
+    return block(req, req.body.userId, req.body.reason);
+  }),
+);
+
+router.delete(
+  '/me/blocks/:userId',
+  validate({ params: userIdParam }),
+  route(async (req) => {
+    await Profile.unblock({ userId: req.user.id, blockedUserId: req.params.userId });
+    return null;
+  }),
+);
+
+router.put(
+  '/:userId/block',
+  validate({ params: userIdParam, body: z.object({ reason: z.string().max(500).optional() }).default({}) }),
+  route(async (req) => block(req, req.params.userId, req.body?.reason)),
+);
+
+router.delete(
+  '/:userId/block',
+  validate({ params: userIdParam }),
+  route(async (req) => {
+    await Profile.unblock({ userId: req.user.id, blockedUserId: req.params.userId });
+    return null;
   }),
 );
 
@@ -95,80 +166,49 @@ router.post(
  * Other people
  * ------------------------------------------------------------------ */
 
+/** Mention autocomplete and people search. */
+const searchQuery = z.object({
+  q: z.string().min(2).max(80),
+  scopeId: z.string().uuid().optional(),
+  spaceId: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(25).optional(),
+});
+
+const search = route(async (req) =>
+  Profile.search({
+    q: q(req).q,
+    viewerId: req.user.id,
+    scopeId: q(req).scopeId ?? q(req).spaceId ?? null,
+    limit: q(req).limit ?? 10,
+  }),
+);
+
+router.get('/search', rateLimit({ key: 'profile:search', points: 60, durationSec: 60, by: ['user'] }), validate({ query: searchQuery }), search);
+router.get('/', rateLimit({ key: 'profile:search', points: 60, durationSec: 60, by: ['user'] }), validate({ query: searchQuery }), search);
+
+/**
+ * Someone else's profile, as this viewer may see it. `canMessage` and the
+ * reason are computed by the same rule the send path enforces.
+ */
 router.get(
-  '/profiles/:userId',
+  '/:userId',
   rateLimit({ key: 'profile:read', points: 300, durationSec: 300, by: ['user'] }),
-  validate({ params: userIdParam }),
+  validate({ params: userIdParam, query: z.object({ roomId: z.string().uuid().optional() }).passthrough() }),
   route(async (req) => {
-    const profile = await Profile.getPublic(req.params.userId, {
-      viewerId: req.user.id,
-      tenantId: tenantOf(req),
-    });
+    const profile = await Profile.getPublic({ userId: req.params.userId, viewerId: req.user.id });
     if (!profile) throw notFound('No such profile');
 
-    // Computed, not guessed by the client: the button and the send check agree.
-    const messaging = await ConversationService.canMessage(req.user.id, req.params.userId);
-    return { ...profile, canMessage: messaging.allowed, messageBlockedReason: messaging.reason ?? null };
-  }),
-);
+    const messaging = await ConversationService.canMessage({
+      fromUserId: req.user.id,
+      toUserId: req.params.userId,
+      roomId: q(req).roomId ?? null,
+    });
 
-/** Directory search. Narrow by design: it only returns people the viewer may see. */
-router.get(
-  '/profiles',
-  rateLimit({ key: 'profile:search', points: 60, durationSec: 60, by: ['user'] }),
-  validate({
-    query: z.object({
-      q: z.string().min(2).max(80),
-      courseId: z.string().uuid().optional(),
-      spaceId: z.string().uuid().optional(),
-      cursor: z.string().optional(),
-      limit: z.coerce.number().int().min(1).max(25).optional(),
-    }),
-  }),
-  route(async (req) =>
-    Profile.search({
-      viewerId: req.user.id,
-      tenantId: tenantOf(req),
-      query: q(req).q,
-      courseId: q(req).courseId,
-      spaceId: q(req).spaceId,
-      ...paging(req, { defaultLimit: 15, maxLimit: 25 }),
-    }),
-  ),
-);
-
-/** What we have in common — the ProfileModal shows this under the bio. */
-router.get(
-  '/profiles/:userId/shared',
-  validate({ params: userIdParam }),
-  route(async (req) => Profile.sharedContext(req.user.id, req.params.userId)),
-);
-
-/* ------------------------------------------------------------------ *
- * Blocking
- * ------------------------------------------------------------------ */
-
-router.get(
-  '/profiles/me/blocks',
-  route(async (req) => ({ blocked: await Profile.listBlocks(req.user.id) })),
-);
-
-router.put(
-  '/profiles/:userId/block',
-  validate({ params: userIdParam, body: z.object({ reason: z.string().max(500).optional() }).default({}) }),
-  route(async (req) => {
-    if (req.params.userId === req.user.id) throw badRequest('You cannot block yourself');
-    // Symmetric: neither side can send afterwards. Enforcement is in the messaging domain.
-    return Profile.block({ userId: req.user.id, blockedId: req.params.userId, reason: req.body.reason ?? null });
-  }),
-);
-
-router.delete(
-  '/profiles/:userId/block',
-  validate({ params: userIdParam }),
-  route(async (req) => {
-    await Profile.unblock({ userId: req.user.id, blockedId: req.params.userId });
-    return null;
+    return {
+      ...profile,
+      canMessage: messaging.allowed,
+      cannotMessageReason: messaging.allowed ? null : messaging.reason ?? null,
+    };
   }),
 );
 
@@ -177,14 +217,14 @@ router.delete(
  * ------------------------------------------------------------------ */
 
 router.post(
-  '/profiles/:userId/report',
+  '/:userId/report',
   rateLimit({ key: 'profile:report', points: 20, durationSec: 3600, by: ['user'] }),
   validate({
     params: userIdParam,
     body: z.object({
       reason: z.enum(['spam', 'abuse', 'harassment', 'impersonation', 'nsfw', 'other']),
       note: z.string().max(2000).optional(),
-      messageIds: z.array(z.string().uuid()).max(20).default([]), // evidence, if it came from chat
+      messageIds: z.array(z.string().uuid()).max(20).default([]),
     }),
   }),
   route(async (req, res) => {

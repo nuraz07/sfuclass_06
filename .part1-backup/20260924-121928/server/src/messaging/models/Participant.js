@@ -2,26 +2,20 @@
 /**
  * Participant  (F6)
  *
- * Membership of a conversation, and the per-person state that goes with it:
- * muted (optionally until a time), where they have read up to, and whether
- * they deleted the thread for themselves.
+ * Membership of a conversation, and the per-person preferences that go with it:
+ * muted, and where they have read up to.
  *
- * `last_read_at` is a timestamp rather than a message id: an id breaks when
- * that message is deleted, and a timestamp answers the only question anyone
- * asks — "how many arrived after this" — with a range scan.
+ * `last_read_at` is a timestamp rather than a message id, which is worth
+ * defending: an id would be precise but breaks when that message is deleted,
+ * and a timestamp answers the only question anyone asks — "how many arrived
+ * after this" — with a range scan on the index that already exists.
  *
- * Leaving sets `left_at` rather than deleting the row. "Deleted for me" sets
- * `hidden_at` and `cleared_at` (020): the thread leaves this person's list and
- * their history restarts, while the other side keeps everything.
- *
- * Display names come from `users`; `profiles` has none.
+ * Leaving sets `left_at` rather than deleting the row. Otherwise a person's own
+ * messages lose their membership context, and rejoining a group would show them
+ * as having read everything they missed.
  */
 
 import { pool } from '../../db/pool.js';
-
-/** A mute with an end time that has passed is no longer a mute. */
-export const isMutedNow = (row, now = Date.now()) =>
-  Boolean(row?.muted) && (!row.muted_until || new Date(row.muted_until).getTime() > now);
 
 export const toParticipant = (row) => ({
   userId: row.user_id,
@@ -30,35 +24,23 @@ export const toParticipant = (row) => ({
     displayName: row.display_name ?? 'Unknown',
     avatarUrl: row.avatar_url ?? null,
   },
-  role: row.role === 'owner' ? 'owner' : 'member',
-  joinedAt: row.joined_at ? new Date(row.joined_at).toISOString() : null,
-  lastReadAt: row.last_read_at ? new Date(row.last_read_at).toISOString() : null,
-  muted: isMutedNow(row),
+  role: row.role,
+  joinedAt: row.joined_at,
+  lastReadAt: row.last_read_at,
+  muted: row.muted,
 });
 
 export const listForConversation = async (conversationId) => {
   const { rows } = await pool.query(
-    `SELECT cp.user_id, cp.role, cp.joined_at, cp.last_read_at, cp.muted, cp.muted_until,
-            cp.hidden_at, cp.cleared_at, u.display_name, NULL::text AS avatar_url
+    `SELECT cp.user_id, cp.role, cp.joined_at, cp.last_read_at, cp.muted,
+            p.display_name, p.avatar_url
        FROM conversation_participants cp
-       JOIN users u ON u.id = cp.user_id
+       LEFT JOIN profiles p ON p.user_id = cp.user_id
       WHERE cp.conversation_id = $1 AND cp.left_at IS NULL
       ORDER BY cp.joined_at ASC`,
     [conversationId],
   );
   return rows;
-};
-
-/** One person's row in one conversation, or null. */
-export const state = async ({ conversationId, userId }) => {
-  const { rows } = await pool.query(
-    `SELECT conversation_id, user_id, role, muted, muted_until, hidden_at, cleared_at,
-            last_read_at, left_at
-       FROM conversation_participants
-      WHERE conversation_id = $1 AND user_id = $2`,
-    [conversationId, userId],
-  );
-  return rows[0] ?? null;
 };
 
 export const isParticipant = async ({ conversationId, userId }) => {
@@ -90,37 +72,11 @@ export const remove = async ({ conversationId, userId }) => {
   );
 };
 
-/**
- * Mute, optionally until a time. `until` null with muted true is "until I turn
- * it back on"; unmuting clears both.
- */
-export const setMuted = async ({ conversationId, userId, muted, until = null }) => {
+export const setMuted = async ({ conversationId, userId, muted }) => {
   await pool.query(
-    `UPDATE conversation_participants
-        SET muted = $3,
-            muted_until = CASE WHEN $3 THEN $4::timestamptz ELSE NULL END
+    `UPDATE conversation_participants SET muted = $3
       WHERE conversation_id = $1 AND user_id = $2`,
-    [conversationId, userId, muted, until],
-  );
-};
-
-/** "Delete for me": out of the list, history restarts now. The other side is untouched. */
-export const hide = async ({ conversationId, userId }) => {
-  const { rowCount } = await pool.query(
-    `UPDATE conversation_participants
-        SET hidden_at = now(), cleared_at = now()
-      WHERE conversation_id = $1 AND user_id = $2 AND left_at IS NULL`,
-    [conversationId, userId],
-  );
-  return rowCount > 0;
-};
-
-/** Back into the list, with history still starting at cleared_at. */
-export const reveal = async ({ conversationId, userId }) => {
-  await pool.query(
-    `UPDATE conversation_participants SET hidden_at = NULL
-      WHERE conversation_id = $1 AND user_id = $2 AND hidden_at IS NOT NULL`,
-    [conversationId, userId],
+    [conversationId, userId, muted],
   );
 };
 
@@ -164,18 +120,14 @@ export const setChannelMuted = async ({ channelId, userId, muted }) => {
   );
 };
 
-/** Who should be notified: everyone present except the author and anyone muted right now. */
+/** Who should be notified: everyone present except the author and the muted. */
 export const notifiableIds = async ({ conversationId, excludeUserId }) => {
   const { rows } = await pool.query(
     `SELECT user_id FROM conversation_participants
-      WHERE conversation_id = $1 AND left_at IS NULL AND user_id <> $2
-        AND NOT (muted AND (muted_until IS NULL OR muted_until > now()))`,
+      WHERE conversation_id = $1 AND left_at IS NULL AND muted = false AND user_id <> $2`,
     [conversationId, excludeUserId],
   );
   return rows.map((row) => row.user_id);
 };
 
-export default {
-  listForConversation, state, isParticipant, add, remove, setMuted, hide, reveal,
-  markRead, toParticipant, isMutedNow,
-};
+export default { listForConversation, isParticipant, add, remove, markRead, toParticipant };

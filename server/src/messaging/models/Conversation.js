@@ -5,99 +5,115 @@
  * A participant set. A 1:1 chat and a small group chat are the same object with
  * a different size, which is why there is no separate "DirectMessage" table.
  *
- * The one piece of real machinery here is `findDirectBetween`. Opening a DM from
- * a profile card must be idempotent — a double-tap cannot produce two threads
- * with the same person — and the obvious implementations are all subtly wrong:
- * a `participant_key` column drifts when someone leaves, and a self-join
- * without the cardinality check matches any group that happens to contain both
- * people. The query below requires the conversation to be direct, to contain
- * both, and to contain nobody else.
+ * Column names are the table's (008_messaging.sql, 020): the primary key is
+ * `id`. Every query aliases it to `conversation_id`, the name the rest of the
+ * messaging domain and the contract use, so the rename happens in exactly one
+ * place.
+ *
+ * One direct conversation per pair of people is guaranteed by the database:
+ * `participant_key` holds the two user ids, sorted, and the unique index on
+ * (tenant_id, participant_key) settles two clicks at the same moment. The model
+ * only has to compute the key the same way every time — directKey() below.
+ *
+ * Per-person state (muted, muted_until, hidden_at, cleared_at, last_read_at)
+ * lives on conversation_participants; the list query reads it for the viewer.
  */
 
 import { pool } from '../../db/pool.js';
 
+/** Sorted pair of user ids. Same order as `ORDER BY uuid` in 020's backfill. */
+export const directKey = (userA, userB) =>
+  [String(userA).toLowerCase(), String(userB).toLowerCase()].sort().join(':');
+
 const SELECT = `
-  c.conversation_id, c.kind, c.title, c.created_by,
-  c.created_at, c.updated_at, c.last_message_at, c.archived_at
+  c.id AS conversation_id, c.tenant_id, c.kind, c.title, c.created_by,
+  c.created_at, c.updated_at, c.last_message_at
 `;
 
-export const toConversation = (row, { participants = [], unreadCount = 0, muted = false, lastMessage = null }) => ({
+const iso = (value) => (value ? new Date(value).toISOString() : null);
+
+/**
+ * API shape (Chat.ConversationSchema). `mutedUntil` and `lastMessagePreview`
+ * are additive fields the conversation list uses; `lastMessage` stays null
+ * because the contract types it as a full Message.
+ */
+export const toConversation = (
+  row,
+  { participants = [], unreadCount = 0, muted = false, mutedUntil = null, lastMessagePreview = null } = {},
+) => ({
   conversationId: row.conversation_id,
   kind: row.kind,
   title: row.title,
   participants,
   createdBy: row.created_by,
-  lastMessage,
-  lastMessageAt: row.last_message_at,
+  lastMessage: null,
+  lastMessageAt: iso(row.last_message_at),
+  lastMessagePreview,
   unreadCount,
   muted,
-  archived: Boolean(row.archived_at),
-  createdAt: row.created_at,
-  updatedAt: row.updated_at,
+  mutedUntil: iso(mutedUntil),
+  archived: false,
+  createdAt: iso(row.created_at),
+  updatedAt: iso(row.updated_at ?? row.created_at),
 });
 
-export const findById = async (conversationId) => {
-  const { rows } = await pool.query(
-    `SELECT ${SELECT} FROM conversations c WHERE c.conversation_id = $1`,
+export const findById = async (conversationId, client = pool) => {
+  const { rows } = await client.query(
+    `SELECT ${SELECT} FROM conversations c WHERE c.id = $1`,
     [conversationId],
   );
   return rows[0] ?? null;
 };
 
-/**
- * The existing 1:1 between two people, or null.
- *
- * `having count(*) = 2` is the part that matters: without it, a group
- * containing both of them would match and the next direct message would land
- * in the wrong thread.
- */
-export const findDirectBetween = async (userA, userB) => {
-  const { rows } = await pool.query(
+/** The existing 1:1 between two people in a tenant, or null. */
+export const findDirectBetween = async ({ tenantId = null, userA, userB }, client = pool) => {
+  const { rows } = await client.query(
     `SELECT ${SELECT}
        FROM conversations c
-       JOIN conversation_participants p ON p.conversation_id = c.conversation_id
       WHERE c.kind = 'direct'
-        AND c.archived_at IS NULL
-        AND p.left_at IS NULL
-      GROUP BY c.conversation_id, c.kind, c.title, c.created_by,
-               c.created_at, c.updated_at, c.last_message_at, c.archived_at
-     HAVING count(*) = 2
-        AND bool_or(p.user_id = $1)
-        AND bool_or(p.user_id = $2)
+        AND c.participant_key = $1
+        AND ($2::uuid IS NULL OR c.tenant_id = $2)
       LIMIT 1`,
-    [userA, userB],
+    [directKey(userA, userB), tenantId],
   );
   return rows[0] ?? null;
 };
 
 /**
- * Creates a conversation and its participants in one transaction. A
- * conversation with no participants is unreachable, so the two writes must
- * succeed or fail together.
+ * Creates a conversation and its participants in one transaction. `hiddenFor`
+ * lists participants who should not see it in their list yet: a direct
+ * conversation someone opened but has not written in stays invisible to the
+ * other person until the first message arrives (touch() reveals it).
  */
-export const create = async ({ conversationId, tenantId, kind, title = null, createdBy, participantIds }) => {
+export const create = async ({
+  conversationId,
+  tenantId,
+  kind,
+  title = null,
+  createdBy,
+  participantIds,
+  hiddenFor = [],
+}) => {
+  const participantKey = kind === 'direct' ? directKey(participantIds[0], participantIds[1]) : null;
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
 
     await client.query(
-      `INSERT INTO conversations (conversation_id, tenant_id, kind, title, created_by, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, now(), now())`,
-      [conversationId, tenantId, kind, title, createdBy],
+      `INSERT INTO conversations (id, tenant_id, kind, title, participant_key, created_by, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now(), now())`,
+      [conversationId, tenantId, kind, title, participantKey, createdBy],
     );
 
     // One statement rather than a loop: a group of fifty would otherwise be
     // fifty round trips inside a transaction.
     await client.query(
-      `INSERT INTO conversation_participants (conversation_id, user_id, role, joined_at)
-       SELECT $1, unnest($2::uuid[]), 'member', now()`,
-      [conversationId, participantIds],
-    );
-
-    await client.query(
-      `UPDATE conversation_participants SET role = 'owner'
-        WHERE conversation_id = $1 AND user_id = $2`,
-      [conversationId, createdBy],
+      `INSERT INTO conversation_participants (conversation_id, user_id, role, joined_at, hidden_at)
+       SELECT $1, member, CASE WHEN member = $3 THEN 'owner' ELSE 'member' END, now(),
+              CASE WHEN member = ANY($4::uuid[]) THEN now() END
+         FROM unnest($2::uuid[]) AS member`,
+      [conversationId, participantIds, createdBy, hiddenFor],
     );
 
     await client.query('COMMIT');
@@ -112,35 +128,54 @@ export const create = async ({ conversationId, tenantId, kind, title = null, cre
 };
 
 /**
- * A person's conversations, most recently active first, with their unread
- * count computed in the same query — the list screen would otherwise be one
- * query plus one per row.
+ * A person's visible conversations, most recently active first, with their
+ * unread count and a short preview of the last message — both counted from
+ * after this person's cleared_at, so a thread they deleted and that came back
+ * shows only what is new to them.
+ *
+ * `conversationId` narrows it to one thread (used to push a single updated
+ * row to someone's list).
  */
-export const listForUser = async ({ userId, cursor, limit = 25, archived = false }) => {
-  const params = [userId, limit + 1];
-  const where = [
-    'p.user_id = $1',
-    'p.left_at IS NULL',
-    archived ? 'c.archived_at IS NOT NULL' : 'c.archived_at IS NULL',
-  ];
+export const listForUser = async ({ userId, cursor = null, limit = 25, conversationId = null }) => {
+  const params = [userId, limit + 1, conversationId];
+  const where = ['p.user_id = $1', 'p.left_at IS NULL', '($3::uuid IS NULL OR c.id = $3)'];
+
+  // A thread requested by id is returned even while hidden: the caller is
+  // pushing an update the person must see.
+  if (!conversationId) where.push('p.hidden_at IS NULL');
 
   if (cursor) {
     params.push(cursor);
-    where.push(`c.last_message_at < $${params.length}`);
+    where.push(`coalesce(c.last_message_at, c.created_at) < $${params.length}::timestamptz`);
   }
 
   const { rows } = await pool.query(
-    `SELECT ${SELECT}, p.muted, p.last_read_at,
+    `SELECT ${SELECT},
+            p.muted, p.muted_until, p.last_read_at, p.cleared_at, p.hidden_at,
+            coalesce(c.last_message_at, c.created_at) AS sort_at,
             (SELECT count(*)::int FROM messages m
-              WHERE m.conversation_id = c.conversation_id
+              WHERE m.conversation_id = c.id
                 AND m.deleted_at IS NULL
                 AND m.author_id <> $1
-                AND (p.last_read_at IS NULL OR m.created_at > p.last_read_at)
-            ) AS unread_count
+                AND m.created_at > greatest(coalesce(p.last_read_at, '-infinity'::timestamptz),
+                                            coalesce(p.cleared_at, '-infinity'::timestamptz))
+            ) AS unread_count,
+            (SELECT jsonb_build_object(
+                      'messageId', m.message_id,
+                      'authorId', m.author_id,
+                      'body', left(m.body, 140),
+                      'createdAt', m.created_at)
+               FROM messages m
+              WHERE m.conversation_id = c.id
+                AND m.deleted_at IS NULL
+                AND m.created_at > coalesce(p.cleared_at, '-infinity'::timestamptz)
+              ORDER BY m.created_at DESC
+              LIMIT 1
+            ) AS last_message_preview
        FROM conversations c
-       JOIN conversation_participants p ON p.conversation_id = c.conversation_id
+       JOIN conversation_participants p ON p.conversation_id = c.id
       WHERE ${where.join(' AND ')}
-      ORDER BY c.last_message_at DESC NULLS LAST
+      ORDER BY sort_at DESC, c.id DESC
       LIMIT $2`,
     params,
   );
@@ -151,24 +186,25 @@ export const listForUser = async ({ userId, cursor, limit = 25, archived = false
   return {
     rows: page,
     hasMore,
-    nextCursor: hasMore ? page.at(-1)?.last_message_at ?? null : null,
+    nextCursor: hasMore ? iso(page.at(-1)?.sort_at) : null,
   };
 };
 
-/** Keeps the conversation list ordered without a join on every read. */
+/**
+ * A message was sent. Keeps the list ordered, and brings the thread back for
+ * anyone who had deleted it or had not seen it yet — their cleared_at still
+ * hides what came before.
+ */
 export const touch = async (conversationId) => {
   await pool.query(
-    `UPDATE conversations SET last_message_at = now(), updated_at = now()
-      WHERE conversation_id = $1`,
+    `UPDATE conversations SET last_message_at = now(), updated_at = now() WHERE id = $1`,
+    [conversationId],
+  );
+  await pool.query(
+    `UPDATE conversation_participants SET hidden_at = NULL
+      WHERE conversation_id = $1 AND hidden_at IS NOT NULL AND left_at IS NULL`,
     [conversationId],
   );
 };
 
-export const setArchived = async (conversationId, archived) => {
-  await pool.query(
-    `UPDATE conversations SET archived_at = $2, updated_at = now() WHERE conversation_id = $1`,
-    [conversationId, archived ? new Date().toISOString() : null],
-  );
-};
-
-export default { findById, findDirectBetween, create, listForUser, touch, toConversation };
+export default { directKey, findById, findDirectBetween, create, listForUser, touch, toConversation };

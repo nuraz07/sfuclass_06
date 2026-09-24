@@ -1,0 +1,168 @@
+]633;E;for t in conversations conversation_participants blocks user_blocks channel_participants messages;095e2c4b-9867-43d0-b57d-b1866f29983e]633;C===== conversations
+                             Table "public.conversations"
+     Column      |           Type           | Collation | Nullable |      Default      
+-----------------+--------------------------+-----------+----------+-------------------
+ id              | uuid                     |           | not null | gen_random_uuid()
+ tenant_id       | uuid                     |           | not null | 
+ kind            | text                     |           | not null | 'direct'::text
+ title           | text                     |           |          | 
+ participant_key | text                     |           |          | 
+ created_by      | uuid                     |           |          | 
+ created_at      | timestamp with time zone |           | not null | now()
+ last_message_at | timestamp with time zone |           |          | 
+Indexes:
+    "conversations_pkey" PRIMARY KEY, btree (id)
+    "conversations_participant_key" UNIQUE, btree (tenant_id, participant_key) WHERE participant_key IS NOT NULL
+    "conversations_recent_idx" btree (tenant_id, last_message_at DESC)
+Check constraints:
+    "conversations_kind_check" CHECK (kind = ANY (ARRAY['direct'::text, 'group'::text]))
+Foreign-key constraints:
+    "conversations_created_by_fkey" FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+    "conversations_tenant_id_fkey" FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+Referenced by:
+    TABLE "conversation_participants" CONSTRAINT "conversation_participants_conversation_id_fkey" FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+    TABLE "messages" CONSTRAINT "messages_conversation_id_fkey" FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+
+===== conversation_participants
+                        Table "public.conversation_participants"
+        Column        |           Type           | Collation | Nullable |    Default     
+----------------------+--------------------------+-----------+----------+----------------
+ conversation_id      | uuid                     |           | not null | 
+ user_id              | uuid                     |           | not null | 
+ role                 | text                     |           | not null | 'member'::text
+ muted                | boolean                  |           | not null | false
+ last_read_at         | timestamp with time zone |           |          | 
+ last_read_message_id | uuid                     |           |          | 
+ joined_at            | timestamp with time zone |           | not null | now()
+ left_at              | timestamp with time zone |           |          | 
+Indexes:
+    "conversation_participants_pkey" PRIMARY KEY, btree (conversation_id, user_id)
+    "conversation_participants_user_idx" btree (user_id) WHERE left_at IS NULL
+Foreign-key constraints:
+    "conversation_participants_conversation_id_fkey" FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+    "conversation_participants_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+
+===== blocks
+                         Table "public.blocks"
+   Column   |           Type           | Collation | Nullable | Default 
+------------+--------------------------+-----------+----------+---------
+ user_id    | uuid                     |           | not null | 
+ blocked_id | uuid                     |           | not null | 
+ reason     | text                     |           |          | 
+ created_at | timestamp with time zone |           | not null | now()
+Indexes:
+    "blocks_pkey" PRIMARY KEY, btree (user_id, blocked_id)
+    "blocks_blocked_idx" btree (blocked_id, user_id)
+Check constraints:
+    "blocks_no_self" CHECK (user_id <> blocked_id)
+Foreign-key constraints:
+    "blocks_blocked_id_fkey" FOREIGN KEY (blocked_id) REFERENCES users(id) ON DELETE CASCADE
+    "blocks_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+
+===== user_blocks
+                       View "public.user_blocks"
+   Column   |           Type           | Collation | Nullable | Default 
+------------+--------------------------+-----------+----------+---------
+ user_id    | uuid                     |           |          | 
+ blocker_id | uuid                     |           |          | 
+ blocked_id | uuid                     |           |          | 
+ reason     | text                     |           |          | 
+ created_at | timestamp with time zone |           |          | 
+
+===== channel_participants
+                       Table "public.channel_participants"
+        Column        |           Type           | Collation | Nullable | Default 
+----------------------+--------------------------+-----------+----------+---------
+ channel_id           | uuid                     |           | not null | 
+ user_id              | uuid                     |           | not null | 
+ muted                | boolean                  |           | not null | false
+ last_read_at         | timestamp with time zone |           |          | 
+ last_read_message_id | uuid                     |           |          | 
+ muted_until          | timestamp with time zone |           |          | 
+Indexes:
+    "channel_participants_pkey" PRIMARY KEY, btree (channel_id, user_id)
+Foreign-key constraints:
+    "channel_participants_channel_id_fkey" FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    "channel_participants_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+
+===== messages
+                                 Table "public.messages"
+      Column       |           Type           | Collation | Nullable |      Default      
+-------------------+--------------------------+-----------+----------+-------------------
+ message_id        | uuid                     |           | not null | gen_random_uuid()
+ tenant_id         | uuid                     |           | not null | 
+ conversation_id   | uuid                     |           |          | 
+ channel_id        | uuid                     |           |          | 
+ author_id         | uuid                     |           | not null | 
+ body              | text                     |           | not null | ''::text
+ reply_to_id       | uuid                     |           |          | 
+ mentions          | uuid[]                   |           | not null | '{}'::uuid[]
+ client_message_id | text                     |           |          | 
+ created_at        | timestamp with time zone |           | not null | now()
+ edited_at         | timestamp with time zone |           |          | 
+ deleted_at        | timestamp with time zone |           |          | 
+ deleted_by        | uuid                     |           |          | 
+ delete_reason     | text                     |           |          | 
+ legal_hold        | boolean                  |           | not null | false
+ target_kind       | text                     |           | not null | 
+ room_id           | uuid                     |           |          | 
+ kind              | text                     |           | not null | 'text'::text
+Indexes:
+    "messages_pkey" PRIMARY KEY, btree (message_id)
+    "messages_channel_keyset_idx" btree (channel_id, created_at DESC, message_id DESC) WHERE channel_id IS NOT NULL
+    "messages_client_id_key" UNIQUE, btree (author_id, client_message_id) WHERE client_message_id IS NOT NULL
+    "messages_conversation_keyset_idx" btree (conversation_id, created_at DESC, message_id DESC) WHERE conversation_id IS NOT NULL
+    "messages_mentions_idx" gin (mentions)
+    "messages_retention_idx" btree (tenant_id, created_at) WHERE deleted_at IS NULL AND legal_hold = false
+    "messages_room_keyset_idx" btree (room_id, created_at DESC, message_id DESC) WHERE room_id IS NOT NULL
+Check constraints:
+    "messages_scope_check" CHECK (target_kind = 'conversation'::text AND conversation_id IS NOT NULL AND channel_id IS NULL AND room_id IS NULL OR target_kind = 'channel'::text AND conversation_id IS NULL AND channel_id IS NOT NULL AND room_id IS NULL OR target_kind = 'room'::text AND conversation_id IS NULL AND channel_id IS NULL AND room_id IS NOT NULL)
+    "messages_target_kind_check" CHECK (target_kind = ANY (ARRAY['conversation'::text, 'channel'::text, 'room'::text]))
+Foreign-key constraints:
+    "messages_channel_id_fkey" FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    "messages_conversation_id_fkey" FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+    "messages_deleted_by_fkey" FOREIGN KEY (deleted_by) REFERENCES users(id) ON DELETE SET NULL
+    "messages_reply_to_id_fkey" FOREIGN KEY (reply_to_id) REFERENCES messages(message_id) ON DELETE SET NULL
+    "messages_sender_id_fkey" FOREIGN KEY (author_id) REFERENCES users(id)
+    "messages_tenant_id_fkey" FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+Referenced by:
+596-    [35mroute[39m: "/conversations/direct"
+597-    [35mstatus[39m: 500
+598-    [35mdurationMs[39m: 5.86
+599-    [35muserId[39m: null
+600-    [35mip[39m: "::1"
+601:[11:30:19.522] [31mERROR[39m: [36mrequest failed[39m
+602-    [35mrelease[39m: "local"
+603-    [35mtask[39m: "codespaces-2330f4"
+604-    [35mrequestId[39m: "8a582025-7d47-4e75-9a06-63a2eac085a6"
+605-    [35mtraceId[39m: "7aa9443bff374cddab77c847dfc858a2"
+606-    [35mtrace_id[39m: "6ab509cb02bd49cce2f1c29a732f8126"
+607-    [35mspan_id[39m: "4980f71aad0acb50"
+608-    [35mcode[39m: "internal_error"
+609-    [35mstatus[39m: 500
+610-    [35mpath[39m: "/messaging/conversations/direct"
+611-    [35mmethod[39m: "POST"
+612-    err: {
+613-      "type": "Object",
+614-      "message": "ConversationService.openOrCreateDirect is not a function",
+615-      "stack":
+616-          TypeError: ConversationService.openOrCreateDirect is not a function
+617-              at file:///workspaces/sfuclass_06/server/src/routes/messaging.routes.js:68:46
+618-              at file:///workspaces/sfuclass_06/server/src/routes/_helpers.js:30:27
+619-              at Layer.handle [as handle_request] (/workspaces/sfuclass_06/node_modules/express/lib/router/layer.js:95:5)
+620-              at next (/workspaces/sfuclass_06/node_modules/express/lib/router/route.js:149:13)
+621-              at file:///workspaces/sfuclass_06/server/src/routes/_helpers.js:97:10
+--
+628:[11:30:19.524] [31mERROR[39m: [36mrequest[39m
+629-    [35mrelease[39m: "local"
+630-    [35mtask[39m: "codespaces-2330f4"
+631-    [35mrequestId[39m: "8a582025-7d47-4e75-9a06-63a2eac085a6"
+632-    [35mtraceId[39m: "7aa9443bff374cddab77c847dfc858a2"
+633-    [35mtrace_id[39m: "6ab509cb02bd49cce2f1c29a732f8126"
+634-    [35mspan_id[39m: "4980f71aad0acb50"
+635-    [35mmethod[39m: "POST"
+636-    [35mroute[39m: "/conversations/direct"
+637-    [35mstatus[39m: 500
+638-    [35mdurationMs[39m: 8.57
+639-    [35muserId[39m: null
+640-    [35mip[39m: "::1"

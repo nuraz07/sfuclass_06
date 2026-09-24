@@ -141,15 +141,6 @@ const deliver = async ({ message, target, authorId, recipients }) => {
   const { broadcastMessage } = await import('./chatGateway.js');
   broadcastMessage({ message, target });
 
-  // The thread may not be open anywhere: push the updated row (unread count,
-  // preview, back from "deleted for me") to each participant's list.
-  if (target.kind === 'conversation') {
-    const { announceActivity } = await import('./ConversationService.js');
-    await announceActivity({ conversationId: target.conversationId }).catch((cause) =>
-      log.warn({ err: cause, conversationId: target.conversationId }, 'conversation list update failed'),
-    );
-  }
-
   const { incrementUnread } = await import('./UnreadService.js');
   await incrementUnread({ target, authorId, recipients, message });
 
@@ -241,25 +232,9 @@ export const remove = async ({ messageId, userId, asModerator = false }) => {
 export const history = async ({ target, viewerId, cursor, limit = 25, order = 'desc', around = null }) => {
   await authoriseRead({ target, userId: viewerId });
 
-  let page = around
+  const page = around
     ? await Message.listAround({ target, messageId: around, limit })
     : await Message.listByTarget({ target, cursor, limit, order });
-
-  // "Deleted for me": this viewer's history restarts at cleared_at; the other
-  // participants keep everything. Pages are newest-first, so once one row is
-  // before the cut there is nothing older left for this viewer.
-  if (target.kind === 'conversation') {
-    const own = await Participant.state({ conversationId: target.conversationId, userId: viewerId });
-    const cutoff = own?.cleared_at ? new Date(own.cleared_at).getTime() : null;
-    if (cutoff !== null) {
-      const kept = page.rows.filter((row) => new Date(row.created_at).getTime() > cutoff);
-      if (kept.length !== page.rows.length) {
-        page = order === 'asc'
-          ? { ...page, rows: kept }
-          : { ...page, rows: kept, hasMore: false, nextCursor: null };
-      }
-    }
-  }
 
   const ids = page.rows.map((row) => row.message_id);
   const attachmentsByMessage = await Attachment.listForMessages(ids);

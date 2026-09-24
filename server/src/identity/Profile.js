@@ -1,37 +1,43 @@
 // classroom-app/server/src/identity/Profile.js
 /**
- * Profiles  (F6)  [NEW]
+ * Profiles  (F6)
  *
  * What a person shows to other people, and who is allowed to contact them.
  *
  * Separate from User.js because the two are read by different things at
- * different rates: the account is read by the auth path, the profile is read
- * every time anybody renders an avatar. Keeping the password hash in a table
- * that is joined into every chat message is a bad idea for reasons that do not
- * need explaining.
+ * different rates: the account is read by the auth path, the profile every time
+ * anybody renders an avatar.
  *
- * The important function here is `canMessage`. It is computed on the server and
- * sent to the client as a boolean, never derived client-side, because only the
- * server can see *both* block lists — and a Message button that appears and
- * then fails is worse than one that was never there.
+ * Storage (009_profiles.sql): privacy lives in named columns, not in a jsonb
+ * blob, because visibility and dm_policy carry check constraints —
+ *
+ *   dm_policy            anyone | shared-only | nobody
+ *   visibility           tenant | shared-only | private
+ *   show_presence        boolean
+ *   show_read_receipts   boolean
+ *
+ * The contract spells the middle DM setting 'shared-context'; it is mapped at
+ * this boundary in both directions. Display name and email live on `users`,
+ * the avatar is `profiles.avatar_asset_id`. Blocks are `blocks(user_id,
+ * blocked_id)`.
+ *
+ * Whether someone may message someone else is decided in exactly one place,
+ * messaging/ConversationService.canMessage. profile.routes asks it and puts the
+ * answer on the public profile, so the button and the send always agree.
  */
 
 import { pool } from '../db/pool.js';
-import { env } from '../config/env.js';
 import { logger } from '../observability/logger.js';
 
 const log = logger.child({ component: 'profiles' });
 
 export const DM_POLICIES = ['anyone', 'shared-context', 'nobody'];
 
-const DEFAULT_PRIVACY = {
-  dmPolicy: env.CHAT_DEFAULT_DM_POLICY,
-  showPresence: true,
-  showEmail: 'nobody',
-  showCourses: 'members',
-  sendReadReceipts: true,
-  discoverable: true,
-};
+const TO_CONTRACT = { anyone: 'anyone', 'shared-only': 'shared-context', nobody: 'nobody' };
+const TO_DB = { anyone: 'anyone', 'shared-context': 'shared-only', shared: 'shared-only', 'shared-only': 'shared-only', nobody: 'nobody' };
+
+/** Privacy fields the contract has that the table does not store: fixed values. */
+const FIXED_PRIVACY = { showEmail: 'nobody', showCourses: 'members', discoverable: true };
 
 const DEFAULT_NOTIFICATIONS = {
   dmPush: true,
@@ -42,25 +48,35 @@ const DEFAULT_NOTIFICATIONS = {
   quietHours: null,
 };
 
+const iso = (value) => (value ? new Date(value).toISOString() : null);
+
 // ---------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------
+
+const privacyOf = (row) => ({
+  ...FIXED_PRIVACY,
+  dmPolicy: TO_CONTRACT[row.dm_policy] ?? 'shared-context',
+  showPresence: row.show_presence !== false,
+  sendReadReceipts: row.show_read_receipts !== false,
+  visibility: row.visibility ?? 'tenant',
+});
 
 const rowToPublic = (row) => ({
   userId: row.user_id,
   displayName: row.display_name,
   handle: row.handle,
-  avatarUrl: row.avatar_url,
-  headline: row.headline,
-  bio: row.bio,
+  avatarUrl: null,
+  headline: row.headline ?? null,
+  bio: row.bio ?? null,
   links: row.links ?? [],
   role: row.role,
   presence: 'offline', // filled in from Redis by the caller
-  lastSeenAt: row.last_seen_at?.toISOString() ?? null,
-  canMessage: false, // computed per viewer; see below
+  lastSeenAt: iso(row.last_seen_at),
+  canMessage: false, // computed per viewer by profile.routes
   isBlockedByViewer: false,
   sharedSpaceCount: 0,
-  joinedAt: row.created_at.toISOString(),
+  joinedAt: iso(row.created_at),
 });
 
 const rowToOwn = (row) => ({
@@ -69,68 +85,20 @@ const rowToOwn = (row) => ({
   isBlockedByViewer: undefined,
   sharedSpaceCount: undefined,
   email: row.email,
-  emailVerified: row.email_verified,
+  emailVerified: Boolean(row.email_verified),
   locale: row.locale,
   timeZone: row.time_zone,
-  privacy: { ...DEFAULT_PRIVACY, ...(row.privacy ?? {}) },
-  notifications: { ...DEFAULT_NOTIFICATIONS, ...(row.notifications ?? {}) },
-  createdAt: row.created_at.toISOString(),
-  updatedAt: row.updated_at.toISOString(),
+  privacy: privacyOf(row),
+  notifications: { ...DEFAULT_NOTIFICATIONS },
+  createdAt: iso(row.created_at),
+  updatedAt: iso(row.updated_at ?? row.created_at),
 });
 
 const SELECT = `
-  SELECT p.*, u.email, (u.email_verified_at IS NOT NULL) AS email_verified, u.display_name, NULL::text AS avatar_url,
-         u.role, u.locale, u.time_zone, u.created_at
+  SELECT p.*, u.email, (u.email_verified_at IS NOT NULL) AS email_verified, u.display_name,
+         u.role, u.locale, u.time_zone, u.created_at, u.last_seen_at
     FROM profiles p JOIN users u ON u.id = p.user_id
 `;
-
-// ---------------------------------------------------------------------------
-// Contact rules  (pure)
-// ---------------------------------------------------------------------------
-
-/**
- * Whether one person may open a direct message with another.
- *
- * Pure and exported so the rule can be tested exhaustively — this is the
- * privacy boundary of the whole messaging feature, and a subtle mistake in it
- * is a stranger appearing in somebody's inbox.
- *
- * @param {{ viewerId, targetId, dmPolicy, blockedEitherWay, sharedContext, viewerIsModerator }} input
- * @returns {{ allowed: boolean, reason?: string }}
- */
-export const canMessage = ({
-  viewerId,
-  targetId,
-  dmPolicy = 'shared-context',
-  blockedEitherWay = false,
-  sharedContext = false,
-  viewerIsModerator = false,
-}) => {
-  // Messaging yourself is a saved-notes feature, not a conversation.
-  if (viewerId === targetId) return { allowed: false, reason: 'self' };
-
-  /**
-   * A block outranks everything, including a moderator's override. A
-   * moderator who needs to contact someone who blocked them has the
-   * moderation tools; the block is not theirs to ignore.
-   */
-  if (blockedEitherWay) return { allowed: false, reason: 'blocked' };
-
-  if (dmPolicy === 'nobody') {
-    // A teacher can still reach a learner who has closed their inbox — a
-    // course has to be able to contact its participants.
-    return viewerIsModerator
-      ? { allowed: true, reason: 'moderator' }
-      : { allowed: false, reason: 'dm_not_allowed' };
-  }
-
-  if (dmPolicy === 'anyone') return { allowed: true };
-
-  // 'shared-context': a course or space in common.
-  return sharedContext
-    ? { allowed: true }
-    : { allowed: false, reason: 'no_shared_context' };
-};
 
 // ---------------------------------------------------------------------------
 // Reading
@@ -142,60 +110,44 @@ export const getOwn = async (userId) => {
 };
 
 /**
- * The public view, resolved for one viewer.
- *
- * Blocks, DM policy and shared context are answered in a single query rather
- * than four: this runs on every profile card, and a card that opens on hover
- * cannot afford four round trips.
+ * The public view for one viewer: block state and shared spaces in one query.
+ * `canMessage` is left false here; profile.routes fills it from
+ * ConversationService.canMessage.
  */
 export const getPublic = async ({ userId, viewerId }) => {
   const { rows } = await pool.query(
-    `${SELECT},
-       LATERAL (
-         SELECT
-           EXISTS (SELECT 1 FROM blocks b
-                    WHERE (b.user_id = $2 AND b.blocked_user_id = p.user_id)
-                       OR (b.user_id = p.user_id AND b.blocked_user_id = $2))  AS blocked_either_way,
-           EXISTS (SELECT 1 FROM blocks b
-                    WHERE b.user_id = $2 AND b.blocked_user_id = p.user_id)     AS blocked_by_viewer,
-           (SELECT count(*)::int FROM space_memberships a
-              JOIN space_memberships b2 ON b2.space_id = a.space_id
-             WHERE a.user_id = $2 AND b2.user_id = p.user_id)                   AS shared_spaces,
-           EXISTS (SELECT 1 FROM enrollments e1
-                     JOIN enrollments e2 ON e2.course_id = e1.course_id
-                    WHERE e1.user_id = $2 AND e2.user_id = p.user_id
-                      AND e1.status = 'active' AND e2.status = 'active')        AS shared_course,
-           EXISTS (SELECT 1 FROM courses c
-                    WHERE c.owner_id = $2
-                      AND EXISTS (SELECT 1 FROM enrollments e
-                                   WHERE e.course_id = c.id AND e.user_id = p.user_id))
-                                                                                AS viewer_teaches
-       ) ctx
-     WHERE p.user_id = $1`,
-    [userId, viewerId],
+    `${SELECT}
+      WHERE p.user_id = $1 AND u.deleted_at IS NULL`,
+    [userId],
   );
-
   const row = rows[0];
   if (!row) return null;
 
-  const privacy = { ...DEFAULT_PRIVACY, ...(row.privacy ?? {}) };
+  const { rows: ctx } = await pool.query(
+    `SELECT EXISTS (SELECT 1 FROM blocks b WHERE b.user_id = $2 AND b.blocked_id = $1) AS blocked_by_viewer`,
+    [userId, viewerId],
+  );
 
-  const verdict = canMessage({
-    viewerId,
-    targetId: userId,
-    dmPolicy: privacy.dmPolicy,
-    blockedEitherWay: row.blocked_either_way,
-    sharedContext: row.shared_spaces > 0 || row.shared_course,
-    viewerIsModerator: row.viewer_teaches,
-  });
+  let sharedSpaces = 0;
+  try {
+    const { rows: shared } = await pool.query(
+      `SELECT count(*)::int AS n
+         FROM space_memberships a
+         JOIN space_memberships b ON b.space_id = a.space_id
+        WHERE a.user_id = $1 AND b.user_id = $2`,
+      [viewerId, userId],
+    );
+    sharedSpaces = shared[0]?.n ?? 0;
+  } catch (cause) {
+    log.warn({ err: cause }, 'shared space count unavailable');
+  }
 
   return {
     ...rowToPublic(row),
-    canMessage: verdict.allowed,
-    isBlockedByViewer: row.blocked_by_viewer,
-    sharedSpaceCount: row.shared_spaces,
+    isBlockedByViewer: Boolean(ctx[0]?.blocked_by_viewer),
+    sharedSpaceCount: sharedSpaces,
     // Presence is hidden when they have switched it off, never inflated.
-    presence: privacy.showPresence ? 'offline' : 'offline',
+    presence: 'offline',
   };
 };
 
@@ -205,21 +157,21 @@ export const getByHandle = async ({ handle, viewerId }) => {
 };
 
 /**
- * Mention autocomplete. Only people the viewer shares something with, and only
- * those who have not switched off discovery — a search that returns the whole
- * tenant is a user directory.
+ * Mention autocomplete. Never returns someone the viewer is blocked with in
+ * either direction.
  */
 export const search = async ({ q, viewerId, scopeId = null, limit = 10 }) => {
   const { rows } = await pool.query(
-    `SELECT p.user_id, p.handle, u.display_name, u.avatar_url
+    `SELECT p.user_id, p.handle, u.display_name
        FROM profiles p JOIN users u ON u.id = p.user_id
       WHERE u.status = 'active'
+        AND u.deleted_at IS NULL
         AND p.user_id <> $2
-        AND coalesce((p.privacy->>'discoverable')::boolean, true)
+        AND u.tenant_id = (SELECT tenant_id FROM users WHERE id = $2)
         AND (p.handle ILIKE $1 || '%' OR u.display_name ILIKE '%' || $1 || '%')
         AND NOT EXISTS (SELECT 1 FROM blocks b
-                         WHERE (b.user_id = $2 AND b.blocked_user_id = p.user_id)
-                            OR (b.user_id = p.user_id AND b.blocked_user_id = $2))
+                         WHERE (b.user_id = $2 AND b.blocked_id = p.user_id)
+                            OR (b.user_id = p.user_id AND b.blocked_id = $2))
         AND ($3::uuid IS NULL OR EXISTS (
               SELECT 1 FROM space_memberships m
                WHERE m.space_id = $3 AND m.user_id = p.user_id))
@@ -233,7 +185,7 @@ export const search = async ({ q, viewerId, scopeId = null, limit = 10 }) => {
       userId: row.user_id,
       handle: row.handle,
       displayName: row.display_name,
-      avatarUrl: row.avatar_url,
+      avatarUrl: null,
       presence: 'offline',
     })),
   };
@@ -245,34 +197,15 @@ export const search = async ({ q, viewerId, scopeId = null, limit = 10 }) => {
 
 export const createForUser = async ({ userId, displayName }) => {
   const handle = await uniqueHandle(displayName);
-
-  // 009_profiles.sql spreads these across named columns rather than keeping a
-  // `privacy` and a `notifications` blob: visibility and dm_policy carry check
-  // constraints, and a constraint cannot reach inside jsonb. The defaults below
-  // come from the same DEFAULT_PRIVACY object, so there is still one source.
   await pool.query(
-    `INSERT INTO profiles (user_id, handle, visibility, dm_policy, show_presence, show_read_receipts)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (user_id) DO NOTHING`,
-    [
-      userId,
-      handle,
-      DEFAULT_PRIVACY?.visibility ?? 'tenant',
-      // The column's check allows anyone | shared-only | nobody. env.js spells
-      // the middle one 'shared-context', so it is mapped rather than passed on.
-      DEFAULT_PRIVACY?.dmPolicy === 'shared-context'
-        ? 'shared-only'
-        : (DEFAULT_PRIVACY?.dmPolicy ?? 'shared-only'),
-      DEFAULT_PRIVACY?.showPresence ?? true,
-      DEFAULT_PRIVACY?.showReadReceipts ?? true,
-    ],
+    `INSERT INTO profiles (user_id, handle) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING`,
+    [userId, handle],
   );
-
   return getOwn(userId);
 };
 
 const slugifyHandle = (name) =>
-  name
+  String(name ?? '')
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[^a-z0-9_]/g, '')
@@ -280,24 +213,19 @@ const slugifyHandle = (name) =>
 
 const uniqueHandle = async (displayName) => {
   const base = slugifyHandle(displayName);
-
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const candidate = attempt === 0 ? base : `${base}${Math.floor(Math.random() * 9_000) + 1_000}`;
     const { rows } = await pool.query(`SELECT 1 FROM profiles WHERE handle = $1`, [candidate]);
     if (rows.length === 0) return candidate;
   }
-
   return `${base}${Date.now().toString(36)}`;
 };
 
 export const update = async ({ userId, patch }) => {
-  // display_name and avatar live on the user row; the rest on the profile.
-  const userPatch = {};
-  if (patch.displayName !== undefined) userPatch.displayName = patch.displayName;
-
-  if (Object.keys(userPatch).length > 0) {
+  // display_name lives on the user row; the rest on the profile.
+  if (patch.displayName !== undefined) {
     const Users = await import('./User.js');
-    await Users.update({ userId, patch: userPatch });
+    await Users.update({ userId, patch: { displayName: patch.displayName } });
   }
 
   const columns = { handle: 'handle', headline: 'headline', bio: 'bio', links: 'links' };
@@ -315,9 +243,7 @@ export const update = async ({ userId, patch }) => {
       `SELECT 1 FROM profiles WHERE handle = lower($1) AND user_id <> $2`,
       [patch.handle, userId],
     );
-    if (rows.length > 0) {
-      throw Object.assign(new Error('that handle is taken'), { code: 'conflict' });
-    }
+    if (rows.length > 0) throw Object.assign(new Error('that handle is taken'), { code: 'conflict' });
   }
 
   if (sets.length > 0) {
@@ -331,25 +257,43 @@ export const update = async ({ userId, patch }) => {
   return getOwn(userId);
 };
 
-/** Merged rather than replaced, so a client sending one key keeps the rest. */
+/**
+ * Writes the privacy columns. Accepts the contract's names (dmPolicy,
+ * showPresence, sendReadReceipts, visibility) and returns the full privacy
+ * block. "Receive private messages: off" is dmPolicy 'nobody'.
+ */
 export const updatePrivacy = async ({ userId, patch }) => {
-  const { rows } = await pool.query(
-    `UPDATE profiles SET privacy = coalesce(privacy, '{}'::jsonb) || $2::jsonb, updated_at = now()
-      WHERE user_id = $1 RETURNING privacy`,
-    [userId, JSON.stringify(patch)],
-  );
-  return { ...DEFAULT_PRIVACY, ...(rows[0]?.privacy ?? {}) };
+  const sets = [];
+  const params = [];
+  const set = (column, value) => {
+    params.push(value);
+    sets.push(`${column} = $${params.length}`);
+  };
+
+  if (patch.dmPolicy !== undefined) {
+    const policy = TO_DB[patch.dmPolicy];
+    if (!policy) throw Object.assign(new Error('unknown DM setting'), { code: 'validation_failed' });
+    set('dm_policy', policy);
+  }
+  if (patch.visibility !== undefined) set('visibility', patch.visibility === 'shared' ? 'shared-only' : patch.visibility);
+  if (patch.showPresence !== undefined) set('show_presence', Boolean(patch.showPresence));
+  if (patch.sendReadReceipts !== undefined) set('show_read_receipts', Boolean(patch.sendReadReceipts));
+  if (patch.readReceipts !== undefined) set('show_read_receipts', Boolean(patch.readReceipts));
+
+  if (sets.length > 0) {
+    params.push(userId);
+    await pool.query(
+      `UPDATE profiles SET ${sets.join(', ')}, updated_at = now() WHERE user_id = $${params.length}`,
+      params,
+    );
+  }
+
+  const own = await getOwn(userId);
+  return own?.privacy ?? null;
 };
 
-export const updateNotifications = async ({ userId, patch }) => {
-  const { rows } = await pool.query(
-    `UPDATE profiles SET notifications = coalesce(notifications, '{}'::jsonb) || $2::jsonb,
-            updated_at = now()
-      WHERE user_id = $1 RETURNING notifications`,
-    [userId, JSON.stringify(patch)],
-  );
-  return { ...DEFAULT_NOTIFICATIONS, ...(rows[0]?.notifications ?? {}) };
-};
+/** Notification preferences have no storage yet; the defaults are returned unchanged. */
+export const updateNotifications = async () => ({ ...DEFAULT_NOTIFICATIONS });
 
 export const setAvatar = async ({ userId, assetId }) => {
   const { getAssetsForOwner } = await import('../media/UploadService.js');
@@ -360,19 +304,18 @@ export const setAvatar = async ({ userId, assetId }) => {
     throw Object.assign(new Error('that image is still processing'), { code: 'asset_not_ready' });
   }
 
-  const Users = await import('./User.js');
-  await Users.update({ userId, patch: { avatarUrl: asset.assetId } });
+  await pool.query(`UPDATE profiles SET avatar_asset_id = $2, updated_at = now() WHERE user_id = $1`, [userId, assetId]);
   return getOwn(userId);
 };
 
 // ---------------------------------------------------------------------------
-// Blocking
+// Blocking (account-wide; the per-lesson block lives with the room)
 // ---------------------------------------------------------------------------
 
 /**
- * Blocking is mutual in effect: neither can message the other afterwards. It is
- * not symmetric in the list — only the blocker sees it — because telling
- * somebody they have been blocked is how a block becomes an escalation.
+ * Mutual in effect: neither can message the other afterwards. Only the blocker
+ * sees it in a list — telling somebody they have been blocked is how a block
+ * becomes an escalation.
  */
 export const block = async ({ userId, blockedUserId, reason = null }) => {
   if (userId === blockedUserId) {
@@ -380,75 +323,101 @@ export const block = async ({ userId, blockedUserId, reason = null }) => {
   }
 
   await pool.query(
-    `INSERT INTO blocks (user_id, blocked_user_id, reason)
-     VALUES ($1,$2,$3) ON CONFLICT (user_id, blocked_user_id) DO NOTHING`,
+    `INSERT INTO blocks (user_id, blocked_id, reason)
+     VALUES ($1, $2, $3) ON CONFLICT (user_id, blocked_id) DO NOTHING`,
     [userId, blockedUserId, reason],
   );
 
   log.info({ userId, blockedUserId }, 'user blocked');
-  return { blockedUserId, blockedAt: new Date().toISOString() };
+  const { rows } = await pool.query(
+    `SELECT b.blocked_id, b.reason, b.created_at, u.display_name
+       FROM blocks b JOIN users u ON u.id = b.blocked_id
+      WHERE b.user_id = $1 AND b.blocked_id = $2`,
+    [userId, blockedUserId],
+  );
+  return toBlock(rows[0]);
 };
 
 export const unblock = async ({ userId, blockedUserId }) => {
   const { rowCount } = await pool.query(
-    `DELETE FROM blocks WHERE user_id = $1 AND blocked_user_id = $2`,
+    `DELETE FROM blocks WHERE user_id = $1 AND blocked_id = $2`,
     [userId, blockedUserId],
   );
   return rowCount > 0;
 };
 
-export const listBlocks = async ({ userId, cursor, limit = 25 }) => {
+const toBlock = (row) => ({
+  blockedUserId: row.blocked_id,
+  blockedAt: iso(row.created_at),
+  reason: row.reason ?? null,
+  profile: { userId: row.blocked_id, displayName: row.display_name, avatarUrl: null },
+});
+
+export const listBlocks = async ({ userId, cursor = null, limit = 25 }) => {
   const params = [userId];
   let where = 'b.user_id = $1';
 
   if (cursor) {
     const [at, id] = Buffer.from(cursor, 'base64url').toString().split('|');
     params.push(at, id);
-    where += ` AND (b.created_at, b.blocked_user_id) < ($2::timestamptz, $3::uuid)`;
+    where += ` AND (b.created_at, b.blocked_id) < ($2::timestamptz, $3::uuid)`;
   }
   params.push(limit + 1);
 
   const { rows } = await pool.query(
-    `SELECT b.*, u.display_name, u.avatar_url
-       FROM blocks b JOIN users u ON u.id = b.blocked_user_id
-      WHERE ${where} ORDER BY b.created_at DESC LIMIT $${params.length}`,
+    `SELECT b.blocked_id, b.reason, b.created_at, u.display_name
+       FROM blocks b JOIN users u ON u.id = b.blocked_id
+      WHERE ${where} ORDER BY b.created_at DESC, b.blocked_id DESC LIMIT $${params.length}`,
     params,
   );
 
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit);
+  const last = page.at(-1);
 
   return {
-    items: page.map((row) => ({
-      blockedUserId: row.blocked_user_id,
-      blockedAt: row.created_at.toISOString(),
-      reason: row.reason,
-      profile: {
-        userId: row.blocked_user_id,
-        displayName: row.display_name,
-        avatarUrl: row.avatar_url,
-      },
-    })),
+    items: page.map(toBlock),
     hasMore,
-    nextCursor: hasMore && page.at(-1)
-      ? Buffer.from(`${page.at(-1).created_at.toISOString()}|${page.at(-1).blocked_user_id}`).toString('base64url')
-      : null,
+    nextCursor:
+      hasMore && last
+        ? Buffer.from(`${new Date(last.created_at).toISOString()}|${last.blocked_id}`).toString('base64url')
+        : null,
   };
 };
 
-/** The check every send path calls. One query, either direction. */
+/** The check a send path can call. One query, either direction. */
 export const isBlockedEitherWay = async ({ a, b }) => {
   const { rows } = await pool.query(
     `SELECT 1 FROM blocks
-      WHERE (user_id = $1 AND blocked_user_id = $2)
-         OR (user_id = $2 AND blocked_user_id = $1) LIMIT 1`,
+      WHERE (user_id = $1 AND blocked_id = $2)
+         OR (user_id = $2 AND blocked_id = $1) LIMIT 1`,
     [a, b],
   );
   return rows.length > 0;
 };
 
+/**
+ * The v6 pure rule, kept for callers that still import it. The rule that is
+ * actually enforced is ConversationService.canMessage.
+ */
+export const canMessage = ({
+  viewerId,
+  targetId,
+  dmPolicy = 'shared-context',
+  blockedEitherWay = false,
+  sharedContext = false,
+  viewerIsModerator = false,
+}) => {
+  if (viewerId === targetId) return { allowed: false, reason: 'self' };
+  if (blockedEitherWay) return { allowed: false, reason: 'blocked' };
+  if (viewerIsModerator) return { allowed: true, reason: 'moderator' };
+  if (dmPolicy === 'nobody') return { allowed: false, reason: 'dm_not_allowed' };
+  if (dmPolicy === 'anyone') return { allowed: true };
+  return sharedContext ? { allowed: true } : { allowed: false, reason: 'no_shared_context' };
+};
+
 export default {
-  getOwn, getPublic, getByHandle, search, createForUser, update,
+  canMessage, getOwn, getPublic, getByHandle, search, createForUser, update,
   updatePrivacy, updateNotifications, setAvatar, block, unblock,
-  listBlocks, isBlockedEitherWay, canMessage,
+  listBlocks, isBlockedEitherWay,
 };

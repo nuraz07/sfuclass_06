@@ -2,16 +2,27 @@
 /**
  * Conversations  (F6)
  *
- * The Message action on a profile card resolves here, and `openDirect` is the
- * function the whole feature hangs on. It is idempotent: it returns the existing
- * conversation or creates one. There is no separate "new message" flow, which
- * is what stops the two drifting apart.
+ * Opening a private chat resolves here. `openDirect` is idempotent: it returns
+ * the existing conversation or creates one, and the database's unique key on
+ * the participant pair settles two clicks at the same moment.
  *
  * Before it creates anything it answers a question only the server can answer:
- * may these two people talk? That needs the target's DM policy, both block
- * lists, and whether they share a course or space. A client can see none of
- * that, which is why `canMessage` on a PublicProfile is computed server-side and
- * why this check is repeated here rather than trusted from the request.
+ * may these two people talk? That needs the target's DM setting, both block
+ * lists, the sender's role and whether they share a course, a space or the
+ * live room they are in right now.
+ *
+ * The rules (canMessage):
+ *
+ *   blocked either way      no — outranks everything, teachers included
+ *   sender is a teacher     yes — a course must be able to reach its people,
+ *   or owner                even someone who switched private messages off
+ *   DM setting 'anyone'     yes
+ *   DM setting 'nobody'     no  ("receive private messages: off")
+ *   DM setting 'shared'     yes when they share a course, a space, or the
+ *   (the default)           live room the request came from
+ *
+ * Per-person state — mute with an end time, "deleted for me" — is written
+ * here through Participant, never shared between the two sides.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -26,66 +37,134 @@ import * as Block from './models/Block.js';
 const log = logger.child({ component: 'conversations' });
 
 const MAX_GROUP = 50;
+const TEACHING_ROLES = new Set(['teacher', 'owner']);
+
+/** The contract says 'shared-context', the table says 'shared-only'. Same setting. */
+export const toDbPolicy = (policy) =>
+  policy === 'shared-context' || policy === 'shared' ? 'shared-only' : policy;
+
+// ---------------------------------------------------------------------------
+// Shared context
+// ---------------------------------------------------------------------------
+
+/** A course or a space in common. Missing tables in a partial schema count as "no". */
+const sharesCourseOrSpace = async (userA, userB) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM (
+         SELECT course_id AS id FROM enrollments WHERE user_id = $1 AND status = 'active'
+         INTERSECT
+         SELECT course_id AS id FROM enrollments WHERE user_id = $2 AND status = 'active'
+         UNION ALL
+         SELECT space_id AS id FROM space_memberships WHERE user_id = $1
+         INTERSECT
+         SELECT space_id AS id FROM space_memberships WHERE user_id = $2
+       ) shared LIMIT 1`,
+      [userA, userB],
+    );
+    return rows.length > 0;
+  } catch (cause) {
+    log.warn({ err: cause }, 'shared-context lookup failed; treating as no shared context');
+    return false;
+  }
+};
+
+/**
+ * Both are in the same live room right now. Rooms live in the SFU process;
+ * in development that is this process. Where it is not, the answer is "no" and
+ * the course/space rule still applies.
+ */
+const sharesLiveRoom = async (userA, userB, roomId) => {
+  if (!roomId) return false;
+  try {
+    const RoomManager = await import('../classroom/RoomManager.js');
+    const room = RoomManager.getRoom(roomId);
+    return Boolean(room?.findPeerByUser?.(userA) && room?.findPeerByUser?.(userB));
+  } catch {
+    return false;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Permission
 // ---------------------------------------------------------------------------
 
-/** Do these two share a course or a space? The 'shared-context' policy. */
-const sharesContext = async (userA, userB) => {
+/**
+ * The single source of truth for "may A message B". Used here, and by
+ * profile.routes to fill `canMessage`, so the button and the send agree.
+ *
+ * @returns {Promise<{ allowed: boolean, code?: string, reason?: string }>}
+ */
+export const canMessage = async ({ fromUserId, toUserId, roomId = null }) => {
+  if (!fromUserId || !toUserId || fromUserId === toUserId) {
+    return { allowed: false, code: 'validation_failed', reason: 'You cannot message yourself.' };
+  }
+
+  const { blocked } = await Block.areBlocked(fromUserId, toUserId);
+  if (blocked) {
+    // Same answer whichever direction the block runs: telling someone they
+    // have been blocked is information the blocker did not choose to share.
+    return { allowed: false, code: 'blocked_by_user', reason: 'You cannot message this person.' };
+  }
+
   const { rows } = await pool.query(
-    `SELECT 1 FROM (
-       SELECT course_id AS id FROM enrollments WHERE user_id = $1 AND status = 'active'
-       INTERSECT
-       SELECT course_id AS id FROM enrollments WHERE user_id = $2 AND status = 'active'
-       UNION
-       SELECT space_id AS id FROM space_memberships WHERE user_id = $1
-       INTERSECT
-       SELECT space_id AS id FROM space_memberships WHERE user_id = $2
-     ) shared LIMIT 1`,
-    [userA, userB],
+    `SELECT u.id, u.tenant_id, u.role, p.dm_policy
+       FROM users u
+       LEFT JOIN profiles p ON p.user_id = u.id
+      WHERE u.id = ANY($1::uuid[]) AND u.deleted_at IS NULL`,
+    [[fromUserId, toUserId]],
   );
-  return rows.length > 0;
+  const sender = rows.find((row) => row.id === fromUserId);
+  const target = rows.find((row) => row.id === toUserId);
+
+  if (!sender || !target || sender.tenant_id !== target.tenant_id) {
+    return { allowed: false, code: 'not_found', reason: 'This person could not be found.' };
+  }
+
+  if (TEACHING_ROLES.has(sender.role)) return { allowed: true, reason: 'teacher' };
+
+  const policy = target.dm_policy ?? toDbPolicy(env.CHAT_DEFAULT_DM_POLICY ?? 'shared-only');
+
+  if (policy === 'anyone') return { allowed: true };
+  if (policy === 'nobody') {
+    return { allowed: false, code: 'dm_not_allowed', reason: 'This person does not accept private messages.' };
+  }
+
+  if ((await sharesLiveRoom(fromUserId, toUserId, roomId)) || (await sharesCourseOrSpace(fromUserId, toUserId))) {
+    return { allowed: true };
+  }
+  return {
+    allowed: false,
+    code: 'dm_not_allowed',
+    reason: 'This person only accepts private messages from people they share a course or lesson with.',
+  };
 };
 
-/**
- * The single source of truth for "may A message B". Used by this service and
- * by profileApi to fill `canMessage`, so the button and the send agree.
- */
-export const canMessage = async ({ fromUserId, toUserId }) => {
-  if (fromUserId === toUserId) {
-    return { allowed: false, code: 'validation_failed', reason: 'cannot message yourself' };
-  }
+// ---------------------------------------------------------------------------
+// Shaping
+// ---------------------------------------------------------------------------
 
-  const { blocked, by } = await Block.areBlocked(fromUserId, toUserId);
-  if (blocked) {
-    // Same answer whichever direction the block runs. Distinguishing them
-    // would tell someone they have been blocked, which is information the
-    // blocker did not choose to share.
-    return { allowed: false, code: 'blocked_by_user', blockedBy: by };
-  }
+/** One conversation as `viewerId` sees it: their mute, their unread count, their preview. */
+const hydrate = async ({ row, viewerId, created = false }) => {
+  const participants = await Participant.listForConversation(row.conversation_id);
+  const viewer = participants.find((participant) => participant.user_id === viewerId) ?? row;
 
-  const { rows } = await pool.query(
-    `SELECT coalesce(privacy->>'dmPolicy', $2) AS policy, role
-       FROM profiles WHERE user_id = $1`,
-    [toUserId, env.CHAT_DEFAULT_DM_POLICY],
-  );
+  return {
+    ...Conversation.toConversation(row, {
+      participants: participants.map(Participant.toParticipant),
+      muted: Participant.isMutedNow(viewer),
+      mutedUntil: Participant.isMutedNow(viewer) ? viewer.muted_until ?? null : null,
+      unreadCount: Number(row.unread_count ?? 0),
+      lastMessagePreview: row.last_message_preview ?? null,
+    }),
+    created,
+  };
+};
 
-  const target = rows[0];
-  if (!target) return { allowed: false, code: 'not_found' };
-
-  switch (target.policy) {
-    case 'anyone':
-      return { allowed: true };
-    case 'nobody':
-      // Teachers can still reach a learner who has closed their inbox; a
-      // learner cannot be unreachable to the person teaching them.
-      return { allowed: false, code: 'dm_not_allowed' };
-    default:
-      return (await sharesContext(fromUserId, toUserId))
-        ? { allowed: true }
-        : { allowed: false, code: 'dm_not_allowed', reason: 'you share no course or space' };
-  }
+/** The viewer's own row for one conversation (unread, preview), hidden or not. */
+const rowFor = async ({ conversationId, userId }) => {
+  const page = await Conversation.listForUser({ userId, conversationId, limit: 1 });
+  return page.rows[0] ?? null;
 };
 
 // ---------------------------------------------------------------------------
@@ -93,141 +172,163 @@ export const canMessage = async ({ fromUserId, toUserId }) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Idempotent. Two taps on the Message button produce one conversation, and so
- * do two devices asking at the same moment — the unique index on the direct
- * participant pair is what settles the race, and the retry below reads the
- * winner rather than failing.
+ * Idempotent. The person who opens the chat sees it immediately; the other
+ * person sees it once the first message arrives (Conversation.create hides it
+ * for them, Conversation.touch reveals it).
+ *
+ * Reopening a chat you deleted brings it back into your list with history
+ * still starting where you deleted it.
  */
-export const openDirect = async ({ fromUserId, toUserId, tenantId }) => {
-  const existing = await Conversation.findDirectBetween(fromUserId, toUserId);
+export const openDirect = async ({ fromUserId, toUserId, tenantId, roomId = null }) => {
+  const existing = await Conversation.findDirectBetween({ tenantId, userA: fromUserId, userB: toUserId });
   if (existing) {
-    return hydrate({ row: existing, viewerId: fromUserId });
+    await Participant.reveal({ conversationId: existing.conversation_id, userId: fromUserId });
+    const row = await rowFor({ conversationId: existing.conversation_id, userId: fromUserId });
+    return hydrate({ row: row ?? existing, viewerId: fromUserId });
   }
 
-  const permission = await canMessage({ fromUserId, toUserId });
+  const permission = await canMessage({ fromUserId, toUserId, roomId });
   if (!permission.allowed) {
-    throw new ApiError(permission.code, {
+    throw new ApiError(permission.code ?? 'forbidden', {
       detail: permission.reason ?? 'You cannot message this person.',
     });
   }
 
   try {
-    const row = await Conversation.create({
+    const created = await Conversation.create({
       conversationId: randomUUID(),
       tenantId,
       kind: 'direct',
       createdBy: fromUserId,
       participantIds: [fromUserId, toUserId],
+      hiddenFor: [toUserId],
     });
 
-    log.info({ conversationId: row.conversation_id }, 'direct conversation opened');
-    return hydrate({ row, viewerId: fromUserId, created: true });
+    log.info({ conversationId: created.conversation_id }, 'direct conversation opened');
+    const row = await rowFor({ conversationId: created.conversation_id, userId: fromUserId });
+    const conversation = await hydrate({ row: row ?? created, viewerId: fromUserId, created: true });
+
+    // The opener's other tabs and devices add it to their list too.
+    const { notifyConversationCreated } = await import('./chatGateway.js');
+    notifyConversationCreated({ conversation, userIds: [fromUserId] });
+
+    return conversation;
   } catch (cause) {
-    // Unique violation: someone else created it a millisecond ago. Theirs is
-    // as good as ours.
+    // Unique violation on the participant pair: the other person opened it a
+    // moment ago. Theirs is as good as ours.
     if (cause?.code === '23505') {
-      const raced = await Conversation.findDirectBetween(fromUserId, toUserId);
-      if (raced) return hydrate({ row: raced, viewerId: fromUserId });
+      const raced = await Conversation.findDirectBetween({ tenantId, userA: fromUserId, userB: toUserId });
+      if (raced) {
+        await Participant.reveal({ conversationId: raced.conversation_id, userId: fromUserId });
+        const row = await rowFor({ conversationId: raced.conversation_id, userId: fromUserId });
+        return hydrate({ row: row ?? raced, viewerId: fromUserId });
+      }
     }
     throw cause;
   }
 };
 
-export const createGroup = async ({ createdBy, participantIds, title, tenantId }) => {
+export const createGroup = async ({ createdBy, participantIds, title = null, tenantId }) => {
   const unique = [...new Set([createdBy, ...participantIds])];
 
   if (unique.length < 3) {
     throw new ApiError('validation_failed', {
-      detail: 'A group needs at least three people. Use a direct message for two.',
+      detail: 'A group needs at least three people. Use a private message for two.',
     });
   }
   if (unique.length > MAX_GROUP) {
     throw new ApiError('validation_failed', { detail: `A group holds at most ${MAX_GROUP} people.` });
   }
 
-  // Everyone has to be reachable. Adding someone who has blocked the creator
-  // would put them in a room with them, which blocking is meant to prevent.
   for (const userId of unique) {
     if (userId === createdBy) continue;
     const permission = await canMessage({ fromUserId: createdBy, toUserId: userId });
     if (!permission.allowed) {
-      throw new ApiError(permission.code, {
+      throw new ApiError(permission.code ?? 'forbidden', {
         detail: 'One of the people you selected cannot be added.',
       });
     }
   }
 
-  const row = await Conversation.create({
+  const created = await Conversation.create({
     conversationId: randomUUID(),
     tenantId,
     kind: 'group',
-    title: title ?? null,
+    title,
     createdBy,
     participantIds: unique,
   });
 
-  return hydrate({ row, viewerId: createdBy, created: true });
+  const row = await rowFor({ conversationId: created.conversation_id, userId: createdBy });
+  return hydrate({ row: row ?? created, viewerId: createdBy, created: true });
 };
 
 // ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
 
-const hydrate = async ({ row, viewerId, created = false }) => {
-  const participants = await Participant.listForConversation(row.conversation_id);
-  const viewer = participants.find((participant) => participant.user_id === viewerId);
-
-  return {
-    ...Conversation.toConversation(row, {
-      participants: participants.map(Participant.toParticipant),
-      muted: viewer?.muted ?? false,
-      unreadCount: Number(row.unread_count ?? 0),
-    }),
-    created,
-  };
-};
-
-export const getById = async ({ conversationId, viewerId }) => {
-  const row = await Conversation.findById(conversationId);
-  if (!row) throw new ApiError('not_found', { detail: 'Conversation not found.' });
-
-  if (!(await Participant.isParticipant({ conversationId, userId: viewerId }))) {
+export const assertParticipant = async ({ conversationId, userId }) => {
+  if (!(await Participant.isParticipant({ conversationId, userId }))) {
     // 404, not 403: whether a conversation exists is not the caller's business.
     throw new ApiError('not_found', { detail: 'Conversation not found.' });
   }
+};
 
+export const getById = async ({ conversationId, viewerId }) => {
+  await assertParticipant({ conversationId, userId: viewerId });
+  const row = await rowFor({ conversationId, userId: viewerId });
+  if (!row) throw new ApiError('not_found', { detail: 'Conversation not found.' });
   return hydrate({ row, viewerId });
 };
 
-export const list = async ({ userId, cursor, limit, archived }) => {
-  const page = await Conversation.listForUser({ userId, cursor, limit, archived });
-
-  const items = await Promise.all(
-    page.rows.map(async (row) => {
-      const participants = await Participant.listForConversation(row.conversation_id);
-      return Conversation.toConversation(row, {
-        participants: participants.map(Participant.toParticipant),
-        unreadCount: Number(row.unread_count ?? 0),
-        muted: row.muted ?? false,
-      });
-    }),
-  );
-
+/** The viewer's visible conversations, newest activity first. */
+export const list = async ({ userId, cursor = null, limit = 25 }) => {
+  const page = await Conversation.listForUser({ userId, cursor, limit });
+  const items = await Promise.all(page.rows.map((row) => hydrate({ row, viewerId: userId })));
   return { items, nextCursor: page.nextCursor, hasMore: page.hasMore };
 };
 
 // ---------------------------------------------------------------------------
-// Membership
+// Per-person state
 // ---------------------------------------------------------------------------
 
+/**
+ * Mute for a while or until turned back on. `until` must lie in the future;
+ * `muted: false` ends any mute.
+ */
+export const setMuted = async ({ conversationId, userId, muted, until = null }) => {
+  await assertParticipant({ conversationId, userId });
+
+  if (muted && until && new Date(until).getTime() <= Date.now()) {
+    throw new ApiError('validation_failed', { detail: 'A mute has to end in the future.' });
+  }
+
+  await Participant.setMuted({ conversationId, userId, muted: Boolean(muted), until: muted ? until : null });
+  return getById({ conversationId, viewerId: userId });
+};
+
+/**
+ * "Delete for me". Only this person's view changes: the thread leaves their
+ * list and their history restarts now. The other side keeps everything, and a
+ * new message brings the thread back for this person without the old ones.
+ */
+export const deleteForMe = async ({ conversationId, userId }) => {
+  await assertParticipant({ conversationId, userId });
+  await Participant.hide({ conversationId, userId });
+
+  const { clear } = await import('./UnreadService.js');
+  await clear({ userId, target: { kind: 'conversation', conversationId } }).catch(() => undefined);
+
+  return { conversationId, deleted: true };
+};
+
+/** Leaving a group removes you; "leaving" a direct chat is deleting it for yourself. */
 export const leave = async ({ conversationId, userId }) => {
   const row = await Conversation.findById(conversationId);
   if (!row) return false;
 
   if (row.kind === 'direct') {
-    // Leaving a DM is archiving it. Removing yourself would orphan the thread
-    // and make the other person's history unreachable.
-    await Conversation.setArchived(conversationId, true);
+    await deleteForMe({ conversationId, userId });
     return true;
   }
 
@@ -235,16 +336,29 @@ export const leave = async ({ conversationId, userId }) => {
   return true;
 };
 
-export const setMuted = ({ conversationId, userId, muted }) =>
-  Participant.setMuted({ conversationId, userId, muted });
+// ---------------------------------------------------------------------------
+// Live list updates
+// ---------------------------------------------------------------------------
 
-export const setArchived = ({ conversationId, archived }) =>
-  Conversation.setArchived(conversationId, archived);
+/**
+ * A message landed in a conversation. Every participant's list gets the
+ * updated row — their own unread count, their own preview — on their personal
+ * socket room, so a thread appears and a badge moves without a reload.
+ */
+export const announceActivity = async ({ conversationId }) => {
+  const { notifyConversationUpdated } = await import('./chatGateway.js');
+  const participants = await Participant.listForConversation(conversationId);
 
-export const assertParticipant = async ({ conversationId, userId }) => {
-  if (!(await Participant.isParticipant({ conversationId, userId }))) {
-    throw new ApiError('forbidden', { detail: 'You are not in this conversation.' });
-  }
+  await Promise.all(
+    participants.map(async ({ user_id: userId }) => {
+      const row = await rowFor({ conversationId, userId });
+      if (!row || row.hidden_at) return;
+      notifyConversationUpdated({ userId, conversation: await hydrate({ row, viewerId: userId }) });
+    }),
+  );
 };
 
-export default { openDirect, createGroup, getById, list, canMessage, leave };
+export default {
+  canMessage, openDirect, createGroup, getById, list, setMuted, deleteForMe, leave,
+  assertParticipant, announceActivity, toDbPolicy,
+};
