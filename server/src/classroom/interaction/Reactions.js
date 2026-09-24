@@ -50,6 +50,12 @@ const withinLimit = (roomId, peerId) => {
  * @returns {{ ok: true } | { ok: false, code: string, retryAfterSec?: number }}
  */
 export const send = (room, peer, emoji) => {
+  // Switched off by the host: everyone else is refused here, whatever the
+  // client shows. The host can still react.
+  if (room.settings?.reactionsEnabled === false && !peer.isHost) {
+    return { ok: false, code: 'reactions_disabled', reason: 'The host has switched reactions off.' };
+  }
+
   if (!ALLOWED.includes(emoji)) {
     return { ok: false, code: 'validation_failed', reason: 'unsupported reaction' };
   }

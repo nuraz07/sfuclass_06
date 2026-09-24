@@ -107,6 +107,7 @@ const HANDLERS = [
   { event: CLIENT.react, cost: 1, handler: onReact },
   { event: CLIENT.hostAction, cost: 3, roles: MODERATORS, handler: onHostAction },
   { event: CLIENT.breakout, cost: 5, roles: MODERATORS, handler: onBreakout },
+  { event: CLIENT.roomSettings, cost: 2, roles: ['host'], handler: onRoomSettings },
 ];
 
 /**
@@ -711,8 +712,8 @@ async function onReact(_ctx, payload, session) {
     fail(result.code ?? 'rate_limited', result.reason ?? 'Slow down on the reactions');
   }
 
-  // Ephemeral by design: the burst is broadcast and never written to history.
-  session.room.broadcast(SERVER.reaction, { peerId: session.peer.id, emoji: payload.emoji });
+  // Reactions.send has broadcast it already; a second broadcast showed every
+  // reaction twice.
   return { sent: true };
 }
 
@@ -797,6 +798,23 @@ async function onBreakout(_ctx, payload, session) {
     default:
       return fail('invalid_payload', `Unknown breakout action: ${payload.action}`);
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Room settings (host)
+ * ------------------------------------------------------------------ */
+
+/** { reactionsEnabled: boolean }. ModerationControls broadcasts the change. */
+async function onRoomSettings(_ctx, payload, session) {
+  if (typeof payload.reactionsEnabled !== 'boolean') {
+    fail('invalid_payload', 'reactionsEnabled must be true or false');
+  }
+  const reactionsEnabled = ModerationControls.setReactionsEnabled(
+    session.room,
+    session.peer,
+    payload.reactionsEnabled,
+  );
+  return { reactionsEnabled };
 }
 
 export default registerSocketHandlers;

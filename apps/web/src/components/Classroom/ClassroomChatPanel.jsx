@@ -1,58 +1,39 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { createChatApi, useChat, useCore } from '@classroom/core-client';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  createChatApi,
+  createProfileApi,
+  titleOf,
+  useConversations,
+  useCore,
+} from '@classroom/core-client';
 
 import ParticipantList from './ParticipantList.jsx';
+import ChatRooms, { useSessionBlocks } from '../Chat/ChatRooms.jsx';
+import '../Chat/chatRooms.css';
 
 /**
- * Chat inside a lesson  (F1, F6)
+ * The sidebar of a lesson  (F1, F6)
  *
- * Three tabs over one sidebar: who is here, the room's own channel, and a
- * direct message with one of them.
+ * Two tabs, and only two:
  *
- * ChatDock is deliberately not reused. It is a floating panel built for the app
- * shell, and it is hidden inside a lesson on purpose — two chats competing for
- * the same screen while someone is teaching is one too many. This is the same
- * data in a layout that fits beside a video grid.
+ *   People   who is here. Clicking a person opens a small dialog —
+ *            "Send a private message?" and "Block for this lesson" — instead
+ *            of opening a chat straight away.
+ *   Rooms    the default chatroom and every private chat, one under the other
+ *            (ChatRooms). A chat opens when its row is clicked, nowhere else.
  *
- * The DM is opened from the participant list rather than from a separate "new
- * message" flow, which is the same rule the rest of the product follows:
- * clicking a person is how a conversation starts, everywhere.
+ * A private chat is created only after the confirmation in the dialog, and
+ * appears in Rooms under the default chatroom. The other person sees it once
+ * the first message arrives — with a badge on the Rooms tab and a short notice
+ * at the top, so nobody has to click the sender to find out they were written
+ * to. Muted chats count neither in the badge nor in the notice.
  */
-export default function ClassroomChatPanel({
-  roomId,
-  peers,
-  selfPeerId,
-  canModerate,
-  onHostAction,
-}) {
+export default function ClassroomChatPanel({ roomId, peers, selfPeerId, canModerate, onHostAction }) {
   const { http, chatSocket, session } = useCore();
-  const [tab, setTab] = useState('people');
-  /** { conversationId, displayName } while a DM is open. */
-  const [dm, setDm] = useState(null);
-  const [roomChannelId, setRoomChannelId] = useState(null);
-  const [roomChannelError, setRoomChannelError] = useState(false);
-  const [roomChannelRetry, setRoomChannelRetry] = useState(0);
 
-  // One instance for the life of the panel; a new one per render would reset
-  // every request the hook has in flight.
+  // One instance each for the life of the panel.
   const api = useMemo(() => createChatApi(http), [http]);
-
-  // Resolved once when the tab is first opened, not on mount: somebody who
-  // never opens the chat should not create a channel by arriving.
-  // Channels are provisioned server-side — SpaceService creates them when a
-  // course is published — so this finds one rather than creating it. The
-  // tenant's public channel is the honest fallback for a room that has no
-  // course behind it yet.
-  useEffect(() => {
-    if (tab !== 'room' || roomChannelId) return;
-    setRoomChannelError(false);
-    void api
-      .listChannels({ scope: 'public' })
-      .then((result) => {
-        setRoomChannelId(result.items[0]?.channelId ?? null);
-      })
-      .catch(() => setRoomChannelError(true));
-  }, [api, tab, roomChannelId, roomChannelRetry]);
+  const profiles = useMemo(() => createProfileApi(http), [http]);
 
   const self = useMemo(
     () => ({
@@ -60,32 +41,39 @@ export default function ClassroomChatPanel({
       displayName: session?.displayName ?? 'You',
       avatarUrl: session?.avatarUrl ?? null,
     }),
-    [session]
+    [session],
   );
 
-  const openDirectMessage = useCallback(
-    async (peer) => {
-      try {
-        // Idempotent on the server: it returns the existing conversation or
-        // creates one. There is no second code path for "first message".
-        const conversation = await http.post('/messaging/conversations/direct', {
-          userId: peer.user.userId,
-        });
-        setDm({
-          conversationId: conversation.conversationId ?? conversation.id,
-          displayName: peer.user.displayName,
-        });
-        setTab('direct');
-      } catch {
-        // Blocked, or DM policy forbids it. The server decides; saying so
-        // without detail is deliberate — "this person blocked you" is not
-        // information they agreed to share.
-        setDm({ conversationId: null, displayName: peer.user.displayName });
-        setTab('direct');
-      }
+  const [tab, setTab] = useState('people');
+  const [view, setView] = useState({ type: 'list' });
+  const [person, setPerson] = useState(null);
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+
+  const onIncoming = useCallback(
+    (conversation) => {
+      setToast({ conversationId: conversation.conversationId, title: titleOf(conversation, self.userId) });
+      window.clearTimeout(toastTimer.current);
+      toastTimer.current = window.setTimeout(() => setToast(null), 8_000);
     },
-    [http]
+    [self.userId],
   );
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+
+  const rooms = useConversations({
+    api,
+    socket: chatSocket ?? undefined,
+    selfUserId: self.userId,
+    enabled: Boolean(self.userId),
+    onIncoming,
+  });
+  const sessionBlocks = useSessionBlocks({ api, roomId });
+
+  const showConversation = useCallback((conversationId) => {
+    setTab('rooms');
+    setView({ type: 'conversation', id: conversationId });
+    setToast(null);
+  }, []);
 
   return (
     <aside className="panel">
@@ -103,25 +91,25 @@ export default function ClassroomChatPanel({
         <button
           type="button"
           role="tab"
-          aria-selected={tab === 'room'}
-          className={tab === 'room' ? 'panel__tab is-active' : 'panel__tab'}
-          onClick={() => setTab('room')}
+          aria-selected={tab === 'rooms'}
+          className={tab === 'rooms' ? 'panel__tab is-active' : 'panel__tab'}
+          onClick={() => setTab('rooms')}
         >
-          Room
+          Rooms
+          {rooms.unreadTotal > 0 ? (
+            <span className="rooms-badge" aria-label={`${rooms.unreadTotal} unread`}>
+              {rooms.unreadTotal > 99 ? '99+' : rooms.unreadTotal}
+            </span>
+          ) : null}
         </button>
-
-        {dm && (
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === 'direct'}
-            className={tab === 'direct' ? 'panel__tab is-active' : 'panel__tab'}
-            onClick={() => setTab('direct')}
-          >
-            {dm.displayName.split(' ')[0]}
-          </button>
-        )}
       </nav>
+
+      {toast && !(tab === 'rooms' && view.type === 'conversation' && view.id === toast.conversationId) ? (
+        <button type="button" className="rooms-toast" onClick={() => showConversation(toast.conversationId)}>
+          <span className="rooms-toast__text">New message from {toast.title}</span>
+          <span aria-hidden="true">Open</span>
+        </button>
+      ) : null}
 
       {tab === 'people' && (
         <ParticipantList
@@ -129,181 +117,153 @@ export default function ClassroomChatPanel({
           selfPeerId={selfPeerId}
           canModerate={canModerate}
           onHostAction={onHostAction}
-          onMessage={openDirectMessage}
+          onMessage={(peer) => setPerson(peer)}
         />
       )}
 
-      {/*
-        Keyed so switching target tears the hook down and rebuilds it. Without a
-        key, React reuses the instance and the new target inherits the old
-        thread's messages for a frame.
-      */}
-      {/*
-        A channel, not `{ kind: 'room' }`. The socket gateway routes a room
-        target, but messaging.routes.js exposes no HTTP endpoint for one — and
-        the first page of history always comes over HTTP. A course-scoped
-        channel is the same thing with a persistence story the rest of the
-        messaging domain already understands.
-      */}
-      {tab === 'room' && roomChannelId && (
-        <ChatThread
-          key={`ch:${roomChannelId}`}
+      {tab === 'rooms' && (
+        <ChatRooms
+          rooms={rooms}
+          view={view}
+          onViewChange={setView}
           api={api}
           socket={chatSocket}
           self={self}
-          target={{ kind: 'channel', channelId: roomChannelId }}
-          placeholder="Message everyone in this lesson"
-          emptyText="Nothing here yet. Whatever is written stays with the lesson."
+          roomId={roomId}
+          sessionBlocks={sessionBlocks}
         />
       )}
 
-      {tab === 'room' && !roomChannelId && (
-        roomChannelError ? (
-          <div className="panel__notice">
-            <p>Unable to open the lesson chat.</p>
-            <button
-              type="button"
-              className="btn btn--tiny"
-              onClick={() => {
-                setRoomChannelError(false);
-                setRoomChannelRetry((value) => value + 1);
-              }}
-            >
-              Try again
-            </button>
-          </div>
-        ) : (
-          <p className="panel__notice">Opening the lesson channel…</p>
-        )
-      )}
-
-      {tab === 'direct' &&
-        (dm?.conversationId ? (
-          <ChatThread
-            key={`dm:${dm.conversationId}`}
-            api={api}
-            socket={chatSocket}
-            self={self}
-            target={{ kind: 'conversation', conversationId: dm.conversationId }}
-            placeholder={`Message ${dm.displayName}`}
-            emptyText={`This is the start of your conversation with ${dm.displayName}.`}
-          />
-        ) : (
-          <p className="panel__notice">
-            You cannot message {dm?.displayName} right now.
-          </p>
-        ))}
+      {person ? (
+        <PersonDialog
+          peer={person}
+          roomId={roomId}
+          profiles={profiles}
+          rooms={rooms}
+          sessionBlocks={sessionBlocks}
+          onClose={() => setPerson(null)}
+          onOpened={(conversation) => {
+            setPerson(null);
+            showConversation(conversation.conversationId);
+          }}
+        />
+      ) : null}
     </aside>
   );
 }
 
 /**
- * One thread, whichever target it is pointed at. A direct message and a room
- * channel differ only in what they are addressed to, so they differ only in
- * the `target` prop here.
+ * What clicking a person offers. Nothing is created until the person confirms:
+ * "Send a private message" opens (or reopens) the chat and shows it in Rooms.
+ * Whether writing is allowed comes from the server, with the same rule the send
+ * path enforces, so a button that is on here does not fail afterwards.
  */
-function ChatThread({ api, socket, self, target, placeholder, emptyText }) {
-  const [draft, setDraft] = useState('');
+function PersonDialog({ peer, roomId, profiles, rooms, sessionBlocks, onClose, onOpened }) {
+  const dialogRef = useRef(null);
+  const name = peer.user?.displayName ?? 'this person';
+  const userId = peer.user?.userId;
 
-  const {
-    messages,
-    loading,
-    hasMore,
-    loadOlder,
-    typingUserIds,
-    throttledUntil,
-    send,
-    retry,
-    setTyping,
-  } = useChat({ api, socket: socket ?? undefined, target, self });
+  const [profile, setProfile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState(null);
 
-  const throttled = throttledUntil !== null && throttledUntil > Date.now();
+  const blockedHere = sessionBlocks.enabled && sessionBlocks.blocked.has(userId);
 
-  const submit = async (event) => {
-    event.preventDefault();
-    const body = draft.trim();
-    if (!body || throttled) return;
-    setDraft('');
-    setTyping(false);
-    await send({ body });
+  useEffect(() => {
+    const el = dialogRef.current;
+    if (el && !el.open) el.showModal();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    profiles
+      .get(userId, { roomId })
+      .then((result) => !cancelled && setProfile(result))
+      .catch(() => !cancelled && setProfile({ canMessage: true, cannotMessageReason: null }));
+    return () => {
+      cancelled = true;
+    };
+  }, [profiles, userId, roomId, blockedHere]);
+
+  const act = async (fn) => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await fn();
+    } catch (cause) {
+      setMessage(cause?.detail ?? cause?.message ?? 'That did not work. Try again.');
+    } finally {
+      setBusy(false);
+    }
   };
 
+  const openChat = () =>
+    act(async () => {
+      const conversation = await rooms.open(userId, { roomId });
+      onOpened(conversation);
+    });
+
+  const canMessage = profile ? profile.canMessage && !blockedHere : false;
+
   return (
-    <div className="thread">
-      <div className="thread__messages">
-        {hasMore && (
-          <button type="button" className="btn btn--tiny" onClick={() => loadOlder()}>
-            Load earlier messages
+    <dialog
+      ref={dialogRef}
+      className="person-dialog"
+      aria-label={name}
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    >
+      <div className="person-dialog__body">
+        <h2 className="person-dialog__title">{name}</h2>
+
+        {!profile ? <p className="person-dialog__hint">Checking…</p> : null}
+
+        {profile ? (
+          <p className="person-dialog__hint">
+            {blockedHere
+              ? `You blocked ${name} for this lesson.`
+              : canMessage
+                ? `Send ${name} a private message? The chat appears under Rooms.`
+                : (profile.cannotMessageReason ?? `${name} is not accepting private messages.`)}
+          </p>
+        ) : null}
+
+        {message ? <p className="person-dialog__hint rooms-status--error">{message}</p> : null}
+
+        <div className="person-dialog__actions">
+          <button type="button" className="btn" disabled={busy || !canMessage} onClick={openChat}>
+            {busy ? 'Opening…' : 'Send a private message'}
           </button>
-        )}
 
-        {loading && <p className="thread__empty">Loading…</p>}
-        {!loading && messages.length === 0 && (
-          <p className="thread__empty">{emptyText}</p>
-        )}
-
-        {messages.map((message) => (
-          <div
-            key={message.clientMessageId ?? message.messageId}
-            className={[
-              'bubble',
-              message.author.userId === self.userId ? 'bubble--mine' : '',
-              // A failed send keeps its bubble rather than vanishing: losing
-              // what somebody wrote is worse than showing it did not arrive.
-              message.delivery === 'failed' ? 'bubble--failed' : '',
-              message.delivery === 'sending' ? 'bubble--pending' : '',
-            ]
-              .filter(Boolean)
-              .join(' ')}
-          >
-            {message.author.userId !== self.userId && (
-              <span className="bubble__author">{message.author.displayName}</span>
-            )}
-
-            <span className="bubble__body">
-              {message.deletedAt ? <em>Message deleted</em> : message.body}
-            </span>
-
-            {message.delivery === 'failed' && (
+          {sessionBlocks.enabled ? (
+            blockedHere ? (
+              <button type="button" className="btn" disabled={busy} onClick={() => act(() => sessionBlocks.unblock(userId))}>
+                Unblock for this lesson
+              </button>
+            ) : (
               <button
                 type="button"
-                className="bubble__retry"
-                onClick={() => retry(message.clientMessageId)}
+                className="btn btn--danger"
+                disabled={busy}
+                onClick={() =>
+                  act(async () => {
+                    await sessionBlocks.block(userId);
+                    setMessage(`${name} cannot write to you privately until this lesson ends.`);
+                  })
+                }
               >
-                Not sent — retry
+                Block for this lesson
               </button>
-            )}
-          </div>
-        ))}
+            )
+          ) : null}
+
+          <button type="button" className="btn btn--tiny" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
       </div>
-
-      {typingUserIds.length > 0 && (
-        <p className="thread__typing">
-          {typingUserIds.length === 1
-            ? 'Someone is typing…'
-            : `${typingUserIds.length} people are typing…`}
-        </p>
-      )}
-
-      <form className="thread__composer" onSubmit={submit}>
-        <input
-          value={draft}
-          onChange={(event) => {
-            setDraft(event.target.value);
-            setTyping(event.target.value.length > 0);
-          }}
-          placeholder={throttled ? 'Slow mode — wait a moment' : placeholder}
-          disabled={throttled}
-          aria-label={placeholder}
-        />
-        <button
-          type="submit"
-          className="btn btn--tiny"
-          disabled={!draft.trim() || throttled}
-        >
-          Send
-        </button>
-      </form>
-    </div>
+    </dialog>
   );
 }

@@ -1,0 +1,73 @@
+/* Rooms list, open chat, person dialog, toast and settings — see ChatRooms.jsx. */
+
+.rooms { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; gap: 6px; }
+
+.rooms-list { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+.rooms-list__group { margin: 10px 4px 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .65; }
+
+.rooms-row {
+  display: grid; grid-template-columns: 32px 1fr auto auto; align-items: center; gap: 8px;
+  width: 100%; padding: 8px; border: 0; border-radius: 8px; background: transparent;
+  color: inherit; font: inherit; text-align: start; cursor: pointer;
+}
+.rooms-row:hover, .rooms-row:focus-visible { background: rgba(127, 127, 127, .12); }
+.rooms-row--unread .rooms-row__name { font-weight: 700; }
+.rooms-row__avatar {
+  width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+  background: rgba(127, 127, 127, .22); font-weight: 700;
+}
+.rooms-row__main { display: flex; flex-direction: column; min-width: 0; }
+.rooms-row__name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rooms-row__preview { font-size: 12px; opacity: .7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rooms-row__time { font-size: 11px; opacity: .6; }
+.rooms-row__muted { font-size: 11px; }
+
+.rooms-badge {
+  min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; display: inline-grid; place-items: center;
+  background: #2563eb; color: #fff; font-size: 11px; font-weight: 700;
+}
+.rooms-badge--muted { background: rgba(127, 127, 127, .55); }
+.panel__tab .rooms-badge { margin-inline-start: 6px; }
+
+.rooms-head { display: flex; align-items: center; gap: 8px; }
+.rooms-head__title { flex: 1 1 auto; margin: 0; font-weight: 700; display: flex; flex-direction: column; min-width: 0; }
+.rooms-head__sub { font-weight: 400; font-size: 12px; opacity: .7; }
+
+.rooms-menu { position: relative; }
+.rooms-menu__items {
+  position: absolute; inset-inline-end: 0; top: calc(100% + 4px); z-index: 20; min-width: 240px;
+  display: flex; flex-direction: column; padding: 4px; border-radius: 8px;
+  background: var(--color-surface, #fff); color: var(--color-text, #111);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+}
+.rooms-menu__item { padding: 8px 10px; border: 0; background: transparent; color: inherit; font: inherit; text-align: start; border-radius: 6px; cursor: pointer; }
+.rooms-menu__item:hover, .rooms-menu__item:focus-visible { background: rgba(127, 127, 127, .14); }
+.rooms-menu__item--danger { color: #b91c1c; }
+.rooms-menu__sep { border: 0; border-top: 1px solid rgba(127, 127, 127, .25); margin: 4px 0; }
+
+.rooms-notice { margin: 4px; font-size: 13px; opacity: .8; }
+.rooms-status { margin: 0 4px; font-size: 12px; opacity: .8; }
+.rooms-status--error { color: #b91c1c; opacity: 1; }
+
+.rooms-toast {
+  display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 6px; padding: 8px 10px;
+  border: 0; border-radius: 8px; background: #2563eb; color: #fff; font: inherit; text-align: start; cursor: pointer;
+}
+.rooms-toast__text { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.person-dialog { border: 0; border-radius: 12px; padding: 0; width: min(360px, 92vw); box-shadow: 0 16px 48px rgba(0, 0, 0, .25); }
+.person-dialog::backdrop { background: rgba(0, 0, 0, .35); }
+.person-dialog__body { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.person-dialog__title { margin: 0; font-size: 18px; }
+.person-dialog__hint { margin: 0; font-size: 13px; opacity: .75; }
+.person-dialog__actions { display: flex; flex-direction: column; gap: 8px; }
+.person-dialog__actions .btn { width: 100%; }
+
+.settings { display: grid; gap: 22px; max-width: 640px; }
+.settings__section { display: grid; gap: 8px; }
+.settings__switch { display: flex; gap: 10px; align-items: flex-start; }
+.settings__hint { margin: 0; font-size: 13px; opacity: .75; }
+.settings__row { display: flex; align-items: center; gap: 10px; }
+.settings__row span { flex: 1 1 auto; }
+
+.messages-page { display: flex; flex-direction: column; gap: 12px; max-width: 720px; min-height: 60vh; }

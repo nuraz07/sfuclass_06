@@ -283,6 +283,8 @@ export const RoomStateSchema = z.object({
   /** The active screen share, if any, so a late joiner sees it immediately. */
   screenShare: ScreenShareStartedSchema.nullable().default(null),
   waitingRoomEnabled: z.boolean().default(false),
+  /** Off: only the host may send emoji reactions. Set by the host. */
+  reactionsEnabled: z.boolean().default(true),
   startedAt: IsoDateTimeSchema,
 });
 
@@ -416,6 +418,8 @@ export const SIGNALING_CLIENT_EVENTS = {
   react: 'classroom:react',
   hostAction: 'classroom:host.action',
   breakout: 'classroom:breakout',
+  /** Host only: { reactionsEnabled: boolean }. */
+  roomSettings: 'classroom:room.settings.update',
 } as const;
 
 export const SIGNALING_SERVER_EVENTS = {
@@ -438,6 +442,8 @@ export const SIGNALING_SERVER_EVENTS = {
   iceUpdate: 'classroom:ice.update',
   /** The room's SFU node is draining; rebuild media with a rejoin. */
   nodeDraining: 'classroom:node.draining',
+  /** The host changed a room setting: { reactionsEnabled }. */
+  roomSettings: 'classroom:room.settings',
 } as const;
 
 export const SignalingEvents = Object.freeze({

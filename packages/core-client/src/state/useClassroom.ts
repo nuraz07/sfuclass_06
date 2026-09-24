@@ -34,6 +34,8 @@ export interface ClassroomState {
   cameraEnabled: boolean;
   microphoneEnabled: boolean;
   handRaised: boolean;
+  /** Off: only the host may react. */
+  reactionsEnabled: boolean;
   error: ApiError | null;
 }
 
@@ -49,6 +51,8 @@ export interface ClassroomActions {
     payload: SignalingEvents.SignalingClientPayloads['classroom:host.action'],
   ): Promise<void>;
   admit(peerId: string): Promise<void>;
+  /** Host only. */
+  setReactionsEnabled(enabled: boolean): Promise<void>;
 }
 
 export interface UseClassroomOptions {
@@ -83,6 +87,7 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
   const [cameraEnabled, setCameraEnabled] = useState(!options.startCameraOff);
   const [microphoneEnabled, setMicrophoneEnabled] = useState(!startMuted);
   const [handRaised, setHandRaised] = useState(false);
+  const [reactionsEnabled, setReactionsEnabledState] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
 
   const localVideoRef = useRef<MediaStreamTrackLike | null>(null);
@@ -104,6 +109,7 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
         setSelfRole(state.selfRole);
         setRecording(state.recording);
         setScreenShare(state.screenShare);
+        setReactionsEnabledState((state as { reactionsEnabled?: boolean }).reactionsEnabled !== false);
       }),
 
       sfu.on('peerJoined', (peer) => {
@@ -148,6 +154,9 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
 
       sfu.on('reaction', (event) => onReactionRef.current?.(event)),
       sfu.on('recordingChanged', ({ recording: isRecording }) => setRecording(isRecording)),
+      sfu.on('roomSettingsChanged', (event) => {
+        if (typeof event.reactionsEnabled === 'boolean') setReactionsEnabledState(event.reactionsEnabled);
+      }),
       sfu.on('error', setError),
       sfu.on('closed', () => {
         joinedRef.current = false;
@@ -275,6 +284,10 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
       raiseHand,
       react: (emoji) => sfu.react(emoji),
       hostAction: (payload) => sfu.hostAction(payload),
+      setReactionsEnabled: async (enabled) => {
+        const result = await sfu.setRoomSettings({ reactionsEnabled: enabled });
+        setReactionsEnabledState(result.reactionsEnabled);
+      },
       admit: async (peerId) => {
         await sfu.hostAction({ targetPeerId: peerId, action: 'admit' });
         setWaitingPeers((current) => current.filter((p) => p.peerId !== peerId));
@@ -298,6 +311,7 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
     cameraEnabled,
     microphoneEnabled,
     handRaised,
+    reactionsEnabled,
     error,
     actions,
     localVideoTrack: localVideoRef.current,

@@ -14,6 +14,7 @@
  * The rules (canMessage):
  *
  *   blocked either way      no — outranks everything, teachers included
+ *   (account or this lesson)
  *   sender is a teacher     yes — a course must be able to reach its people,
  *   or owner                even someone who switched private messages off
  *   DM setting 'anyone'     yes
@@ -105,6 +106,12 @@ export const canMessage = async ({ fromUserId, toUserId, roomId = null }) => {
     // Same answer whichever direction the block runs: telling someone they
     // have been blocked is information the blocker did not choose to share.
     return { allowed: false, code: 'blocked_by_user', reason: 'You cannot message this person.' };
+  }
+
+  // A block made in a live lesson counts the same while that lesson runs.
+  const { isBlockedEitherWay: blockedInSession } = await import('./SessionBlocks.js');
+  if (await blockedInSession(fromUserId, toUserId)) {
+    return { allowed: false, code: 'blocked_by_user', reason: 'You cannot message this person right now.' };
   }
 
   const { rows } = await pool.query(

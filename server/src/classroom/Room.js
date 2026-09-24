@@ -48,7 +48,7 @@ export class Room {
     /** Child rooms, while breakouts are open. */
     this.breakouts = new Map();
 
-    this.settings = { ...MODE_DEFAULTS[mode] ?? MODE_DEFAULTS.seminar };
+    this.settings = { ...(MODE_DEFAULTS[mode] ?? MODE_DEFAULTS.seminar), reactionsEnabled: true };
     this.peers = new Map();
     /** Peers who have knocked but not been admitted. */
     this.waiting = new Map();
@@ -224,6 +224,7 @@ export class Room {
           }
         : null,
       waitingRoomEnabled: this.settings.waitingRoom,
+      reactionsEnabled: this.settings.reactionsEnabled !== false,
       startedAt: this.createdAt,
     };
   }

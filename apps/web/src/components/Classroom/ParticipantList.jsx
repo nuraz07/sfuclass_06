@@ -1,22 +1,17 @@
 /**
  * Participant list  (F1, F6)
  *
- * Clicking a person opens their profile, and the profile carries the Message
- * action. That is the only way a direct message starts anywhere in the product
- * — participant list, community thread, public channel and course roster all
- * funnel through the same profile card, so there is no separate "new message"
- * flow to keep in sync.
+ * Clicking a person opens the person dialog in ClassroomChatPanel: "Send a
+ * private message?" and "Block for this lesson". Nothing is opened or created
+ * by the click itself.
  */
 export default function ParticipantList({ peers, selfPeerId, canModerate, onHostAction, onMessage }) {
-
   const sorted = [...peers].sort((a, b) => {
     // Raised hands to the top, in the order they went up; hosts next.
     if (a.handRaised !== b.handRaised) return a.handRaised ? -1 : 1;
     const rank = { host: 0, cohost: 1, learner: 2 };
     if (rank[a.role] !== rank[b.role]) return rank[a.role] - rank[b.role];
-    return (a.user?.displayName ?? 'Participant').localeCompare(
-      b.user?.displayName ?? 'Participant',
-    );
+    return (a.user?.displayName ?? 'Participant').localeCompare(b.user?.displayName ?? 'Participant');
   });
 
   return (
@@ -26,10 +21,8 @@ export default function ParticipantList({ peers, selfPeerId, canModerate, onHost
       <ul className="participants__list">
         {sorted.map((peer) => {
           const displayName = peer.user?.displayName || 'Participant';
-          const userId = peer.user?.userId;
-          const muted = !peer.producers.some(
-            (producer) => producer.source === 'microphone' && !producer.paused,
-          );
+          const isSelf = peer.peerId === selfPeerId;
+          const muted = !peer.producers.some((producer) => producer.source === 'microphone' && !producer.paused);
           const sharing = peer.producers.some((producer) => producer.source === 'screen');
 
           return (
@@ -38,10 +31,11 @@ export default function ParticipantList({ peers, selfPeerId, canModerate, onHost
                 type="button"
                 className="participants__person"
                 onClick={() => onMessage?.(peer)}
-                title="Send a message"
-                disabled={!onMessage || peer.peerId === selfPeerId}
+                title={isSelf ? undefined : `Options for ${displayName}`}
+                aria-label={isSelf ? `${displayName} (you)` : `Options for ${displayName}`}
+                disabled={!onMessage || isSelf}
               >
-                {peer.user.avatarUrl ? (
+                {peer.user?.avatarUrl ? (
                   <img src={peer.user.avatarUrl} alt="" className="participants__avatar" />
                 ) : (
                   <span className="participants__avatar participants__avatar--initial">
@@ -51,7 +45,7 @@ export default function ParticipantList({ peers, selfPeerId, canModerate, onHost
 
                 <span className="participants__name">
                   {displayName}
-                  {peer.peerId === selfPeerId && ' (you)'}
+                  {isSelf && ' (you)'}
                 </span>
 
                 {peer.role !== 'learner' && <span className="participants__role">{peer.role}</span>}
@@ -63,7 +57,7 @@ export default function ParticipantList({ peers, selfPeerId, canModerate, onHost
                 {muted && '🔇'}
               </span>
 
-              {canModerate && peer.peerId !== selfPeerId && (
+              {canModerate && !isSelf && (
                 <span className="participants__actions">
                   <button
                     type="button"

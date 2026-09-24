@@ -49,9 +49,11 @@ const authoriseWrite = async ({ target, userId }) => {
       const participants = await Participant.listForConversation(target.conversationId);
       const others = participants.filter((participant) => participant.user_id !== userId);
 
+      // A block made in a running lesson counts the same as an account block.
+      const { isBlockedEitherWay: blockedInSessionCheck } = await import('./SessionBlocks.js');
       for (const other of others) {
         const { blocked } = await Block.areBlocked(userId, other.user_id);
-        if (blocked) {
+        if (blocked || (await blockedInSessionCheck(userId, other.user_id))) {
           throw new ApiError('blocked_by_user', {
             detail: 'You can no longer send messages in this conversation.',
           });

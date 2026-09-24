@@ -2,24 +2,24 @@
  * Chat API  (F6)
  *
  * The HTTP half of messaging. Every mutation here has a socket twin in
- * chat.events.ts, and that symmetry is deliberate: the socket is the fast path
- * when a connection is already open, and this is the path that still works on a
- * train. Neither is a fallback bolted onto the other — they take the same
- * payload and produce the same result.
+ * chat.events.ts; the socket is the fast path when a connection is already
+ * open, this is the path that still works on a train.
  *
- * Two rules the whole feature rests on:
+ * Paths are the server's (server/src/routes/messaging.routes.js, mounted under
+ * /messaging). Conversation and channel rows are validated with the view
+ * schemas below rather than the strict contract schemas: they carry per-viewer
+ * fields the list needs (mutedUntil, lastMessagePreview) and accept the
+ * server's role and id spellings as they are.
  *
- *   `openDirect()` is idempotent. It returns the existing conversation or
- *   creates one. That is why the Message button on a profile card is a single
- *   call with no "new conversation" flow to keep in sync.
- *
- *   Every send carries a client-generated `clientMessageId`. The server treats
- *   a repeat as an update to the original row, which is what makes the offline
- *   outbox safe to replay after a reconnect.
+ *   openDirect()          idempotent open-or-create; `roomId` tells the server
+ *                         both people are in the same lesson
+ *   muteConversation()    { muted, until } — until null means "until I turn it on"
+ *   deleteConversation()  for the caller only; the other side keeps everything
+ *   blockInSession()      block someone for the running lesson only
  */
 
 import { Chat } from '@classroom/contracts';
-import type { z } from 'zod';
+import { z } from 'zod';
 import type { HttpClient } from '../http/httpClient.js';
 
 type ChatTarget = z.infer<typeof Chat.ChatTargetSchema>;
@@ -36,31 +36,125 @@ const targetPath = (target: ChatTarget): string => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// View schemas
+// ---------------------------------------------------------------------------
+
+const MessagePreviewSchema = z
+  .object({
+    messageId: z.string(),
+    authorId: z.string(),
+    body: z.string(),
+    createdAt: z.string(),
+  })
+  .nullable()
+  .default(null);
+
+const ParticipantViewSchema = z
+  .object({
+    userId: z.string(),
+    profile: z
+      .object({
+        userId: z.string(),
+        displayName: z.string().default('Unknown'),
+        avatarUrl: z.string().nullable().default(null),
+      })
+      .passthrough(),
+    role: z.string().default('member'),
+    lastReadAt: z.string().nullable().default(null),
+    muted: z.boolean().default(false),
+  })
+  .passthrough();
+
+export const ConversationViewSchema = z
+  .object({
+    conversationId: z.string(),
+    kind: z.enum(['direct', 'group']),
+    title: z.string().nullable().default(null),
+    participants: z.array(ParticipantViewSchema),
+    lastMessageAt: z.string().nullable().default(null),
+    lastMessagePreview: MessagePreviewSchema,
+    unreadCount: z.number().int().nonnegative().default(0),
+    muted: z.boolean().default(false),
+    mutedUntil: z.string().nullable().default(null),
+    created: z.boolean().optional(),
+    createdAt: z.string(),
+    updatedAt: z.string().nullable().default(null),
+  })
+  .passthrough();
+export type ConversationView = z.infer<typeof ConversationViewSchema>;
+
+const ConversationPageSchema = z.object({
+  items: z.array(ConversationViewSchema),
+  nextCursor: z.string().nullable().default(null),
+  hasMore: z.boolean().default(false),
+});
+
+export const ChannelViewSchema = z
+  .object({
+    channelId: z.string(),
+    scope: z.string(),
+    name: z.string(),
+    unreadCount: z.number().int().nonnegative().default(0),
+    muted: z.boolean().default(false),
+    mutedUntil: z.string().nullable().default(null),
+    lastMessageAt: z.string().nullable().default(null),
+  })
+  .passthrough();
+export type ChannelView = z.infer<typeof ChannelViewSchema>;
+
+const ChannelPageSchema = z.object({
+  items: z.array(ChannelViewSchema),
+  nextCursor: z.string().nullable().default(null),
+  hasMore: z.boolean().default(false),
+});
+
+const ChannelMuteSchema = z.object({
+  channelId: z.string(),
+  muted: z.boolean(),
+  mutedUntil: z.string().nullable().default(null),
+});
+
+const SessionBlocksSchema = z.object({
+  roomId: z.string(),
+  blockedUserIds: z.array(z.string()),
+});
+
+export interface MuteInput {
+  muted: boolean;
+  /** ISO time the mute ends; null or absent means "until I turn it back on". */
+  until?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Interface
+// ---------------------------------------------------------------------------
+
 export interface ChatApi {
   listConversations(
-    query?: { cursor?: string; limit?: number; archived?: boolean },
+    query?: { cursor?: string; limit?: number },
     signal?: AbortSignal,
-  ): Promise<z.infer<typeof Chat.ConversationListSchema>>;
-  getConversation(
-    conversationId: string,
-    signal?: AbortSignal,
-  ): Promise<z.infer<typeof Chat.ConversationSchema>>;
-  /** Idempotent: the Message action on a profile card. */
-  openDirect(userId: string): Promise<z.infer<typeof Chat.ConversationSchema>>;
-  createGroup(
-    input: z.infer<typeof Chat.CreateGroupConversationSchema>,
-  ): Promise<z.infer<typeof Chat.ConversationSchema>>;
+  ): Promise<z.infer<typeof ConversationPageSchema>>;
+  getConversation(conversationId: string, signal?: AbortSignal): Promise<ConversationView>;
+  /** Idempotent: returns the existing conversation or creates one. */
+  openDirect(userId: string, options?: { roomId?: string | null }): Promise<ConversationView>;
+  createGroup(input: { participantIds: string[]; title?: string }): Promise<ConversationView>;
+  muteConversation(conversationId: string, input: MuteInput | boolean): Promise<ConversationView>;
+  /** Removes the conversation for the caller only. */
+  deleteConversation(conversationId: string): Promise<void>;
+  /** Kept for older callers: archiving is now "delete for me". */
   archiveConversation(conversationId: string, archived: boolean): Promise<void>;
-  muteConversation(conversationId: string, muted: boolean): Promise<void>;
   leaveConversation(conversationId: string): Promise<void>;
 
   listChannels(
     query?: { cursor?: string; limit?: number; scope?: 'public' | 'space' | 'course' },
     signal?: AbortSignal,
-  ): Promise<z.infer<typeof Chat.ChannelListSchema>>;
-  getChannel(channelId: string, signal?: AbortSignal): Promise<z.infer<typeof Chat.ChannelSchema>>;
-  joinChannel(channelId: string): Promise<z.infer<typeof Chat.ChannelSchema>>;
-  muteChannel(channelId: string, muted: boolean): Promise<void>;
+  ): Promise<z.infer<typeof ChannelPageSchema>>;
+  muteChannel(channelId: string, input: MuteInput | boolean): Promise<z.infer<typeof ChannelMuteSchema>>;
+
+  listSessionBlocks(roomId: string, signal?: AbortSignal): Promise<z.infer<typeof SessionBlocksSchema>>;
+  blockInSession(roomId: string, userId: string): Promise<void>;
+  unblockInSession(roomId: string, userId: string): Promise<void>;
 
   listMessages(
     target: ChatTarget,
@@ -70,71 +164,68 @@ export interface ChatApi {
   send(input: z.infer<typeof Chat.SendMessageSchema>): Promise<z.infer<typeof Chat.MessageSchema>>;
   edit(messageId: string, body: string): Promise<z.infer<typeof Chat.MessageSchema>>;
   remove(messageId: string): Promise<void>;
-  react(
-    messageId: string,
-    input: z.infer<typeof Chat.ReactToMessageSchema>,
-  ): Promise<void>;
+  react(messageId: string, input: z.infer<typeof Chat.ReactToMessageSchema>): Promise<void>;
 
   markRead(target: ChatTarget, messageId: string): Promise<void>;
   getUnread(signal?: AbortSignal): Promise<z.infer<typeof Chat.UnreadSummarySchema>>;
 
-  /** Announces intent so the composer can show a row and the quota is checked. */
   requestAttachment(
     input: z.infer<typeof Chat.RequestChatAttachmentSchema>,
   ): Promise<{ assetId: string }>;
-
   search(
     query: z.infer<typeof Chat.ChatSearchQuerySchema>,
     signal?: AbortSignal,
   ): Promise<z.infer<typeof Chat.ChatSearchResultSchema>>;
-
   reportMessage(input: z.infer<typeof Chat.ReportMessageSchema>): Promise<void>;
-  moderateMessage(
-    messageId: string,
-    input: z.infer<typeof Chat.ModerateMessageSchema>,
-  ): Promise<void>;
-  setSlowMode(channelId: string, slowModeSec: number): Promise<z.infer<typeof Chat.ChannelSchema>>;
+  setSlowMode(channelId: string, seconds: number): Promise<unknown>;
 }
+
+const toMuteBody = (input: MuteInput | boolean) =>
+  typeof input === 'boolean'
+    ? { muted: input }
+    : { muted: input.muted, mutedUntil: input.muted ? (input.until ?? null) : null };
 
 const AttachmentTicketSchema = Chat.MessageAttachmentSchema.pick({ assetId: true });
 
 export const createChatApi = (http: HttpClient): ChatApi => ({
   listConversations: (query = {}, signal) =>
     http.get('/messaging/conversations', {
-      schema: Chat.ConversationListSchema,
-      query: { cursor: query.cursor, limit: query.limit, archived: query.archived },
+      schema: ConversationPageSchema,
+      query: { cursor: query.cursor, limit: query.limit },
       signal,
     }),
 
   getConversation: (conversationId, signal) =>
     http.get(`/messaging/conversations/${encodeURIComponent(conversationId)}`, {
-      schema: Chat.ConversationSchema,
+      schema: ConversationViewSchema,
       signal,
     }),
 
   /**
-   * POST rather than PUT because the server may create. Safe to call twice:
-   * the second call returns the same conversation, so a double-tap on a
-   * profile card cannot produce two threads with the same person.
+   * POST because the server may create. Safe to call twice: the same pair of
+   * people always resolves to the same conversation.
    */
-  openDirect: (userId) =>
+  openDirect: (userId, options = {}) =>
     http.post(
       '/messaging/conversations/direct',
-      { userId },
-      { schema: Chat.ConversationSchema, idempotencyKey: `direct:${userId}` },
+      { userId, ...(options.roomId ? { roomId: options.roomId } : {}) },
+      { schema: ConversationViewSchema },
     ),
 
   createGroup: (input) =>
-    http.post('/messaging/conversations', input, { schema: Chat.ConversationSchema }),
+    http.post('/messaging/conversations/group', input, { schema: ConversationViewSchema }),
 
-  archiveConversation: async (conversationId, archived) => {
-    await http.patch(`/messaging/conversations/${encodeURIComponent(conversationId)}`, {
-      archived,
-    });
+  muteConversation: (conversationId, input) =>
+    http.patch(`/messaging/conversations/${encodeURIComponent(conversationId)}`, toMuteBody(input), {
+      schema: ConversationViewSchema,
+    }),
+
+  deleteConversation: async (conversationId) => {
+    await http.delete(`/messaging/conversations/${encodeURIComponent(conversationId)}`);
   },
 
-  muteConversation: async (conversationId, muted) => {
-    await http.patch(`/messaging/conversations/${encodeURIComponent(conversationId)}`, { muted });
+  archiveConversation: async (conversationId, archived) => {
+    if (archived) await http.delete(`/messaging/conversations/${encodeURIComponent(conversationId)}`);
   },
 
   leaveConversation: async (conversationId) => {
@@ -145,30 +236,32 @@ export const createChatApi = (http: HttpClient): ChatApi => ({
 
   listChannels: (query = {}, signal) =>
     http.get('/messaging/channels', {
-      schema: Chat.ChannelListSchema,
+      schema: ChannelPageSchema,
       query: { cursor: query.cursor, limit: query.limit, scope: query.scope },
       signal,
     }),
 
-  getChannel: (channelId, signal) =>
-    http.get(`/messaging/channels/${encodeURIComponent(channelId)}`, {
-      schema: Chat.ChannelSchema,
-      signal,
+  muteChannel: (channelId, input) =>
+    http.patch(`/messaging/channels/${encodeURIComponent(channelId)}/members/me`, toMuteBody(input), {
+      schema: ChannelMuteSchema,
     }),
 
-  joinChannel: (channelId) =>
-    http.post(`/messaging/channels/${encodeURIComponent(channelId)}/members`, undefined, {
-      schema: Chat.ChannelSchema,
-    }),
+  listSessionBlocks: (roomId, signal) =>
+    http.get('/messaging/session-blocks', { schema: SessionBlocksSchema, query: { roomId }, signal }),
 
-  muteChannel: async (channelId, muted) => {
-    await http.patch(`/messaging/channels/${encodeURIComponent(channelId)}/members/me`, { muted });
+  blockInSession: async (roomId, userId) => {
+    await http.post('/messaging/session-blocks', { roomId, userId });
+  },
+
+  unblockInSession: async (roomId, userId) => {
+    await http.delete(
+      `/messaging/session-blocks/${encodeURIComponent(roomId)}/${encodeURIComponent(userId)}`,
+    );
   },
 
   /**
    * Keyset paginated. `around` loads the page containing a specific message,
-   * which is what a search hit or a reply link needs — an offset would put the
-   * reader somewhere near it rather than on it.
+   * which is what a search hit or a reply link needs.
    */
   listMessages: (target, query = { limit: 25, order: 'desc' }, signal) =>
     http.get(`${targetPath(target)}/messages`, {
@@ -183,9 +276,8 @@ export const createChatApi = (http: HttpClient): ChatApi => ({
     }),
 
   /**
-   * The idempotency key is the clientMessageId, not a separate value. One id
-   * identifies the message everywhere: in the optimistic bubble, in the retry,
-   * and in the socket echo that reconciles them.
+   * The idempotency key is the clientMessageId: one id identifies the message
+   * in the optimistic bubble, in the retry and in the socket echo.
    */
   send: async (input) => {
     const result = (await http.post(
@@ -224,11 +316,6 @@ export const createChatApi = (http: HttpClient): ChatApi => ({
   getUnread: (signal) =>
     http.get('/messaging/unread', { schema: Chat.UnreadSummarySchema, signal }),
 
-  /**
-   * Checks the plan quota and the per-target limits before a byte is uploaded.
-   * The actual transfer is mediaApi's job; this only reserves the intent so a
-   * 2 GB upload is rejected in a hundred milliseconds rather than at the end.
-   */
   requestAttachment: (input) =>
     http.post('/messaging/attachments', input, { schema: AttachmentTicketSchema }),
 
@@ -239,28 +326,19 @@ export const createChatApi = (http: HttpClient): ChatApi => ({
         q: query.q,
         cursor: query.cursor,
         limit: query.limit,
-        fromUserId: query.fromUserId,
-        hasAttachment: query.hasAttachment,
-        before: query.before,
-        after: query.after,
-        // The union is flattened into one parameter the server re-expands.
-        target: query.target ? JSON.stringify(query.target) : undefined,
+        from: query.fromUserId,
       },
       signal,
     }),
 
   reportMessage: async (input) => {
-    await http.post('/messaging/reports', input);
+    await http.post('/messaging/reports', {
+      messageId: input.messageId,
+      reason: input.reason,
+      note: input.detail,
+    });
   },
 
-  moderateMessage: async (messageId, input) => {
-    await http.post(`/messaging/messages/${encodeURIComponent(messageId)}/moderate`, input);
-  },
-
-  setSlowMode: (channelId, slowModeSec) =>
-    http.patch(
-      `/messaging/channels/${encodeURIComponent(channelId)}`,
-      { slowModeSec },
-      { schema: Chat.ChannelSchema },
-    ),
+  setSlowMode: (channelId, seconds) =>
+    http.post(`/messaging/channels/${encodeURIComponent(channelId)}/slow-mode`, { seconds }),
 });

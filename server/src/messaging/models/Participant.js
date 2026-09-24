@@ -155,12 +155,31 @@ export const markChannelRead = async ({ channelId, userId, readAt, messageId = n
   return rows[0]?.last_read_at ?? null;
 };
 
-export const setChannelMuted = async ({ channelId, userId, muted }) => {
+/**
+ * A person muting a channel for themselves, optionally until a time. Stored on
+ * their membership row; moderation mutes (someone else silencing them) live in
+ * chat_mutes and are a different thing.
+ */
+export const setChannelMuted = async ({ channelId, userId, muted, until = null }) => {
   await pool.query(
-    `INSERT INTO channel_members (channel_id, user_id, muted)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (channel_id, user_id) DO UPDATE SET muted = EXCLUDED.muted`,
-    [channelId, userId, muted],
+    `INSERT INTO channel_members (channel_id, user_id, muted, muted_until)
+     VALUES ($1, $2, $3, CASE WHEN $3 THEN $4::timestamptz ELSE NULL END)
+     ON CONFLICT (channel_id, user_id)
+     DO UPDATE SET muted = EXCLUDED.muted, muted_until = EXCLUDED.muted_until`,
+    [channelId, userId, muted, until],
+  );
+};
+
+/** This person's own mute state for some channels: Map<channelId, { muted, mutedUntil }>. */
+export const channelMuteStates = async ({ userId, channelIds }) => {
+  if (!channelIds.length) return new Map();
+  const { rows } = await pool.query(
+    `SELECT channel_id, muted, muted_until FROM channel_members
+      WHERE user_id = $1 AND channel_id = ANY($2::uuid[])`,
+    [userId, channelIds],
+  );
+  return new Map(
+    rows.map((row) => [row.channel_id, { muted: isMutedNow(row), mutedUntil: isMutedNow(row) ? row.muted_until : null }]),
   );
 };
 

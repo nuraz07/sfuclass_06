@@ -41,6 +41,7 @@ export * from './state/useScreenShare.js';
 export * from './state/useCourse.js';
 export * from './state/useCommunity.js';
 export * from './state/useChat.js';
+export * from './state/useConversations.js';
 export * from './state/usePresence.js';
 export * from './state/useUpload.js';
 export * from './state/useBilling.js';

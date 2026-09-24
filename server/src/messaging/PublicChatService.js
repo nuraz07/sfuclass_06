@@ -11,6 +11,9 @@
  * membership rows here carry preferences rather than permission — deleting one
  * does not remove access, and the scope check is what gates a read.
  *
+ * A person's own mute of a channel (optionally until a time) is one of those
+ * preferences: `muted` in the list is true only while the mute is running.
+ *
  * Auto-provisioning lives here too. SpaceService and CourseService call
  * `ensureChannelFor` on publish, and it has to be safe to call repeatedly
  * because publishing happens more than once.
@@ -73,15 +76,24 @@ export const list = async ({ userId, tenantId, scope, limit }) => {
   if (!scope || scope === 'public') await ensureLobby({ tenantId });
 
   const rows = await Channel.listForUser({ userId, tenantId, scope, limit });
+  const mutes = await Participant.channelMuteStates({
+    userId,
+    channelIds: rows.map((row) => row.channel_id),
+  });
 
   const items = await Promise.all(
-    rows.map(async (row) =>
-      Channel.toChannel(row, {
-        unreadCount: Number(row.unread_count ?? 0),
-        muted: row.muted ?? false,
-        memberCount: await Channel.memberCount(row.channel_id),
-      }),
-    ),
+    rows.map(async (row) => {
+      const mute = mutes.get(row.channel_id) ?? { muted: false, mutedUntil: null };
+      return {
+        ...Channel.toChannel(row, {
+          unreadCount: Number(row.unread_count ?? 0),
+          muted: mute.muted,
+          memberCount: await Channel.memberCount(row.channel_id),
+        }),
+        muted: mute.muted,
+        mutedUntil: mute.mutedUntil ? new Date(mute.mutedUntil).toISOString() : null,
+      };
+    }),
   );
 
   return { items, nextCursor: null, hasMore: false };
@@ -116,8 +128,17 @@ export const join = async ({ channelId, userId }) => {
   return getById({ channelId, userId });
 };
 
-export const setMuted = ({ channelId, userId, muted }) =>
-  Participant.setChannelMuted({ channelId, userId, muted });
+/** A person's own mute, optionally until a time. */
+export const setMuted = async ({ channelId, userId, muted, until = null }) => {
+  if (!(await Channel.canRead({ channelId, userId }))) {
+    throw new ApiError('not_found', { detail: 'Channel not found.' });
+  }
+  if (muted && until && new Date(until).getTime() <= Date.now()) {
+    throw new ApiError('validation_failed', { detail: 'A mute has to end in the future.' });
+  }
+  await Participant.setChannelMuted({ channelId, userId, muted: Boolean(muted), until: muted ? until : null });
+  return { channelId, muted: Boolean(muted), mutedUntil: muted && until ? new Date(until).toISOString() : null };
+};
 
 // ---------------------------------------------------------------------------
 // Live lesson chat
@@ -174,4 +195,4 @@ export const setSlowMode = async ({ channelId, seconds, actorId }) => {
   return Channel.toChannel(row, {});
 };
 
-export default { ensureLobby, ensureChannelFor, list, getById, join, persistRoomMessage };
+export default { ensureLobby, ensureChannelFor, list, getById, join, setMuted, persistRoomMessage };

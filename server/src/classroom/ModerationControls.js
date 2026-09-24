@@ -227,6 +227,20 @@ export const setLearnersMayShare = (room, actor, allowed) => {
   return allowed;
 };
 
+/**
+ * Emoji reactions on or off for everyone except the host. The host only —
+ * not a cohost: it is a decision about the whole lesson.
+ */
+export const setReactionsEnabled = (room, actor, enabled) => {
+  if (!actor?.isHost) {
+    throw Object.assign(new Error('only the host may switch reactions'), { code: 'not_room_host' });
+  }
+  room.settings.reactionsEnabled = Boolean(enabled);
+  room.broadcast('classroom:room.settings', { reactionsEnabled: room.settings.reactionsEnabled });
+  log.info({ roomId: room.id, enabled: room.settings.reactionsEnabled, by: actor.id }, 'reactions switched');
+  return room.settings.reactionsEnabled;
+};
+
 /** Single entry point for the `classroom:host.action` socket event. */
 export const applyHostAction = async (room, actor, { targetPeerId, action, reason }) => {
   switch (action) {

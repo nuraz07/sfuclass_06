@@ -79,6 +79,7 @@ export default function ClassroomPage() {
     cameraEnabled,
     microphoneEnabled,
     handRaised,
+    reactionsEnabled,
     error,
     actions,
     localVideoTrack,
@@ -254,6 +255,9 @@ export default function ClassroomPage() {
         onToggleHand={() => actions.raiseHand(!handRaised)}
         onToggleScreenShare={handleToggleScreenShare}
         onReact={actions.react}
+        reactionsEnabled={reactionsEnabled}
+        canToggleReactions={selfRole === 'host'}
+        onToggleReactions={() => actions.setReactionsEnabled(!reactionsEnabled)}
         onLeave={handleLeave}
       />
     </main>

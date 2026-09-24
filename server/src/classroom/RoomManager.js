@@ -78,6 +78,10 @@ export const closeRoom = async (roomId, reason = 'ended-by-host') => {
   room.close(reason);
   rooms.delete(roomId);
 
+  // Blocks made "for this lesson" end with the lesson.
+  const { clearRoom } = await import('../messaging/SessionBlocks.js');
+  await clearRoom(roomId).catch(() => undefined);
+
   const { releaseRoom } = await import('./RoomRegistry.js');
   await releaseRoom(roomId).catch(() => undefined);
 

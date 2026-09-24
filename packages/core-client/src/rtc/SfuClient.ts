@@ -158,6 +158,8 @@ export interface SfuClientEvents {
   handRaised: (event: { peerId: string; raised: boolean }) => void;
   reaction: (event: { peerId: string; emoji: string }) => void;
   recordingChanged: (event: { recording: boolean }) => void;
+  /** The host changed a room setting (reactions on/off). */
+  roomSettingsChanged: (event: { reactionsEnabled?: boolean }) => void;
   /** A new ICE configuration is in effect (join, refresh, push, recreate). */
   iceConfigChanged: (ice: Readonly<IceConfig>) => void;
   /** Raw mediasoup transport state; IceRecovery and useConnectionQuality listen. */
@@ -651,6 +653,11 @@ export class SfuClient {
     await this.request(CLIENT.hostAction, payload);
   }
 
+  /** Host only: reactions on or off for everyone else. */
+  async setRoomSettings(settings: { reactionsEnabled: boolean }): Promise<{ reactionsEnabled: boolean }> {
+    return this.request<{ reactionsEnabled: boolean }>(CLIENT.roomSettings, settings);
+  }
+
   // -------------------------------------------------------------------------
   // ICE primitives — driven by IceConfigProvider and IceRecovery
   // -------------------------------------------------------------------------
@@ -1025,6 +1032,9 @@ export class SfuClient {
     );
     socket.on(SERVER.recordingChanged, (event: { recording: boolean }) =>
       this.emit('recordingChanged', event),
+    );
+    socket.on(SERVER.roomSettings, (event: { reactionsEnabled?: boolean }) =>
+      this.emit('roomSettingsChanged', event),
     );
 
     // TURN node drained, secret rotation or tenant policy change.

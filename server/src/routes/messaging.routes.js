@@ -168,6 +168,11 @@ router.patch(
   route(
     mapped(async (req) => {
       const until = req.body.mutedUntil ?? req.body.until ?? null;
+      // A body without mute fields (an older client sending `archived`, say)
+      // changes nothing; it must never read as "unmute".
+      if (req.body.muted === undefined && !until) {
+        return ConversationService.getById({ conversationId: req.params.id, viewerId: req.user.id });
+      }
       const muted = req.body.muted ?? Boolean(until);
       return ConversationService.setMuted({
         conversationId: req.params.id,
@@ -208,6 +213,72 @@ router.get(
   route(async (req) =>
     PublicChatService.list({ tenantId: tenantOf(req), userId: req.user.id, scope: q(req).scope }),
   ),
+);
+
+/** The caller's own mute of a channel, e.g. the lesson's default chatroom. */
+router.patch(
+  '/channels/:id/members/me',
+  validate({
+    params: idParam,
+    body: z.object({ muted: z.boolean().optional(), mutedUntil: isoDateTime.nullish(), until: isoDateTime.nullish() }),
+  }),
+  route(
+    mapped(async (req) => {
+      const until = req.body.mutedUntil ?? req.body.until ?? null;
+      return PublicChatService.setMuted({
+        channelId: req.params.id,
+        userId: req.user.id,
+        muted: req.body.muted ?? Boolean(until),
+        until,
+      });
+    }),
+  ),
+);
+
+/* ------------------------------------------------------------------ *
+ * Blocking for one lesson
+ * ------------------------------------------------------------------ */
+
+/**
+ * Only someone who is in the running lesson can block within it. Rooms live
+ * in the SFU process; in development that is this process.
+ */
+const assertInLiveRoom = async (roomId, userId) => {
+  const RoomManager = await import('../classroom/RoomManager.js');
+  const room = RoomManager.getRoom(roomId);
+  if (!room?.findPeerByUser?.(userId)) throw notFound('This lesson is not running, or you are not in it');
+};
+
+router.get(
+  '/session-blocks',
+  validate({ query: z.object({ roomId: z.string().uuid() }) }),
+  route(async (req) => {
+    const { listFor } = await import('../messaging/SessionBlocks.js');
+    return { roomId: q(req).roomId, blockedUserIds: await listFor({ roomId: q(req).roomId, blockerId: req.user.id }) };
+  }),
+);
+
+router.post(
+  '/session-blocks',
+  validate({ body: z.object({ roomId: z.string().uuid(), userId: z.string().uuid() }) }),
+  route(
+    mapped(async (req, res) => {
+      if (req.body.userId === req.user.id) throw badRequest('You cannot block yourself');
+      await assertInLiveRoom(req.body.roomId, req.user.id);
+      const { block } = await import('../messaging/SessionBlocks.js');
+      res.status(201);
+      return block({ roomId: req.body.roomId, blockerId: req.user.id, blockedId: req.body.userId });
+    }),
+  ),
+);
+
+router.delete(
+  '/session-blocks/:roomId/:userId',
+  validate({ params: z.object({ roomId: z.string().uuid(), userId: z.string().uuid() }) }),
+  route(async (req) => {
+    const { unblock } = await import('../messaging/SessionBlocks.js');
+    return unblock({ roomId: req.params.roomId, blockerId: req.user.id, blockedId: req.params.userId });
+  }),
 );
 
 /**
