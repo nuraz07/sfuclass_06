@@ -6,10 +6,6 @@ import ErrorBoundary from './components/system/ErrorBoundary.jsx';
 import AppLayout from './pages/AppLayout.jsx';
 import '@classroom/ui-tokens/tokens.css';
 import './app.css';
-import { applyCachedAppearance } from './lib/preferences.js';
-
-// This device's copy of the account preferences; AppLayout refreshes it.
-applyCachedAppearance();
 
 /**
  * Entry point.

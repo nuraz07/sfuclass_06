@@ -35,7 +35,6 @@ export type PublicProfileView = z.infer<typeof PublicProfileViewSchema>;
 export const PrivacyViewSchema = z
   .object({
     dmPolicy: z.enum(['anyone', 'shared-context', 'nobody']).default('shared-context'),
-    visibility: z.enum(['tenant', 'shared-only', 'private']).default('tenant'),
     showPresence: z.boolean().default(true),
     sendReadReceipts: z.boolean().default(true),
   })
@@ -47,35 +46,10 @@ export const OwnProfileViewSchema = z
     userId: z.string(),
     displayName: z.string(),
     email: z.string(),
-    handle: z.string().nullable().default(null),
-    headline: z.string().nullable().default(null),
-    bio: z.string().nullable().default(null),
-    links: z.array(z.object({ label: z.string(), url: z.string() })).default([]),
     role: z.string().nullable().default(null),
-    locale: z.string().nullable().default(null),
-    timeZone: z.string().nullable().default(null),
     privacy: PrivacyViewSchema,
   })
   .passthrough();
-
-/** Account preferences (server/src/settings/preferences.js); defaults are filled in by the server. */
-export const PreferencesViewSchema = z
-  .object({
-    appearance: z.object({ fontScale: z.string(), reduceMotion: z.boolean() }).passthrough(),
-    region: z.object({ dateFormat: z.string(), timeFormat: z.string() }).passthrough(),
-    lesson: z
-      .object({
-        joinMicrophone: z.string(),
-        joinCamera: z.string(),
-        noiseSuppression: z.boolean(),
-        echoCancellation: z.boolean(),
-        dataSaver: z.boolean(),
-      })
-      .passthrough(),
-    roomDefaults: z.object({ reactionsEnabled: z.boolean(), learnersJoinMuted: z.boolean() }).passthrough(),
-  })
-  .passthrough();
-export type PreferencesView = z.infer<typeof PreferencesViewSchema>;
 export type OwnProfileView = z.infer<typeof OwnProfileViewSchema>;
 
 export const BlockViewSchema = z
@@ -112,9 +86,6 @@ export interface ProfileApi {
   get(userId: string, options?: { roomId?: string | null; signal?: AbortSignal }): Promise<PublicProfileView>;
   update(input: Record<string, unknown>): Promise<OwnProfileView>;
   getPrivacy(signal?: AbortSignal): Promise<PrivacyView>;
-  getPreferences(signal?: AbortSignal): Promise<PreferencesView>;
-  /** Any section, any subset of its keys; returns the full set. */
-  updatePreferences(patch: Record<string, Record<string, unknown>>): Promise<PreferencesView>;
   updatePrivacy(input: Partial<PrivacyView>): Promise<PrivacyView>;
   search(
     query: { q: string; scopeId?: string; limit?: number },
@@ -145,11 +116,6 @@ export const createProfileApi = (http: HttpClient): ProfileApi => ({
   update: (input) => http.patch('/profiles/me', input, { schema: OwnProfileViewSchema }),
 
   getPrivacy: (signal) => http.get('/profiles/me/privacy', { schema: PrivacyViewSchema, signal }),
-
-  getPreferences: (signal) => http.get('/profiles/me/preferences', { schema: PreferencesViewSchema, signal }),
-
-  updatePreferences: (patch) =>
-    http.patch('/profiles/me/preferences', patch, { schema: PreferencesViewSchema }),
 
   updatePrivacy: (input) =>
     http.patch('/profiles/me/privacy', input, { schema: PrivacyViewSchema }),

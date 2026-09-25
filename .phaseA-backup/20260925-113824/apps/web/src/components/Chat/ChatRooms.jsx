@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { isMutedNow, otherParticipant, titleOf, useChat } from '@classroom/core-client';
 import './chatRooms.css';
-import { formatDate, formatTime } from '../../lib/preferences.js';
 
 /**
  * "Rooms": the default chatroom and every private chat, one under the other,
@@ -21,6 +20,8 @@ import { formatDate, formatTime } from '../../lib/preferences.js';
  * the useConversations state so the tab badge can show the total.
  */
 
+const time = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+const day = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
 
 const HOUR = 60 * 60 * 1000;
 export const MUTE_CHOICES = [
@@ -35,7 +36,7 @@ const untilFor = (choice) => (choice.ms ? new Date(Date.now() + choice.ms).toISO
 function shortTime(iso) {
   if (!iso) return '';
   const date = new Date(iso);
-  return date.toDateString() === new Date().toDateString() ? formatTime(date) : formatDate(date);
+  return date.toDateString() === new Date().toDateString() ? time.format(date) : day.format(date);
 }
 
 function mutedLabel(item) {

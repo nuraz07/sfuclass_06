@@ -86,14 +86,6 @@ const sharesLiveRoom = async (userA, userB, roomId) => {
   }
 };
 
-/**
- * Whether two people share a course, a space or the live lesson `roomId`.
- * Used for "who may message me" here and for "who may see my profile" in
- * profile.routes, so both settings mean the same thing by "shared".
- */
-export const sharesContext = async ({ userA, userB, roomId = null }) =>
-  (await sharesLiveRoom(userA, userB, roomId)) || (await sharesCourseOrSpace(userA, userB));
-
 // ---------------------------------------------------------------------------
 // Permission
 // ---------------------------------------------------------------------------
@@ -374,6 +366,6 @@ export const announceActivity = async ({ conversationId }) => {
 };
 
 export default {
-  canMessage, sharesContext, openDirect, createGroup, getById, list, setMuted, deleteForMe, leave,
+  canMessage, openDirect, createGroup, getById, list, setMuted, deleteForMe, leave,
   assertParticipant, announceActivity, toDbPolicy,
 };

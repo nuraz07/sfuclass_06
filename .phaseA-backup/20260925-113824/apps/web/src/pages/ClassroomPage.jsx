@@ -8,7 +8,6 @@ import ScreenShareStage from '../components/Classroom/ScreenShareStage.jsx';
 import ControlBar from '../components/Classroom/ControlBar.jsx';
 import ClassroomChatPanel from '../components/Classroom/ClassroomChatPanel.jsx';
 import VideoTile from '../components/Classroom/VideoTile.jsx';
-import { lessonJoinDefaults, withMediaPreferences } from '../lib/preferences.js';
 
 /**
  * Classroom  (F1)
@@ -25,10 +24,7 @@ export default function ClassroomPage() {
   const navigate = useNavigate();
   const { session, status } = useCore();
 
-  const { sfu, deviceAdapter: baseDeviceAdapter, screenShareAdapter } = useSfuClient();
-  // Settings → Lessons: chosen camera and microphone, noise suppression, data
-  // saver. Wrapped once per adapter, so a setting never makes the lesson rejoin.
-  const deviceAdapter = useMemo(() => withMediaPreferences(baseDeviceAdapter), [baseDeviceAdapter]);
+  const { sfu, deviceAdapter, screenShareAdapter } = useSfuClient();
 
   // Which dependency changed identity between renders. Each line prints only
   // when that value is a different object than last render, so whatever is
@@ -57,10 +53,6 @@ export default function ClassroomPage() {
     setTimeout(() => setReactions((current) => current.filter((r) => r.id !== id)), 3_000);
   }, []);
 
-  // Settings → Lessons → "When you join a lesson". Read once: changing it
-  // mid-lesson must not rebuild the session.
-  const joinDefaults = useMemo(() => lessonJoinDefaults(), []);
-
   const classroomOptions = useMemo(
     () => ({
       sfu,
@@ -68,8 +60,8 @@ export default function ClassroomPage() {
       roomId,
       autoJoin: status === 'authenticated',
       // Above ten people, arriving unmuted is a room full of keyboard noise.
-      startMuted: joinDefaults.startMuted,
-      startCameraOff: joinDefaults.startCameraOff,
+      startMuted: true,
+      startCameraOff: false,
       onReaction,
     }),
     [sfu, deviceAdapter, roomId, status, onReaction],

@@ -225,7 +225,6 @@ export class Room {
         : null,
       waitingRoomEnabled: this.settings.waitingRoom,
       reactionsEnabled: this.settings.reactionsEnabled !== false,
-      startMuted: Boolean(this.settings.startMuted),
       startedAt: this.createdAt,
     };
   }

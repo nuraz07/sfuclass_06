@@ -23,34 +23,12 @@ import * as ConversationService from '../messaging/ConversationService.js';
 import * as ChatModerationService from '../messaging/ChatModerationService.js';
 import * as UploadService from '../media/UploadService.js';
 import { rateLimit } from '../middleware/rateLimit.js';
-import { route, validate, requireAuth, tenantOf, q, notFound, badRequest, forbidden } from './_helpers.js';
+import { route, validate, requireAuth, tenantOf, q, notFound, badRequest } from './_helpers.js';
 
 const router = Router();
 router.use(requireAuth);
 
 const userIdParam = z.object({ userId: z.string().uuid() });
-
-/** Errors the profile domain raises with a code, as the HTTP answers clients understand. */
-const asHttp = (fn) => async (req, res) => {
-  try {
-    return await fn(req, res);
-  } catch (error) {
-    switch (error?.code) {
-      case 'validation_failed':
-        throw badRequest(error.message);
-      case 'forbidden':
-        throw forbidden(error.message);
-      case 'not_found':
-        throw notFound(error.message);
-      case 'conflict':
-        throw Object.assign(badRequest(error.message), { status: 409 });
-      default:
-        throw error;
-    }
-  }
-};
-
-const TIME_ZONES = new Set(Intl.supportedValuesOf('timeZone'));
 
 /* ------------------------------------------------------------------ *
  * Own profile
@@ -69,39 +47,19 @@ router.patch(
   '/me',
   validate({
     body: z.object({
-      displayName: z.string().trim().min(1).max(80).optional(),
-      // Lower-case letters, digits and underscores: what @mentions can match.
-      handle: z.string().trim().toLowerCase().regex(/^[a-z0-9_]{3,32}$/, 'use 3–32 lowercase letters, digits or _').optional(),
+      displayName: z.string().min(1).max(80).optional(),
+      handle: z.string().min(3).max(32).optional(),
       bio: z.string().max(2000).nullish(),
       headline: z.string().max(140).nullish(),
       avatarAssetId: z.string().uuid().nullish(),
       links: z.array(z.object({ label: z.string().max(40), url: z.string().url() })).max(5).optional(),
-      locale: z.string().regex(/^[a-z]{2}(-[A-Z]{2})?$/, 'a language code such as en or de-DE').optional(),
-      timeZone: z.string().max(64).refine((zone) => TIME_ZONES.has(zone), 'not a known time zone').optional(),
     }),
   }),
-  route(
-    asHttp(async (req) => {
-      const { avatarAssetId, ...patch } = req.body;
-      if (avatarAssetId) await Profile.setAvatar({ userId: req.user.id, assetId: avatarAssetId });
-      return Profile.update({ userId: req.user.id, patch });
-    }),
-  ),
-);
-
-/**
- * Account preferences: appearance, date and time format, how lessons start
- * for me, and (teachers) my lesson defaults. PATCH takes any section with any
- * subset of its keys and returns the full set with defaults filled in.
- */
-router.get(
-  '/me/preferences',
-  route(async (req) => Profile.getPreferences(req.user.id)),
-);
-
-router.patch(
-  '/me/preferences',
-  route(asHttp(async (req) => Profile.updatePreferences({ userId: req.user.id, patch: req.body }))),
+  route(async (req) => {
+    const { avatarAssetId, ...patch } = req.body;
+    if (avatarAssetId) await Profile.setAvatar({ userId: req.user.id, assetId: avatarAssetId });
+    return Profile.update({ userId: req.user.id, patch });
+  }),
 );
 
 /**
@@ -240,22 +198,14 @@ router.get(
     const profile = await Profile.getPublic({ userId: req.params.userId, viewerId: req.user.id });
     if (!profile) throw notFound('No such profile');
 
-    const roomId = q(req).roomId ?? null;
     const messaging = await ConversationService.canMessage({
       fromUserId: req.user.id,
       toUserId: req.params.userId,
-      roomId,
+      roomId: q(req).roomId ?? null,
     });
 
-    // Teachers count as sharing a course with the people they teach, as in
-    // the "View as" preview in Settings.
-    const shares =
-      req.params.userId === req.user.id ||
-      ['teacher', 'owner'].includes(req.user.role) ||
-      (await ConversationService.sharesContext({ userA: req.user.id, userB: req.params.userId, roomId }));
-
     return {
-      ...Profile.applyVisibility(profile, { sharesContext: shares }),
+      ...profile,
       canMessage: messaging.allowed,
       cannotMessageReason: messaging.allowed ? null : messaging.reason ?? null,
     };

@@ -92,8 +92,6 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
 
   const localVideoRef = useRef<MediaStreamTrackLike | null>(null);
   const joinedRef = useRef(false);
-  /** From the room state: the host's "learners join muted". Hosts and cohosts are exempt. */
-  const roomPolicyRef = useRef({ startMuted: false });
   const onReactionRef = useRef(options.onReaction);
   onReactionRef.current = options.onReaction;
 
@@ -111,12 +109,6 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
         setSelfRole(state.selfRole);
         setRecording(state.recording);
         setScreenShare(state.screenShare);
-        roomPolicyRef.current = {
-          startMuted:
-            Boolean((state as { startMuted?: boolean }).startMuted) &&
-            state.selfRole !== 'host' &&
-            state.selfRole !== 'cohost',
-        };
         setReactionsEnabledState((state as { reactionsEnabled?: boolean }).reactionsEnabled !== false);
       }),
 
@@ -201,10 +193,7 @@ export const useClassroom = (options: UseClassroomOptions): UseClassroomResult =
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
         await sfu.publishMicrophone(audioTrack);
-        if (startMuted || roomPolicyRef.current.startMuted) {
-          await sfu.setMicrophoneEnabled(false);
-          setMicrophoneEnabled(false);
-        }
+        if (startMuted) await sfu.setMicrophoneEnabled(false);
       }
 
       const videoTrack = stream.getVideoTracks()[0];

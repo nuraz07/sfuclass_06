@@ -53,20 +53,6 @@ export const createRoom = async ({ roomId, lessonId = null, mode = 'seminar', ho
   });
 
   await room.startAudioLevelObserver();
-
-  // The host's lesson defaults (Settings → Teaching). A lookup that fails
-  // leaves the mode defaults: a lesson must start either way.
-  if (hostUserId) {
-    try {
-      const { getPreferences } = await import('../identity/Profile.js');
-      const { roomDefaults } = await getPreferences(hostUserId);
-      room.settings.reactionsEnabled = roomDefaults.reactionsEnabled;
-      room.settings.startMuted = roomDefaults.learnersJoinMuted;
-    } catch (cause) {
-      log.warn({ err: cause, roomId }, 'host lesson defaults unavailable; using mode defaults');
-    }
-  }
-
   rooms.set(roomId, room);
 
   log.info({ roomId, lessonId, mode, breakout: Boolean(breakoutParent) }, 'room created');

@@ -144,30 +144,11 @@ export const getPublic = async ({ userId, viewerId }) => {
 
   return {
     ...rowToPublic(row),
-    // Read by applyVisibility() and removed there; never sent as is.
-    visibility: row.visibility ?? 'tenant',
     isBlockedByViewer: Boolean(ctx[0]?.blocked_by_viewer),
     sharedSpaceCount: sharedSpaces,
     // Presence is hidden when they have switched it off, never inflated.
     presence: 'offline',
   };
-};
-
-/**
- * What a viewer may see of a profile, by the owner's "Who can see your
- * profile" setting:
- *
- *   tenant        everyone in the organisation sees headline, bio and links
- *   shared-only   only people who share a course, space or live lesson with
- *                 them (and teachers); everyone else sees the name only
- *   private       the name only, for everyone
- *
- * The name, role and the Message button stay visible in every case.
- */
-export const applyVisibility = (profile, { sharesContext = false } = {}) => {
-  const { visibility = 'tenant', ...rest } = profile;
-  const full = visibility === 'tenant' || (visibility === 'shared-only' && sharesContext);
-  return full ? rest : { ...rest, headline: null, bio: null, links: [] };
 };
 
 export const getByHandle = async ({ handle, viewerId }) => {
@@ -241,17 +222,10 @@ const uniqueHandle = async (displayName) => {
 };
 
 export const update = async ({ userId, patch }) => {
-  // display_name, locale and time zone live on the user row; the rest on the profile.
+  // display_name lives on the user row; the rest on the profile.
   if (patch.displayName !== undefined) {
     const Users = await import('./User.js');
     await Users.update({ userId, patch: { displayName: patch.displayName } });
-  }
-  if (patch.locale !== undefined || patch.timeZone !== undefined) {
-    await pool.query(
-      `UPDATE users SET locale = coalesce($2, locale), time_zone = coalesce($3, time_zone), updated_at = now()
-        WHERE id = $1`,
-      [userId, patch.locale ?? null, patch.timeZone ?? null],
-    );
   }
 
   const columns = { handle: 'handle', headline: 'headline', bio: 'bio', links: 'links' };
@@ -260,8 +234,7 @@ export const update = async ({ userId, patch }) => {
 
   for (const [key, column] of Object.entries(columns)) {
     if (patch[key] === undefined) continue;
-    const value = key === 'handle' ? String(patch[key]).toLowerCase() : patch[key];
-    params.push(key === 'links' ? JSON.stringify(value) : value);
+    params.push(key === 'links' ? JSON.stringify(patch[key]) : patch[key]);
     sets.push(`${column} = $${params.length}${key === 'links' ? '::jsonb' : ''}`);
   }
 
@@ -333,58 +306,6 @@ export const setAvatar = async ({ userId, assetId }) => {
 
   await pool.query(`UPDATE profiles SET avatar_asset_id = $2, updated_at = now() WHERE user_id = $1`, [userId, assetId]);
   return getOwn(userId);
-};
-
-// ---------------------------------------------------------------------------
-// Preferences (021) — definition and validation in settings/preferences.js
-// ---------------------------------------------------------------------------
-
-export const getPreferences = async (userId) => {
-  const { withDefaults } = await import('../settings/preferences.js');
-  const { rows } = await pool.query(`SELECT preferences FROM profiles WHERE user_id = $1`, [userId]);
-  return withDefaults(rows[0]?.preferences ?? {});
-};
-
-/**
- * Validates and merges one change. Room defaults are for teachers and owners
- * only: they decide how that person's lessons start.
- */
-export const updatePreferences = async ({ userId, patch }) => {
-  const { PreferencesPatchSchema, mergePatch, withDefaults, TEACHING_ROLES } = await import('../settings/preferences.js');
-
-  const parsed = PreferencesPatchSchema.safeParse(patch ?? {});
-  if (!parsed.success) {
-    throw Object.assign(new Error('Unknown or invalid preference.'), { code: 'validation_failed' });
-  }
-
-  if (parsed.data.roomDefaults) {
-    const { rows } = await pool.query(`SELECT role FROM users WHERE id = $1`, [userId]);
-    if (!TEACHING_ROLES.has(rows[0]?.role)) {
-      throw Object.assign(new Error('Only teachers can set lesson defaults.'), { code: 'forbidden' });
-    }
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const { rows } = await client.query(
-      `SELECT preferences FROM profiles WHERE user_id = $1 FOR UPDATE`,
-      [userId],
-    );
-    if (!rows[0]) throw Object.assign(new Error('No profile for this account.'), { code: 'not_found' });
-    const next = mergePatch(rows[0].preferences ?? {}, parsed.data);
-    await client.query(
-      `UPDATE profiles SET preferences = $2::jsonb, updated_at = now() WHERE user_id = $1`,
-      [userId, JSON.stringify(next)],
-    );
-    await client.query('COMMIT');
-    return withDefaults(next);
-  } catch (cause) {
-    await client.query('ROLLBACK');
-    throw cause;
-  } finally {
-    client.release();
-  }
 };
 
 // ---------------------------------------------------------------------------
@@ -498,6 +419,5 @@ export const canMessage = ({
 export default {
   canMessage, getOwn, getPublic, getByHandle, search, createForUser, update,
   updatePrivacy, updateNotifications, setAvatar, block, unblock,
-  getPreferences, updatePreferences,
   listBlocks, isBlockedEitherWay,
 };
