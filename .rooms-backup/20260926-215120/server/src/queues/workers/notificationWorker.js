@@ -42,18 +42,6 @@ import * as AccountDeletion from '../../identity/accountDeletion.js';
 
 const redis = utilityConnection('notify');
 
-/** Where a reminder leads: a scheduled room's lobby, a lesson, or the dashboard. */
-const reminderUrl = async (session, sessionId) => {
-  try {
-    const { pool } = await import('../../db/pool.js');
-    const { rows } = await pool.query('SELECT room_code FROM scheduled_sessions WHERE id = $1', [sessionId]);
-    if (rows[0]?.room_code) return `/rooms/${rows[0].room_code}/lobby`;
-  } catch {
-    // Before migration 024 there is no room_code; fall through.
-  }
-  return session.lessonId ? `/lessons/${session.lessonId}/live` : '/';
-};
-
 const DEDUPE_TTL_SECONDS = 120;
 
 /* ------------------------------------------------------------------ *
@@ -301,7 +289,7 @@ async function sessionReminder(job, log) {
       recipientIds,
       title: session.title,
       body: ruleKey === 'T-10m' ? 'Starts in 10 minutes' : `Starts ${when}`,
-      url: await reminderUrl(session, sessionId),
+      url: session.lessonId ? `/lessons/${session.lessonId}/live` : '/',
       dedupeKey: `session:${sessionId}:${ruleKey}`,
       channels: ruleKey === 'T-10m' ? ['push', 'in-app'] : ['email', 'push', 'in-app'],
       data: { sessionId, lessonId: session.lessonId ?? null },

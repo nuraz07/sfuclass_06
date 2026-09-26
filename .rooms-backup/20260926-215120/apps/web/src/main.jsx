@@ -35,8 +35,6 @@ const MessagesPage = lazy(() => import('./pages/MessagesPage.jsx'));
 const MediaPage = lazy(() => import('./pages/MediaPage.jsx'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage.jsx'));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage.jsx'));
-const RoomEditorPage = lazy(() => import('./pages/RoomEditorPage.jsx'));
-const RoomLobbyPage = lazy(() => import('./pages/RoomLobbyPage.jsx'));
 
 function Loading() {
   return <p className="app app-empty">Loading…</p>;
@@ -68,13 +66,10 @@ createRoot(document.getElementById('root')).render(
                 <Route path="media" element={<MediaPage />} />
                 <Route path="settings" element={<SettingsPage />} />
                 <Route path="settings/:tab" element={<SettingsPage />} />
-                <Route path="rooms/new" element={<RoomEditorPage />} />
-                <Route path="rooms/:code/edit" element={<RoomEditorPage />} />
               </Route>
 
               {/* The classroom sits outside the layout on purpose: no nav, no
                   chat dock, nothing competing with the lesson for the screen. */}
-              <Route path="/rooms/:code/lobby" element={<RoomLobbyPage />} />
               <Route path="/rooms/:roomId" element={<ClassroomPage />} />
               <Route path="/lessons/:lessonId/live" element={<ClassroomPage />} />
 

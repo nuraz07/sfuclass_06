@@ -32,7 +32,6 @@ export * from './api/communityApi.js';
 export * from './api/mediaApi.js';
 export * from './api/chatApi.js';
 export * from './api/profileApi.js';
-export * from './api/roomsApi.js';
 export * from './api/accountApi.js';
 export * from './api/accountSecurityApi.js';
 export * from './api/progressApi.js';

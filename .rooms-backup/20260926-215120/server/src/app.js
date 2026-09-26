@@ -49,7 +49,6 @@ import authRoutes from './routes/auth.routes.js';
 import roomRoutes from './routes/rooms.routes.js';
 import billingRoutes from './routes/billing.routes.js';
 import classroomRoutes from './routes/classroom.routes.js';
-import scheduledRoomsRoutes from './routes/scheduledRooms.routes.js';
 import routeResolveRoutes from './routes/route-resolve.routes.js';
 import courseRoutes from './routes/course.routes.js';
 import progressRoutes from './routes/progress.routes.js';
@@ -142,7 +141,6 @@ export const createApp = () => {
   app.use('/rooms', roomRoutes);
   app.use('/internal', routeResolveRoutes);
   app.use('/classroom', classroomRoutes);
-  app.use('/scheduled-rooms', scheduledRoomsRoutes); // Rooms
   app.use('/courses', courseRoutes);
   app.use('/progress', progressRoutes);
   app.use('/community', communityRoutes);

@@ -46,7 +46,6 @@ import { createWebRtcTransport } from '../mediasoup/createWebRtcTransport.js';
 import { isDraining } from '../lifecycle/drainSfu.js';
 import { consumeSocketBudget } from '../middleware/rateLimit.js';
 import * as CapacityGuard from '../capacity/CapacityGuard.js';
-import * as ScheduledRooms from '../rooms/ScheduledRooms.js';
 import { env } from '../config/env.js';
 import { logger } from '../observability/logger.js';
 import { metrics } from '../observability/metrics.js';
@@ -137,10 +136,6 @@ export function registerSocketHandlers(io) {
   });
 
   namespace.on('connection', (socket) => registerSocket(namespace, socket));
-
-  // Scheduled rooms: closed at their end time, freed seats handed to the
-  // waiting list (rooms/ScheduledRooms.js).
-  ScheduledRooms.startEnforcer({ listRoomIds: RoomManager.listRoomIds, closeRoom: RoomManager.closeRoom });
   return namespace;
 }
 
@@ -334,14 +329,8 @@ async function onJoin({ socket }, payload) {
     avatarUrl: avatarUrl ?? null,
   };
 
-  // A room someone scheduled (rooms/ScheduledRooms.js): when its doors open,
-  // who is on the guest list, whether a host lets people in, how many seats.
-  // null for every other room, whose join is unchanged.
-  const scheduled = await ScheduledRooms.admissionFor({ roomId, userId, tenantId });
-  if (scheduled && !scheduled.allowed) fail(scheduled.code, scheduled.message);
-
-  const seat = await CapacityGuard.reserveSeat({ tenantId, roomId, userId, limit: scheduled?.capacity ?? 0 });
-  if (!seat.granted) fail('room_full', 'The room is full. Join the waiting list from the lobby.');
+  const seat = await CapacityGuard.reserveSeat({ tenantId, roomId, userId });
+  if (!seat.granted) fail('room_full', 'The room is full for this plan');
 
   let room;
   let peer;
@@ -351,16 +340,12 @@ async function onJoin({ socket }, payload) {
       (await RoomManager.createRoom({
         roomId,
         lessonId: payload.lessonId ?? null,
-        // A scheduled room belongs to its host; any other room to whoever opens it.
-        hostUserId: scheduled?.hostId ?? userId,
+        hostUserId: userId, // whoever opens the room owns it
       }));
-    ScheduledRooms.applyToRoom(room, scheduled);
 
     // Waiting room and lock belong to ModerationControls. A knock allocates no
     // router resources, so a flood of them costs nothing.
-    const knocked = scheduled?.role === 'host' || scheduled?.role === 'cohost'
-      ? { admitted: true }
-      : ModerationControls.knock(room, { peerId: socket.id, user });
+    const knocked = ModerationControls.knock(room, { peerId: socket.id, user });
 
     if (!knocked.admitted) {
       if (knocked.waiting) {
@@ -378,7 +363,7 @@ async function onJoin({ socket }, payload) {
       new Peer({
         id: socket.id,
         user,
-        role: scheduled?.role ?? (room.hostUserId === userId ? 'host' : 'learner'),
+        role: room.hostUserId === userId ? 'host' : 'learner',
         device: payload.device ?? {},
       }),
     );

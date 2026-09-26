@@ -9,8 +9,6 @@ import ControlBar from '../components/Classroom/ControlBar.jsx';
 import ClassroomChatPanel from '../components/Classroom/ClassroomChatPanel.jsx';
 import VideoTile from '../components/Classroom/VideoTile.jsx';
 import { lessonJoinDefaults, withMediaPreferences } from '../lib/preferences.js';
-import { useRoomGate } from '../lib/useRoomGate.js';
-import RoomClock from '../components/Rooms/RoomClock.jsx';
 
 /**
  * Classroom  (F1)
@@ -26,8 +24,6 @@ export default function ClassroomPage() {
   const { roomId } = useParams();
   const navigate = useNavigate();
   const { session, status } = useCore();
-  // Scheduled rooms: too early, not invited or no seat → the lobby, not an error.
-  const gate = useRoomGate(roomId);
 
   const { sfu, deviceAdapter: baseDeviceAdapter, screenShareAdapter } = useSfuClient();
   // Settings → Lessons: chosen camera and microphone, noise suppression, data
@@ -70,13 +66,13 @@ export default function ClassroomPage() {
       sfu,
       deviceAdapter,
       roomId,
-      autoJoin: status === 'authenticated' && gate.ready && gate.canEnter,
+      autoJoin: status === 'authenticated',
       // Above ten people, arriving unmuted is a room full of keyboard noise.
       startMuted: joinDefaults.startMuted,
       startCameraOff: joinDefaults.startCameraOff,
       onReaction,
     }),
-    [sfu, deviceAdapter, roomId, status, onReaction, gate.ready, gate.canEnter],
+    [sfu, deviceAdapter, roomId, status, onReaction],
   );
   const classroom = useClassroom(classroomOptions);
 
@@ -128,10 +124,6 @@ export default function ClassroomPage() {
     window.addEventListener('pagehide', onHide);
     return () => window.removeEventListener('pagehide', onHide);
   }, [sfu]);
-
-  if (gate.ready && !gate.canEnter) {
-    return <Navigate to={`/rooms/${roomId}/lobby`} replace />;
-  }
 
   if (status === 'restoring') {
     return (
@@ -186,7 +178,6 @@ export default function ClassroomPage() {
     <main className="room">
       <header className="room__header">
         <h1 className="room__title">Lesson</h1>
-        <RoomClock roomId={roomId} canModerate={canModerate} />
         <span className={`badge badge--${connection}`}>{connection}</span>
         <button
           type="button"
