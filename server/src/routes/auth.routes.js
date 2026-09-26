@@ -1,5 +1,17 @@
 /**
- * auth.routes — login · refresh · logout · devices (F5)
+ * auth.routes — login · second step · passkeys · refresh · logout · devices (F5, Settings Phase C)
+ *
+ * Phase C: POST /login answers { secondFactorRequired, challengeId, methods }
+ * instead of tokens when the account has two-step sign-in. The session is
+ * created only by the second step:
+ *
+ *   POST /login/second-factor                   { challengeId, code }
+ *   POST /login/second-factor/passkey/options   { challengeId }
+ *   POST /login/second-factor/passkey           { challengeId, optionsId, response }
+ *   POST /passkey/options                       sign in with a passkey alone
+ *   POST /passkey                               { optionsId, response }
+ *
+ * All of them answer exactly like /login (cookie, body, wantsRefreshToken).
  *
  * The split that matters here: the API is bearer-token based, but the refresh
  * token lives in an httpOnly, SameSite=Strict cookie. That is why CSRF
@@ -33,6 +45,7 @@ import * as AuthService from '../identity/AuthService.js';
 import * as DeviceRegistry from '../identity/DeviceRegistry.js';
 import { env } from '../config/env.js';
 import { rateLimit } from '../middleware/rateLimit.js';
+import { auditFromRequest } from '../security/auditLog.js';
 import { route, validate, requireAuth, noStore, unauthorised } from './_helpers.js';
 
 const router = Router();
@@ -148,14 +161,142 @@ router.post(
       userAgent: req.get('user-agent') ?? null,
     });
 
-    const body = issue(res, tokens);
-    if (req.body.wantsRefreshToken) {
-      body.refreshToken = tokens.refreshToken;
-      // The client needs this to refresh; Sessions.rotate looks the family up
-      // by id, not by token.
-      body.sessionId = tokens.sessionId;
+    // Two-step sign-in: no cookie, no token — only the challenge.
+    if (tokens.secondFactorRequired) {
+      noStore(res);
+      return {
+        secondFactorRequired: true,
+        challengeId: tokens.challengeId,
+        methods: tokens.methods,
+        expiresInSec: tokens.expiresInSec,
+      };
     }
-    return body;
+
+    return respondWithSession(req, res, tokens);
+  }),
+);
+
+/** Tokens as /login has always answered them. */
+function respondWithSession(req, res, tokens) {
+  const body = issue(res, tokens);
+  if (req.body?.wantsRefreshToken) {
+    body.refreshToken = tokens.refreshToken;
+    // The client needs this to refresh; Sessions.rotate looks the family up
+    // by id, not by token.
+    body.sessionId = tokens.sessionId;
+  }
+  return body;
+}
+
+/** A refused second step, recorded on the account it was for, so its owner sees it. */
+const auditSecondStepFailure = async (req, challengeId, method) => {
+  try {
+    const { read } = await import('../identity/loginChallenge.js');
+    const challenge = await read(challengeId);
+    if (!challenge?.userId) return;
+    const asAccount = Object.create(req);
+    asAccount.user = { id: challenge.userId, userId: challenge.userId };
+    await auditFromRequest(asAccount, {
+      action: 'auth.second_factor.failed',
+      targetType: 'user',
+      targetId: challenge.userId,
+      metadata: { method },
+    });
+  } catch {
+    // History is best effort; the refusal itself already happened.
+  }
+};
+
+const secondStepBody = z.object({
+  challengeId: z.string().min(16).max(128),
+  device: deviceSchema.optional(),
+  wantsRefreshToken: z.boolean().default(false),
+});
+
+router.post(
+  '/login/second-factor',
+  rateLimit({ key: 'auth:second-factor', points: 20, durationSec: 300, by: ['ip'] }),
+  validate({ body: secondStepBody.extend({ code: z.string().min(6).max(20) }) }),
+  route(async (req, res) => {
+    let tokens;
+    try {
+      tokens = await AuthService.completeSecondFactor({
+        challengeId: req.body.challengeId,
+        code: req.body.code,
+        device: req.body.device,
+      });
+    } catch (error) {
+      if (error?.code === 'unauthenticated') await auditSecondStepFailure(req, req.body.challengeId, 'code');
+      throw error;
+    }
+    return respondWithSession(req, res, tokens);
+  }),
+);
+
+router.post(
+  '/login/second-factor/passkey/options',
+  rateLimit({ key: 'auth:passkey-options', points: 30, durationSec: 300, by: ['ip'] }),
+  validate({ body: z.object({ challengeId: z.string().min(16).max(128) }) }),
+  route(async (req, res) => {
+    noStore(res);
+    return AuthService.secondFactorPasskeyOptions({
+      challengeId: req.body.challengeId,
+      requestOrigin: req.get('origin') ?? null,
+    });
+  }),
+);
+
+const passkeyResponse = z.object({ id: z.string().min(1).max(1024) }).passthrough();
+
+router.post(
+  '/login/second-factor/passkey',
+  rateLimit({ key: 'auth:second-factor', points: 20, durationSec: 300, by: ['ip'] }),
+  validate({ body: secondStepBody.extend({ optionsId: z.string().uuid(), response: passkeyResponse }) }),
+  route(async (req, res) => {
+    let tokens;
+    try {
+      tokens = await AuthService.completeSecondFactorWithPasskey({
+        challengeId: req.body.challengeId,
+        optionsId: req.body.optionsId,
+        response: req.body.response,
+        device: req.body.device,
+      });
+    } catch (error) {
+      if (error?.code === 'unauthenticated') await auditSecondStepFailure(req, req.body.challengeId, 'passkey');
+      throw error;
+    }
+    return respondWithSession(req, res, tokens);
+  }),
+);
+
+/** Sign in with a passkey alone: the browser offers the passkeys it holds for this site. */
+router.post(
+  '/passkey/options',
+  rateLimit({ key: 'auth:passkey-options', points: 30, durationSec: 300, by: ['ip'] }),
+  route(async (req, res) => {
+    noStore(res);
+    return AuthService.passkeySignInOptions({ requestOrigin: req.get('origin') ?? null });
+  }),
+);
+
+router.post(
+  '/passkey',
+  rateLimit({ key: 'auth:login', points: 10, durationSec: 300, by: ['ip'] }),
+  validate({
+    body: z.object({
+      optionsId: z.string().uuid(),
+      response: passkeyResponse,
+      device: deviceSchema.optional(),
+      wantsRefreshToken: z.boolean().default(false),
+    }),
+  }),
+  route(async (req, res) => {
+    const tokens = await AuthService.signInWithPasskey({
+      optionsId: req.body.optionsId,
+      response: req.body.response,
+      device: req.body.device ?? { platform: 'web' },
+    });
+    return respondWithSession(req, res, tokens);
   }),
 );
 

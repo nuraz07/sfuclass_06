@@ -11,6 +11,7 @@ import TeachingSettings from '../components/Settings/TeachingSettings.jsx';
 import NotificationSettings from '../components/Settings/NotificationSettings.jsx';
 import SecuritySettings from '../components/Settings/SecuritySettings.jsx';
 import ActivitySettings from '../components/Settings/ActivitySettings.jsx';
+import DataSettings from '../components/Settings/DataSettings.jsx';
 import { searchSettings } from '../components/Settings/settingsIndex.js';
 import { mergeDeep, pickDeep } from '../components/Settings/notificationsModel.js';
 import { cacheLocale, cachePreferences } from '../lib/preferences.js';
@@ -18,7 +19,7 @@ import { liveEventsAvailable, onUserEvent } from '../lib/userEvents.js';
 import '../components/Settings/settings.css';
 
 /**
- * Settings  (Phase A + B)
+ * Settings  (Phase A + B + C)
  *
  * One tab per topic, each with its own address (/settings/<tab>), a search
  * across every setting, and no Save button: every change is saved the moment
@@ -27,12 +28,14 @@ import '../components/Settings/settings.css';
  *   profile        how others see you, and a preview of exactly that
  *   privacy        check-up, private messages, visibility, blocked people
  *   notifications  type × channel, push, tests, quiet hours, focus, muted chats
- *   security       signed-in devices, sign out elsewhere, sign-in history
+ *   security       password, two-step sign-in, passkeys, signed-in devices,
+ *                  sign out elsewhere, sign-in history
  *   activity       recent changes to your settings
  *   region         language, time zone, date and time format
  *   lessons        how you join, sound processing, device test
  *   appearance     text size, motion
  *   teaching       how your lessons start (teachers and owners only)
+ *   data           download your data, delete your account
  *
  * A change made on another device arrives live (settings:changed) and the
  * page reloads what it shows; without a live connection it reloads when the
@@ -49,6 +52,7 @@ const ALL_TABS = [
   { id: 'lessons', label: 'Lessons' },
   { id: 'appearance', label: 'Appearance' },
   { id: 'teaching', label: 'Teaching', roles: ['teacher', 'owner'] },
+  { id: 'data', label: 'Your data' },
 ];
 
 /** An own save echoes back as settings:changed; ignore echoes this soon after one. */
@@ -392,6 +396,7 @@ export default function SettingsPage() {
               {tab === 'lessons' && <LessonSettings {...tabProps} />}
               {tab === 'appearance' && <AppearanceSettings {...tabProps} />}
               {tab === 'teaching' && <TeachingSettings {...tabProps} />}
+              {tab === 'data' && <DataSettings announce={announce} reloadKey={reloadKey} />}
             </>
           )}
         </div>

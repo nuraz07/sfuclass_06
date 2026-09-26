@@ -9,3 +9,9 @@
 .nt-toast__close:hover, .nt-toast__close:focus-visible { opacity: 1; }
 @keyframes nt-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .nt-toast { animation: none; } }
+
+/* Account scheduled for deletion — see components/system/DeletionBanner.jsx (Phase C) */
+.nt-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; padding: 10px 16px; background: #fef3c7; color: #78350f; border-bottom: 1px solid #f59e0b; }
+.nt-banner a { color: inherit; font-weight: 600; }
+.nt-banner__action { border: 1px solid #b45309; border-radius: 8px; padding: 6px 12px; background: #fff; color: #78350f; font: inherit; font-weight: 700; cursor: pointer; }
+.nt-banner__action:disabled { opacity: .6; cursor: default; }

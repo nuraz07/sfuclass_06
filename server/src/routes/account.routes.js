@@ -16,7 +16,10 @@
  *   DELETE /sessions/:sessionId           sign one device out
  *   POST   /sessions/sign-out-others      sign out everywhere else
  *   GET    /login-history                 sign-ins and failed attempts
- *   GET    /activity                      recent settings changes
+ *   GET    /activity                      recent settings and security changes
+ *
+ * Password, two-step sign-in, passkeys and "your data" are in
+ * accountSecurity.routes.js, under /account/security.
  *
  * A test notification is sent from here directly rather than through the
  * queue, so the answer says what actually happened ("sent to 2 browsers",
@@ -339,7 +342,7 @@ const readHistory = async ({ userId, actions, cursor, limit }) => {
       ip: row.ip ?? null,
       section: row.metadata?.section ?? null,
       fields: Array.isArray(row.metadata?.fields) ? row.metadata.fields : [],
-      detail: row.metadata?.device ?? row.metadata?.reason ?? null,
+      detail: row.metadata?.device ?? row.metadata?.reason ?? row.metadata?.method ?? null,
       count: typeof row.metadata?.count === 'number' ? row.metadata.count : null,
     })),
     nextCursor: rows.length > limit && page.length ? String(page.at(-1).id) : null,
@@ -353,7 +356,7 @@ router.get(
     res.set('Cache-Control', 'no-store');
     return readHistory({
       userId: req.user.id,
-      actions: [SIGN_IN_SUCCEEDED, SIGN_IN_FAILED],
+      actions: [SIGN_IN_SUCCEEDED, SIGN_IN_FAILED, 'auth.second_factor.failed'],
       cursor: q(req).cursor,
       limit: Number(q(req).limit ?? 20),
     });
@@ -367,7 +370,20 @@ router.get(
     res.set('Cache-Control', 'no-store');
     return readHistory({
       userId: req.user.id,
-      actions: ['settings.changed', 'auth.session.revoked'],
+      actions: [
+        'settings.changed',
+        'auth.session.revoked',
+        // Phase C: password, two-step sign-in, passkeys, your data
+        'security.password.changed',
+        'security.totp.enabled',
+        'security.totp.disabled',
+        'security.recovery_codes.regenerated',
+        'security.passkey.added',
+        'security.passkey.removed',
+        'account.exported',
+        'account.deletion.requested',
+        'account.deletion.cancelled',
+      ],
       cursor: q(req).cursor,
       limit: Number(q(req).limit ?? 20),
     });

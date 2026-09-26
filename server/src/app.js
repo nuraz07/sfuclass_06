@@ -58,6 +58,7 @@ import assignmentRoutes from './routes/assignment.routes.js';
 import messagingRoutes from './routes/messaging.routes.js';
 import profileRoutes from './routes/profile.routes.js';
 import accountRoutes from './routes/account.routes.js';
+import accountSecurityRoutes from './routes/accountSecurity.routes.js';
 
 export const createApp = () => {
   const app = express();
@@ -135,6 +136,7 @@ export const createApp = () => {
   app.use('/auth', authRoutes);
   app.use('/profiles', profileRoutes);
   app.use('/account', accountRoutes); // Settings, Phase B
+  app.use('/account/security', accountSecurityRoutes); // Settings, Phase C
   app.use('/billing', billingRoutes);
   app.use('/rooms', roomRoutes);
   app.use('/internal', routeResolveRoutes);

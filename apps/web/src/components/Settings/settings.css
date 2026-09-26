@@ -121,3 +121,24 @@
 
 .st-linkbutton { border: 0; padding: 0; background: none; color: #2563eb; font: inherit; text-decoration: underline; cursor: pointer; }
 .btn--danger { background: #b91c1c; color: #fff; border-color: #b91c1c; }
+
+/* ---- Phase C: password, two-step sign-in, passkeys, your data ---- */
+
+.st-form { display: flex; flex-direction: column; gap: 12px; max-width: 420px; }
+.st-check-row { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.st-confirm { display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 10px; background: rgba(127,127,127,.08); max-width: 560px; }
+.st-confirm .st-linkbutton { align-self: flex-start; }
+
+.st-codes { display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 10px; border: 2px dashed #f59e0b; background: rgba(245,158,11,.07); max-width: 520px; }
+.st-codes__list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 24px; margin: 0; padding-inline-start: 22px; }
+.st-codes__list code { font-size: 1rem; letter-spacing: .06em; }
+
+.st-totp { display: flex; flex-direction: column; gap: 12px; max-width: 560px; }
+.st-steps { margin: 0; padding-inline-start: 20px; display: flex; flex-direction: column; gap: 4px; }
+.st-totp__pair { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+.st-totp__qr { border-radius: 8px; background: #fff; padding: 6px; }
+.st-totp__key { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.st-totp__secret { font-size: .95rem; letter-spacing: .08em; word-break: break-all; }
+.st-code-input { max-width: 10em; font-size: 1.2rem; letter-spacing: .2em; }
+
+.st-danger-zone { display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 10px; border: 1px solid rgba(185,28,28,.35); }

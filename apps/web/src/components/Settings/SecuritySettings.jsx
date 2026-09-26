@@ -1,10 +1,15 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { createAccountSecurityApi, useCore } from '@classroom/core-client';
 import { Section } from './fields.jsx';
+import { PasskeySection, PasswordSection, TwoStepSection } from './AccountProtection.jsx';
 import { describeHistoryEntry, relativeTime } from './notificationsModel.js';
 import { formatDate, formatTime } from '../../lib/preferences.js';
 
 /**
- * Sign-in & devices  (Settings, Phase B)
+ * Sign-in & devices  (Settings, Phase B + C)
+ *
+ * Phase C puts password, two-step sign-in and passkeys at the top
+ * (AccountProtection.jsx).
  *
  * Every device signed in to the account, this one marked, each with a way to
  * sign it out; "sign out everywhere else"; and the sign-ins and failed
@@ -69,6 +74,48 @@ export function HistoryList({ load, empty, reloadKey }) {
   );
 }
 
+/** Password, two-step sign-in and passkeys, loaded together. */
+function Protection({ announce, reloadKey }) {
+  const { http } = useCore();
+  const security = useMemo(() => createAccountSecurityApi(http), [http]);
+  const [overview, setOverview] = useState(null);
+  const [failed, setFailed] = useState(false);
+
+  const reload = useCallback(async () => {
+    try {
+      setOverview(await security.overview());
+      setFailed(false);
+    } catch {
+      setFailed(true);
+    }
+  }, [security]);
+
+  useEffect(() => {
+    reload();
+  }, [reload, reloadKey]);
+
+  if (failed && !overview) {
+    return (
+      <Section id="password" title="Password and two-step sign-in">
+        <p className="st-error">These settings could not be loaded.</p>
+        <button type="button" className="btn" onClick={reload}>
+          Try again
+        </button>
+      </Section>
+    );
+  }
+  if (!overview) return <p className="st-hint">Loading…</p>;
+
+  const props = { security, overview, announce, reload };
+  return (
+    <>
+      <PasswordSection {...props} />
+      <TwoStepSection {...props} />
+      <PasskeySection {...props} />
+    </>
+  );
+}
+
 export default function SecuritySettings({ account, announce, reloadKey }) {
   const [sessions, setSessions] = useState(null);
   const [confirming, setConfirming] = useState(null);
@@ -119,6 +166,8 @@ export default function SecuritySettings({ account, announce, reloadKey }) {
 
   return (
     <>
+      <Protection announce={announce} reloadKey={reloadKey} />
+
       <Section
         id="sessions"
         title="Where you are signed in"

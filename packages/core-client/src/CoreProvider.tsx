@@ -31,6 +31,12 @@
  * That is a development trade, not a design. Restoring the cookie path means
  * dropping `wantsRefreshToken` and letting refresh read the cookie again.
  *
+ * Two-step sign-in (Settings, Phase C). For an account with an authenticator
+ * app or a passkey, POST /auth/login answers with a challenge instead of
+ * tokens. signIn() then throws SecondFactorRequired, and the sign-in page
+ * finishes with completeSignIn() (a code) or signInWithPasskey() (a passkey,
+ * with or without a password first). Nothing is signed in before that.
+ *
  * CSRF. middleware/csrf.js issues the cookie on the way out but validates on
  * the way in, so the very first call to a protected route can never succeed — a
  * client cannot echo a token it has not been given. Bootstrapping therefore
@@ -71,7 +77,7 @@ export interface Session {
 export type AuthStatus = 'restoring' | 'authenticated' | 'anonymous';
 
 /** What auth.routes.js `issue()` puts in the body. */
-interface TokenResponse {
+export interface TokenResponse {
   accessToken: string;
   expiresIn: number;
   tokenType: 'Bearer';
@@ -79,6 +85,39 @@ interface TokenResponse {
   /** Present only when the request asked for it. */
   refreshToken?: string;
   sessionId?: string;
+}
+
+/** POST /auth/login for an account with two-step sign-in. */
+interface ChallengeResponse {
+  secondFactorRequired: true;
+  challengeId: string;
+  methods: Array<'totp' | 'recovery' | 'passkey'>;
+  expiresInSec?: number;
+}
+
+/**
+ * Thrown by signIn() when the password was right and a second step is needed.
+ * Not an ApiError: nothing failed.
+ */
+export class SecondFactorRequired extends Error {
+  readonly secondFactorRequired = true;
+  readonly challengeId: string;
+  readonly methods: ChallengeResponse['methods'];
+  readonly expiresInSec: number;
+
+  constructor(challenge: ChallengeResponse) {
+    super('A second step is needed to sign in.');
+    this.name = 'SecondFactorRequired';
+    this.challengeId = challenge.challengeId;
+    this.methods = challenge.methods ?? [];
+    this.expiresInSec = challenge.expiresInSec ?? 300;
+  }
+}
+
+/** WebAuthn options as the server sends them (JSON, base64url). */
+export interface PasskeyOptions {
+  optionsId: string;
+  options: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +136,18 @@ export interface CoreContextValue {
   wsUrl: string;
   /** Handed to SfuClient and to any socket the classroom route opens. */
   getAccessToken(): string | null;
+  /** Throws SecondFactorRequired when the account has two-step sign-in. */
   signIn(credentials: { email: string; password: string }): Promise<Session>;
+  /** The second step with a code from the authenticator app or a recovery code. */
+  completeSignIn(input: { challengeId: string; code: string }): Promise<Session>;
+  /** Options for a passkey: the second step (with a challengeId) or a sign-in on its own. */
+  passkeyOptions(input?: { challengeId?: string | null }): Promise<PasskeyOptions>;
+  /** Finishes a passkey sign-in with the browser's answer. */
+  signInWithPasskey(input: {
+    challengeId?: string | null;
+    optionsId: string;
+    response: Record<string, unknown>;
+  }): Promise<Session>;
   signOut(): Promise<void>;
 }
 
@@ -292,6 +342,17 @@ export function CoreProvider({
   // Actions
   // -------------------------------------------------------------------------
 
+  /** Takes the tokens of any successful sign-in: password, second step or passkey. */
+  const adopt = useCallback((result: TokenResponse): Session => {
+    accessTokenRef.current = result.accessToken;
+    refreshTokenRef.current = result.refreshToken ?? null;
+    sessionIdRef.current = result.sessionId ?? null;
+
+    setSession(result.user);
+    setStatus('authenticated');
+    return result.user;
+  }, []);
+
   const signIn = useCallback<CoreContextValue['signIn']>(
     async (credentials) => {
       const headers = await csrfHeaders();
@@ -306,17 +367,54 @@ export function CoreProvider({
           wantsRefreshToken: true,
         },
         { anonymous: true, headers },
+      )) as TokenResponse | ChallengeResponse;
+
+      if ('secondFactorRequired' in result && result.secondFactorRequired) {
+        throw new SecondFactorRequired(result);
+      }
+      return adopt(result as TokenResponse);
+    },
+    [http, csrfHeaders, adopt],
+  );
+
+  const completeSignIn = useCallback<CoreContextValue['completeSignIn']>(
+    async ({ challengeId, code }) => {
+      const headers = await csrfHeaders();
+      const result = (await http.post(
+        '/auth/login/second-factor',
+        { challengeId, code, device: { platform: 'web' }, wantsRefreshToken: true },
+        // Not retried: a code is single-use, a replay would be refused anyway.
+        { anonymous: true, headers, retry: { attempts: 1 } },
       )) as TokenResponse;
+      return adopt(result);
+    },
+    [http, csrfHeaders, adopt],
+  );
 
-      accessTokenRef.current = result.accessToken;
-      refreshTokenRef.current = result.refreshToken ?? null;
-      sessionIdRef.current = result.sessionId ?? null;
-
-      setSession(result.user);
-      setStatus('authenticated');
-      return result.user;
+  const passkeyOptions = useCallback<CoreContextValue['passkeyOptions']>(
+    async ({ challengeId = null } = {}) => {
+      const headers = await csrfHeaders();
+      return (await http.post(
+        challengeId ? '/auth/login/second-factor/passkey/options' : '/auth/passkey/options',
+        challengeId ? { challengeId } : {},
+        { anonymous: true, headers, retry: { attempts: 1 } },
+      )) as PasskeyOptions;
     },
     [http, csrfHeaders],
+  );
+
+  const signInWithPasskey = useCallback<CoreContextValue['signInWithPasskey']>(
+    async ({ challengeId = null, optionsId, response }) => {
+      const headers = await csrfHeaders();
+      const body = { optionsId, response, device: { platform: 'web' }, wantsRefreshToken: true };
+      const result = (await http.post(
+        challengeId ? '/auth/login/second-factor/passkey' : '/auth/passkey',
+        challengeId ? { ...body, challengeId } : body,
+        { anonymous: true, headers, retry: { attempts: 1 } },
+      )) as TokenResponse;
+      return adopt(result);
+    },
+    [http, csrfHeaders, adopt],
   );
 
   const signOut = useCallback<CoreContextValue['signOut']>(async () => {
@@ -369,6 +467,9 @@ export function CoreProvider({
       wsUrl,
       getAccessToken,
       signIn,
+      completeSignIn,
+      passkeyOptions,
+      signInWithPasskey,
       signOut,
     }),
     [
@@ -382,6 +483,9 @@ export function CoreProvider({
       wsUrl,
       getAccessToken,
       signIn,
+      completeSignIn,
+      passkeyOptions,
+      signInWithPasskey,
       signOut,
     ],
   );

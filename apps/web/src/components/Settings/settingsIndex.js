@@ -39,6 +39,11 @@ export const SETTINGS_INDEX = [
   { tab: 'security', anchor: 'sign-out-others', label: 'Sign out everywhere else', keywords: 'sign out log out everywhere other devices' },
   { tab: 'security', anchor: 'login-history', label: 'Sign-in history', keywords: 'login sign in history failed attempts security' },
   { tab: 'activity', anchor: 'changes', label: 'Recent changes', keywords: 'history changes activity log audit' },
+  { tab: 'security', anchor: 'password', label: 'Change password', keywords: 'password change new security' },
+  { tab: 'security', anchor: 'two-step', label: 'Two-step sign-in', keywords: '2fa two factor two-step authenticator app code otp totp recovery codes security' },
+  { tab: 'security', anchor: 'passkeys', label: 'Passkeys', keywords: 'passkey webauthn fingerprint face id touch id windows hello passwordless security key' },
+  { tab: 'data', anchor: 'export', label: 'Download your data', keywords: 'export download data copy gdpr takeout' },
+  { tab: 'data', anchor: 'delete-account', label: 'Delete your account', keywords: 'delete remove close account deactivate gdpr' },
 ];
 
 export const searchSettings = (query, tabs) => {

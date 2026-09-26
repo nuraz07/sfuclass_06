@@ -16,6 +16,13 @@
  * renamed user taking fifteen minutes to take effect, and a token that is a
  * cache is a cache nobody can invalidate.
  *
+ * Two-step sign-in (Settings, Phase C): someone with an authenticator app or
+ * a passkey gets a challenge from login() instead of a session. Nothing is
+ * signed in until completeSecondFactor() or completeSecondFactorWithPasskey()
+ * accepts the second step — no half-signed-in session exists that other code
+ * would have to remember to refuse. signInWithPasskey() signs in with a
+ * passkey alone (the device checks fingerprint, face or PIN).
+ *
  * Timing is treated as a side channel throughout. A sign-in attempt for an
  * address that does not exist still hashes a password, and every failure
  * returns the same message — otherwise the endpoint is a directory of who has
@@ -28,6 +35,7 @@ import { logger } from '../observability/logger.js';
 import * as Users from './User.js';
 import * as Sessions from './SessionStore.js';
 import * as Profiles from './Profile.js';
+import * as LoginChallenge from './loginChallenge.js';
 
 const log = logger.child({ component: 'auth' });
 
@@ -202,9 +210,22 @@ export const login = async ({ email, password, device }) => {
   }
 
   // Opportunistic upgrade when the hashing parameters have been raised since
-  // this password was last set.
+  // this password was last set. Written directly: Users.updatePassword also
+  // signs every device out, which a silent rehash must not do.
   if (Users.needsRehash(credentials.passwordHash)) {
-    await Users.updatePassword({ userId: credentials.userId, password }).catch(() => undefined);
+    const { pool } = await import('../db/pool.js');
+    await pool
+      .query(`UPDATE users SET password_hash = $2 WHERE id = $1`, [credentials.userId, await Users.hashPassword(password)])
+      .catch(() => undefined);
+  }
+
+  // Two-step sign-in: the password was right, the session waits for the second step.
+  const SecondFactor = await import('./secondFactor.js');
+  const methods = await SecondFactor.methodsFor(credentials.userId);
+  if (methods.length > 0) {
+    const { challengeId, expiresInSec } = await LoginChallenge.create({ userId: credentials.userId, device });
+    log.info({ userId: credentials.userId, methods }, 'password accepted; second step required');
+    return { secondFactorRequired: true, challengeId, methods, expiresInSec };
   }
 
   await Users.recordSuccessfulLogin(credentials.userId);
@@ -214,6 +235,89 @@ export const login = async ({ email, password, device }) => {
 
   log.info({ userId: user.userId, platform: device?.platform }, 'signed in');
   return { user, ...session };
+};
+
+// ---------------------------------------------------------------------------
+// Second step (Settings, Phase C)
+// ---------------------------------------------------------------------------
+
+const secondStepFailed = (left) =>
+  Object.assign(
+    new Error(
+      left > 0
+        ? `That code is not right. ${left} ${left === 1 ? 'attempt' : 'attempts'} left.`
+        : 'Too many wrong codes. Sign in with your password again.',
+    ),
+    { code: 'unauthenticated', attemptsLeft: left },
+  );
+
+const challengeGone = () =>
+  Object.assign(new Error('The sign-in took too long. Enter your password again.'), { code: 'unauthenticated' });
+
+const finishSignIn = async ({ userId, device, method }) => {
+  const user = await Users.findById(userId);
+  if (!user || user.status !== 'active') throw invalidCredentials();
+  await Users.recordSuccessfulLogin(userId);
+  const session = await startSession({ user, device });
+  log.info({ userId, method, platform: device?.platform }, 'signed in');
+  return { user, ...session, secondFactor: method };
+};
+
+/** A code from the authenticator app, or a recovery code. */
+export const completeSecondFactor = async ({ challengeId, code, device }) => {
+  const challenge = await LoginChallenge.read(challengeId);
+  if (!challenge) throw challengeGone();
+
+  const SecondFactor = await import('./secondFactor.js');
+  const method = await SecondFactor.verifyCode({ userId: challenge.userId, code });
+  if (!method) throw secondStepFailed(await LoginChallenge.recordFailure(challengeId));
+
+  if (!(await LoginChallenge.consume(challengeId))) throw challengeGone();
+  return finishSignIn({ userId: challenge.userId, device: device ?? challenge.device, method });
+};
+
+/** Options for a passkey as the second step of this sign-in. */
+export const secondFactorPasskeyOptions = async ({ challengeId, requestOrigin }) => {
+  const challenge = await LoginChallenge.read(challengeId);
+  if (!challenge) throw challengeGone();
+  const Passkeys = await import('./passkeys.js');
+  return Passkeys.authenticationOptions({ userId: challenge.userId, requestOrigin, context: { challengeId } });
+};
+
+export const completeSecondFactorWithPasskey = async ({ challengeId, optionsId, response, device }) => {
+  const challenge = await LoginChallenge.read(challengeId);
+  if (!challenge) throw challengeGone();
+
+  const Passkeys = await import('./passkeys.js');
+  let verified;
+  try {
+    verified = await Passkeys.verifyAuthentication({ optionsId, response });
+  } catch (cause) {
+    await LoginChallenge.recordFailure(challengeId);
+    throw cause;
+  }
+  if (verified.userId !== challenge.userId || verified.context?.challengeId !== challengeId) {
+    throw secondStepFailed(await LoginChallenge.recordFailure(challengeId));
+  }
+  if (!(await LoginChallenge.consume(challengeId))) throw challengeGone();
+  return finishSignIn({ userId: challenge.userId, device: device ?? challenge.device, method: 'passkey' });
+};
+
+/** Sign in with a passkey alone. */
+export const passkeySignInOptions = async ({ requestOrigin }) => {
+  const Passkeys = await import('./passkeys.js');
+  return Passkeys.authenticationOptions({ userId: null, requestOrigin });
+};
+
+export const signInWithPasskey = async ({ optionsId, response, device }) => {
+  const Passkeys = await import('./passkeys.js');
+  const verified = await Passkeys.verifyAuthentication({ optionsId, response });
+  const { pool } = await import('../db/pool.js');
+  const { rows } = await pool.query(`SELECT status FROM users WHERE id = $1 AND deleted_at IS NULL`, [verified.userId]);
+  if (rows[0]?.status === 'suspended') {
+    throw Object.assign(new Error('This account has been suspended.'), { code: 'forbidden' });
+  }
+  return finishSignIn({ userId: verified.userId, device, method: 'passkey-only' });
 };
 
 const startSession = async ({ user, device }) => {
@@ -312,6 +416,38 @@ export const logoutEverywhere = async ({ userId, exceptSessionId = null }) => {
 
 export const listDevices = (userId) => Sessions.listSessions(userId);
 
+/**
+ * GET /auth/me. auth.routes has called this since v6; it did not exist, so
+ * the route answered 500.
+ */
+export const describeSession = async ({ userId, sessionId }) => {
+  const [user, session] = await Promise.all([Users.findById(userId), sessionId ? Sessions.getSession(sessionId) : null]);
+  if (!user) throw Object.assign(new Error('Sign in to continue.'), { code: 'unauthenticated' });
+  return {
+    user,
+    session: session
+      ? {
+          sessionId,
+          device: session.device ?? null,
+          createdAt: session.createdAt ? new Date(session.createdAt).toISOString() : null,
+          lastUsedAt: session.lastUsedAt ? new Date(session.lastUsedAt).toISOString() : null,
+        }
+      : { sessionId: sessionId ?? null },
+  };
+};
+
+/**
+ * DELETE /auth/devices/:deviceId, also called since v6 and also missing.
+ * Accepts a session id and signs that session out, the same way Settings →
+ * Sign-in & devices does.
+ */
+export const revokeDeviceSession = async (userId, sessionId) => {
+  const { revoke } = await import('./deviceSessions.js');
+  const result = await revoke({ userId, sessionId });
+  if (!result) throw Object.assign(new Error('No such device.'), { code: 'not_found' });
+  return true;
+};
+
 // ---------------------------------------------------------------------------
 // Email verification and password reset
 // ---------------------------------------------------------------------------
@@ -404,7 +540,11 @@ export const resetPassword = async ({ token, password }) => {
   return { userId };
 };
 
-/** Changing a password requires the current one, even while signed in. */
+/**
+ * Changing a password requires the current one, even while signed in.
+ * v6 path: signs every device out, this one included. Settings uses
+ * security/passwordChange.js, which keeps this device signed in.
+ */
 export const changePassword = async ({ userId, currentPassword, newPassword }) => {
   const user = await Users.findById(userId);
   const credentials = await Users.findCredentials(user.email);
@@ -431,5 +571,7 @@ export const safeEqual = (a, b) => {
 export default {
   register, login, refresh, logout, logoutEverywhere, listDevices,
   issueAccessToken, verifyAccessToken, verifyEmail, requestPasswordReset,
-  resetPassword, changePassword,
+  resetPassword, changePassword, describeSession, revokeDeviceSession,
+  completeSecondFactor, secondFactorPasskeyOptions, completeSecondFactorWithPasskey,
+  passkeySignInOptions, signInWithPasskey,
 };

@@ -22,6 +22,7 @@
  *   session.reminder            ReminderRules, T-24h and T-10m
  *   digest.daily                community digest by email
  *   notification.focus.flush    the summary after a lesson
+ *   account.deletion            anonymises accounts whose grace period is over (Phase C)
  *
  * Push delivery never throws, so a retried job cannot notify everyone twice.
  * An email that fails is logged per person for the same reason; only a
@@ -37,6 +38,7 @@ import * as ReminderRules from '../../scheduling/ReminderRules.js';
 import * as Rules from '../../settings/notifications.js';
 import * as Delivery from '../../notifications/delivery.js';
 import * as Focus from '../../notifications/focus.js';
+import * as AccountDeletion from '../../identity/accountDeletion.js';
 
 const redis = utilityConnection('notify');
 
@@ -65,6 +67,13 @@ const handlers = {
   'session.reminder': sessionReminder,
   'digest.daily': digest,
   'notification.focus.flush': focusFlush,
+  // Not a notification, but it needs a worker that runs every job it is given
+  // (the maintenance worker skips jobs another task holds the lock for).
+  'account.deletion': async (_job, log) => {
+    const result = await AccountDeletion.runDue();
+    log.info(result, 'account deletion: sweep done');
+    return result;
+  },
 };
 
 export function createNotificationWorker() {
@@ -207,6 +216,14 @@ async function deliver(n, log) {
 const ACCOUNT_EMAIL = {
   'email.verify': { actionLabel: 'Confirm email address', body: 'Confirm that this address is yours. The link works for 24 hours.' },
   'password.reset': { actionLabel: 'Choose a new password', body: 'Someone asked to reset your password. If that was not you, ignore this email. The link works for one hour.' },
+  // Phase C: changes that matter if someone else has taken over the account.
+  'security.password.changed': { actionLabel: 'Check your security settings', body: 'The password of your Classroom account was just changed. If that was not you, reset your password now and sign out every device.' },
+  'security.totp.enabled': { actionLabel: 'Check your security settings', body: 'Two-step sign-in with an authenticator app is now on for your account. If that was not you, reset your password now.' },
+  'security.totp.disabled': { actionLabel: 'Check your security settings', body: 'The authenticator app was removed from your account. If that was not you, reset your password now.' },
+  'security.passkey.added': { actionLabel: 'Check your passkeys', body: 'A passkey was added to your account. If that was not you, remove it and reset your password.' },
+  'security.passkey.removed': { actionLabel: 'Check your passkeys', body: 'A passkey was removed from your account. If that was not you, reset your password now.' },
+  'security.account.deletion_requested': { actionLabel: 'Keep my account', body: 'You asked us to delete your Classroom account. Until the date in the subject, signing in and pressing Cancel keeps it. After that it cannot be restored.' },
+  'security.account.deletion_cancelled': { actionLabel: 'Open Classroom', body: 'Your account will not be deleted. If you did not cancel the deletion yourself, check your security settings.' },
 };
 
 /**

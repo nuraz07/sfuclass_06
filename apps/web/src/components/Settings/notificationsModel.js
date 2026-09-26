@@ -118,6 +118,30 @@ export const describeHistoryEntry = (entry) => {
       return entry.detail === 'too-many-attempts'
         ? 'Sign-in blocked after too many attempts'
         : 'Failed sign-in attempt (wrong password)';
+    case 'auth.second_factor.failed':
+      return entry.detail === 'passkey'
+        ? 'Password right, passkey refused'
+        : 'Password right, wrong second-step code';
+    case 'security.password.changed':
+      return (entry.count ?? 0) > 0
+        ? `Password changed; ${entry.count} other ${entry.count === 1 ? 'device' : 'devices'} signed out`
+        : 'Password changed';
+    case 'security.totp.enabled':
+      return 'Two-step sign-in turned on (authenticator app)';
+    case 'security.totp.disabled':
+      return 'Authenticator app removed';
+    case 'security.recovery_codes.regenerated':
+      return 'New recovery codes made; the old ones stopped working';
+    case 'security.passkey.added':
+      return entry.detail ? `Passkey added: ${entry.detail}` : 'Passkey added';
+    case 'security.passkey.removed':
+      return entry.detail ? `Passkey removed: ${entry.detail}` : 'Passkey removed';
+    case 'account.exported':
+      return 'Your data was downloaded';
+    case 'account.deletion.requested':
+      return 'Account deletion requested';
+    case 'account.deletion.cancelled':
+      return 'Account deletion cancelled';
     case 'auth.session.revoked':
       if ((entry.count ?? 1) > 1) return `Signed out ${entry.count} other devices`;
       return entry.detail ? `Signed out ${entry.detail}` : 'Signed out another device';

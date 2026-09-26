@@ -3,6 +3,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { createAccountApi, createProfileApi, useCore } from '@classroom/core-client';
 import ErrorBoundary from '../components/system/ErrorBoundary.jsx';
 import NotificationToasts from '../components/system/NotificationToasts.jsx';
+import DeletionBanner from '../components/system/DeletionBanner.jsx';
 import { cacheLocale, cachePreferences } from '../lib/preferences.js';
 import { onServiceWorkerMessage, resyncPush } from '../lib/pushClient.js';
 import { onUserEvent } from '../lib/userEvents.js';
@@ -13,6 +14,8 @@ import { onUserEvent } from '../lib/userEvents.js';
  * The boundary sits around <Outlet/> rather than around the whole layout, so a
  * page that throws loses the page and keeps the navigation — a user who can
  * still click away from a broken screen is not stuck.
+ *
+ * Phase C adds the banner for an account that is scheduled for deletion.
  *
  * Phase B adds three invisible helpers: SessionWatch (a device signed out
  * from elsewhere goes back to the sign-in page), NotificationToasts (a new
@@ -35,6 +38,8 @@ export default function AppLayout() {
           <NavLink to="/settings">Settings</NavLink>
         </nav>
       </header>
+
+      <DeletionBanner />
 
       <main className="app__content">
         <ErrorBoundary area="page">

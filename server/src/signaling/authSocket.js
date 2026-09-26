@@ -33,6 +33,7 @@ import { randomUUID } from 'node:crypto';
 import { verifyAccessToken } from '../identity/AuthService.js';
 import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
+import * as SessionActivity from '../security/sessionActivity.js';
 
 const log = logger.child({ component: 'auth-socket' });
 
@@ -108,6 +109,13 @@ export const authSocket = async (socket, next) => {
     const code = cause?.code === 'token_revoked' ? 'token_revoked' : 'unauthenticated';
     log.debug({ socketId: socket.id, traceId, code }, 'handshake rejected');
     return next(reject(code, cause?.message ?? 'The access token is not valid'));
+  }
+
+  // Settings → Sign-in & devices (Phase B) marks a signed-out session at once;
+  // its access token would otherwise open sockets until it expires.
+  if (await SessionActivity.isRevoked(claims.sessionId)) {
+    log.debug({ socketId: socket.id, traceId }, 'handshake for a signed-out device');
+    return next(reject('token_revoked', 'This device was signed out.'));
   }
 
   let identity;
