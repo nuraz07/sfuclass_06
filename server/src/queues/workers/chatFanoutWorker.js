@@ -1,38 +1,33 @@
 /**
- * chatFanoutWorker — unread counters, mentions (F6)
+ * chatFanoutWorker — who hears about a chat message  (F6 · Settings Phase B)
  *
- * The send path does the minimum: persist the message, emit it to the Socket.IO room, ack.
- * Everything that can happen a beat later happens here, because chat delivery latency is an
- * alarm (p95 under a second) and counting badges for a 500-person channel is not something
- * the sender should wait for.
+ * The send path does the minimum: store the message, put it on everyone's
+ * screen, count it unread (DirectMessageService). Deciding who else should
+ * hear about it happens here, a beat later, so a slow push provider never
+ * delays a message that is already visible.
  *
- * What "a beat later" must still guarantee:
- *  - Counters are exact, not approximate. They are Redis INCRs keyed per participant, and
- *    the job is idempotent per message so a redelivered job cannot double-count: a set
- *    marker per (message, participant) gates the increment.
- *  - A participant who is actively looking at the conversation is not incremented, and
- *    their read marker moves instead. Otherwise the badge appears and clears every time
- *    somebody types.
- *  - Push is only for people who are offline everywhere. That decision is made here and
- *    handed to the notify queue, which owns preferences and quiet hours.
+ * For each message:
  *
- * Ordering is not guaranteed between jobs, and it does not need to be: counters are
- * commutative, and the read marker keeps the furthest message it has seen.
+ *   recipients   a private chat: its participants, minus the author and
+ *                anyone who muted it. A channel (the lesson's default
+ *                chatroom): only people who opted in under Settings →
+ *                Notifications, since the audience is the whole organisation.
+ *                Mentioned people always count, unless a block stands between.
+ *
+ *   presence     looking at the app → nothing more (the badge moves).
+ *                In a lesson → held for the summary afterwards, if they have
+ *                focus on. Away or offline → a notification job, where the
+ *                settings, quiet hours and dedupe decide the channels.
+ *
+ * The job loads the message itself, so the producer only needs its id, and a
+ * message deleted before the job runs notifies nobody.
  */
 
 import { defineWorker, enqueue, QUEUE_NAMES, PermanentJobError } from '../queues.js';
-import { utilityConnection } from '../connection.js';
-import * as UnreadService from '../../messaging/UnreadService.js';
-import * as ConversationService from '../../messaging/ConversationService.js';
-import * as DirectMessageService from '../../messaging/DirectMessageService.js';
-import * as ChatSearchService from '../../messaging/ChatSearchService.js';
-import * as PresenceService from '../../realtime/PresenceService.js';
-import { metrics } from '../../observability/metrics.js';
-
-const redis = utilityConnection('chat-fanout');
-
-/** How long the per-message dedupe marker lives. Longer than any plausible retry chain. */
-const FANOUT_MARKER_TTL_SECONDS = 3600;
+import { pool } from '../../db/pool.js';
+import * as LiveState from '../../realtime/liveState.js';
+import * as NotificationService from '../../community/NotificationService.js';
+import * as Focus from '../../notifications/focus.js';
 
 const handlers = {
   'chat.message.fanout': fanoutMessage,
@@ -49,142 +44,230 @@ export function createChatFanoutWorker() {
 }
 
 /* ------------------------------------------------------------------ *
+ * Loading
+ * ------------------------------------------------------------------ */
+
+const loadMessage = async (messageId) => {
+  const { rows } = await pool.query(
+    `SELECT m.message_id, m.author_id, m.body, m.mentions, m.conversation_id, m.channel_id,
+            m.deleted_at, u.display_name AS author_name, ch.name AS channel_name
+       FROM messages m
+       JOIN users u ON u.id = m.author_id
+       LEFT JOIN channels ch ON ch.channel_id = m.channel_id
+      WHERE m.message_id = $1`,
+    [messageId],
+  );
+  return rows[0] ?? null;
+};
+
+/** The other people in a private chat who have not left it or muted it. */
+const conversationRecipients = async (conversationId, authorId) => {
+  const { rows } = await pool.query(
+    `SELECT cp.user_id
+       FROM conversation_participants cp
+       JOIN users u ON u.id = cp.user_id AND u.deleted_at IS NULL
+      WHERE cp.conversation_id = $1
+        AND cp.user_id <> $2
+        AND cp.left_at IS NULL
+        AND NOT (coalesce(cp.muted, false) AND (cp.muted_until IS NULL OR cp.muted_until > now()))`,
+    [conversationId, authorId],
+  );
+  return rows.map((row) => row.user_id);
+};
+
+/** People who asked to hear about the channel, minus mutes and blocks. */
+const channelOptIns = async (channelId, authorId) => {
+  const { rows } = await pool.query(
+    `SELECT np.user_id
+       FROM notification_preferences np
+       JOIN users u ON u.id = np.user_id AND u.deleted_at IS NULL AND u.status = 'active'
+       JOIN channels ch ON ch.channel_id = $1 AND ch.archived_at IS NULL AND ch.tenant_id = u.tenant_id
+      WHERE np.user_id <> $2
+        AND (coalesce((np.channels -> 'channelMessages' ->> 'inApp')::boolean, false)
+          OR coalesce((np.channels -> 'channelMessages' ->> 'push')::boolean, false)
+          OR coalesce((np.channels -> 'channelMessages' ->> 'email')::boolean, false))
+        AND NOT EXISTS (SELECT 1 FROM channel_members cm
+                         WHERE cm.channel_id = $1 AND cm.user_id = np.user_id AND cm.muted
+                           AND (cm.muted_until IS NULL OR cm.muted_until > now()))
+        AND NOT EXISTS (SELECT 1 FROM blocks b
+                         WHERE (b.user_id = np.user_id AND b.blocked_id = $2)
+                            OR (b.user_id = $2 AND b.blocked_id = np.user_id))
+        AND (ch.scope = 'public'
+          OR (ch.scope = 'space' AND EXISTS (SELECT 1 FROM space_memberships s
+                                              WHERE s.space_id = ch.scope_ref_id AND s.user_id = np.user_id))
+          OR (ch.scope = 'course' AND EXISTS (SELECT 1 FROM enrollments e
+                                               WHERE e.course_id = ch.scope_ref_id AND e.user_id = np.user_id
+                                                 AND e.status = 'active')))
+      LIMIT 5000`,
+    [channelId, authorId],
+  );
+  return rows.map((row) => row.user_id);
+};
+
+/** Mentioned people the author is not blocked with, either way. */
+const unblocked = async (authorId, userIds) => {
+  if (userIds.length === 0) return [];
+  const { rows } = await pool.query(
+    `SELECT DISTINCT CASE WHEN user_id = $1 THEN blocked_id ELSE user_id END AS other
+       FROM blocks
+      WHERE (user_id = $1 AND blocked_id = ANY($2::uuid[]))
+         OR (blocked_id = $1 AND user_id = ANY($2::uuid[]))`,
+    [authorId, userIds],
+  );
+  const blocked = new Set(rows.map((row) => row.other));
+  return userIds.filter((id) => !blocked.has(id));
+};
+
+/** 'in-class', 'online' or 'offline', from the presence gateway (realtime/liveState.js). */
+const presenceOf = (userId) => LiveState.stateOf(userId);
+
+const preview = (text) => {
+  const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return value.length > 160 ? `${value.slice(0, 159)}…` : value || 'Sent an attachment';
+};
+
+/* ------------------------------------------------------------------ *
  * Fan-out
  * ------------------------------------------------------------------ */
 
 async function fanoutMessage(job, log) {
-  const { messageId, conversationId, channelId, senderId, preview, mentions = [] } = job.data;
-  if (!messageId || (!conversationId && !channelId)) {
-    throw new PermanentJobError('chat fan-out needs a messageId and a conversation or channel');
+  // The producer's payload has changed shape over time; accept every one of them.
+  const messageId =
+    job.data?.messageId ?? job.data?.message?.messageId ?? job.data?.message?.id ?? job.data?.id ?? null;
+  if (!messageId) throw new PermanentJobError('chat fan-out needs a messageId');
+
+  const message = await loadMessage(messageId);
+  if (!message || message.deleted_at) return { skipped: 'message gone' };
+  if (!message.conversation_id && !message.channel_id) return { skipped: 'lesson chat' };
+
+  const authorId = message.author_id;
+  const sender = message.author_name ?? 'Someone';
+  const conversationId = message.conversation_id ?? null;
+  const channelId = message.channel_id ?? null;
+  const url = conversationId ? `/messages/${conversationId}` : '/messages';
+
+  const recipients = conversationId
+    ? await conversationRecipients(conversationId, authorId)
+    : await channelOptIns(channelId, authorId);
+
+  const mentioned = await unblocked(
+    authorId,
+    [...new Set((message.mentions ?? []).map(String))].filter((id) => id !== authorId),
+  );
+  const mentionSet = new Set(mentioned);
+
+  const away = { message: [], mention: [] };
+  let looking = 0;
+  let held = 0;
+
+  for (const userId of new Set([...recipients, ...mentioned])) {
+    const type = mentionSet.has(userId) ? 'mention' : 'message';
+    const presence = await presenceOf(userId);
+
+    if (presence === 'in-class') {
+      const settings = await NotificationService.getSettings(userId);
+      const category = type === 'mention' ? 'mentions' : conversationId ? 'directMessages' : 'channelMessages';
+      const anyChannel = Object.values(settings.categories[category]).some(Boolean);
+      if (settings.focusDuringLessons && anyChannel) {
+        await Focus.hold(userId, { type, from: sender, conversationId, channelId });
+        held += 1;
+      }
+      continue;
+    }
+
+    if (presence === 'online') {
+      looking += 1;
+      continue;
+    }
+
+    away[type].push(userId);
   }
 
-  const scopeId = conversationId ?? channelId;
-  const participants = conversationId
-    ? await ConversationService.participantIds(conversationId)
-    : await ConversationService.channelSubscriberIds(channelId);
+  const data = { conversationId, channelId, messageId, from: sender };
 
-  const mentioned = new Set(mentions);
-  const offline = [];
-  let incremented = 0;
-  let skipped = 0;
-
-  for (const userId of participants) {
-    if (userId === senderId) {
-      // The sender has read it by definition; move their marker instead of counting.
-      await UnreadService.setReadMarker({ scopeId, userId, messageId });
-      continue;
-    }
-
-    // Idempotency gate: one increment per (message, participant), whatever the retries do.
-    const marker = `chat:fanout:${messageId}:${userId}`;
-    const first = await redis.set(marker, '1', 'EX', FANOUT_MARKER_TTL_SECONDS, 'NX');
-    if (!first) {
-      skipped += 1;
-      continue;
-    }
-
-    const presence = await PresenceService.get(userId);
-    const viewing = presence?.viewing === scopeId;
-
-    if (viewing) {
-      // Looking straight at it — treat it as read rather than flashing a badge.
-      await UnreadService.setReadMarker({ scopeId, userId, messageId });
-      continue;
-    }
-
-    await UnreadService.increment({ scopeId, userId, mention: mentioned.has(userId) });
-    incremented += 1;
-
-    const reachable = presence?.state === 'online' || presence?.state === 'in-class';
-    if (!reachable) offline.push(userId);
-  }
-
-  // Badge fan-out over the Socket.IO Redis adapter: every API task, every device.
-  await UnreadService.publishBadges({ scopeId, userIds: participants.filter((id) => id !== senderId) });
-
-  if (offline.length > 0) {
-    const sender = await ConversationService.describeSender(senderId);
+  if (away.message.length > 0) {
     await enqueue(
       QUEUE_NAMES.NOTIFY,
       'notification.fanout',
       {
-        kind: channelId ? 'chat.channel.message' : 'chat.direct.message',
-        recipientIds: offline,
-        actorId: senderId,
-        title: sender.displayName,
-        body: preview,
-        url: conversationId ? `/chat/${conversationId}` : `/channels/${channelId}`,
-        // Three messages in two minutes is one push, not three.
-        dedupeKey: `chat:${scopeId}`,
-        channels: ['push', 'in-app'],
-        data: { conversationId: conversationId ?? null, channelId: channelId ?? null, messageId },
+        kind: conversationId ? 'chat.direct.message' : 'chat.channel.message',
+        recipientIds: away.message,
+        actorId: authorId,
+        title: conversationId ? sender : `${sender} in # ${message.channel_name ?? 'chat'}`,
+        body: preview(message.body),
+        url,
+        // Three messages in two minutes are one push, not three.
+        dedupeKey: `chat:${conversationId ?? channelId}`,
+        channels: ['in-app', 'push', 'email'],
+        data,
       },
       { jobId: `chat-push:${messageId}` },
     );
   }
 
-  // Mentions are louder than a message: they bypass the per-conversation dedupe.
-  const mentionedOffline = mentions.filter((id) => id !== senderId);
-  if (mentionedOffline.length > 0) {
+  if (away.mention.length > 0) {
     await enqueue(
       QUEUE_NAMES.NOTIFY,
       'notification.fanout',
       {
         kind: 'chat.mention',
-        recipientIds: mentionedOffline,
-        actorId: senderId,
-        title: 'You were mentioned',
-        body: preview,
-        url: conversationId ? `/chat/${conversationId}` : `/channels/${channelId}`,
+        recipientIds: away.mention,
+        actorId: authorId,
+        title: `${sender} mentioned you`,
+        body: preview(message.body),
+        url,
         dedupeKey: `mention:${messageId}`,
-        channels: ['push', 'in-app'],
+        channels: ['in-app', 'push', 'email'],
+        data,
       },
       { jobId: `chat-mention:${messageId}` },
     );
   }
 
-  metrics.increment?.('chat_fanout_participants', incremented);
-  log.debug({ messageId, participants: participants.length, incremented, skipped, offline: offline.length }, 'chat: fan-out done');
-  return { participants: participants.length, incremented, skipped, pushed: offline.length };
+  const outcome = {
+    recipients: recipients.length,
+    mentioned: mentioned.length,
+    looking,
+    held,
+    notified: away.message.length + away.mention.length,
+  };
+  log.debug({ messageId, ...outcome }, 'chat: fan-out done');
+  return outcome;
 }
 
 /* ------------------------------------------------------------------ *
- * Search index
+ * Search index and read sync — run only where their services exist
  * ------------------------------------------------------------------ */
 
-/**
- * OpenSearch indexing is off the send path on purpose: a slow cluster must not slow down
- * message delivery, and a lost index entry is repairable by a reindex — a lost message is
- * not.
- */
 async function indexMessage(job, log) {
-  const { messageId } = job.data;
-  const message = await DirectMessageService.getForIndex(messageId);
-
-  if (!message || message.deletedAt) {
-    await ChatSearchService.remove(messageId);
+  const Search = await import('../../messaging/ChatSearchService.js');
+  const message = await loadMessage(job.data?.messageId ?? job.data?.message?.messageId);
+  if (!message || message.deleted_at) {
+    const remove = Search.removeFromIndex ?? Search.remove;
+    if (typeof remove === 'function') await remove(job.data.messageId);
     return { removed: true };
   }
-
-  await ChatSearchService.index(message);
-  log.debug({ messageId }, 'chat: indexed');
+  const index = Search.indexMessage ?? Search.index;
+  if (typeof index !== 'function') {
+    log.debug('chat: no search index configured');
+    return { skipped: 'no index' };
+  }
+  await index({
+    messageId: message.message_id,
+    authorId: message.author_id,
+    body: message.body,
+    target: message.conversation_id
+      ? { kind: 'conversation', conversationId: message.conversation_id }
+      : { kind: 'channel', channelId: message.channel_id },
+  });
   return { indexed: true };
 }
 
-/* ------------------------------------------------------------------ *
- * Read state
- * ------------------------------------------------------------------ */
-
-/**
- * A read from one device has to clear the badge on the others. The HTTP route updates Redis
- * synchronously; this job persists the marker to Postgres and republishes the badge, so a
- * Redis flush does not resurrect an unread count the user already cleared.
- */
 async function syncRead(job) {
-  const { scopeId, userId, messageId } = job.data;
-  await UnreadService.persistReadMarker({ scopeId, userId, messageId });
-  await UnreadService.publishBadges({ scopeId, userIds: [userId] });
-  return { synced: true };
+  const { scopeId, userId } = job.data;
+  const Unread = await import('../../messaging/UnreadService.js');
+  if (typeof Unread.rebuild === 'function' && userId) await Unread.rebuild({ userId });
+  return { synced: true, scopeId };
 }
 
 export default createChatFanoutWorker;

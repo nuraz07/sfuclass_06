@@ -23,6 +23,8 @@ import * as ConversationService from '../messaging/ConversationService.js';
 import * as ChatModerationService from '../messaging/ChatModerationService.js';
 import * as UploadService from '../media/UploadService.js';
 import { rateLimit } from '../middleware/rateLimit.js';
+import * as NotificationService from '../community/NotificationService.js';
+import { recordChange } from '../settings/changeLog.js';
 import { route, validate, requireAuth, tenantOf, q, notFound, badRequest, forbidden } from './_helpers.js';
 
 const router = Router();
@@ -84,7 +86,9 @@ router.patch(
     asHttp(async (req) => {
       const { avatarAssetId, ...patch } = req.body;
       if (avatarAssetId) await Profile.setAvatar({ userId: req.user.id, assetId: avatarAssetId });
-      return Profile.update({ userId: req.user.id, patch });
+      const next = await Profile.update({ userId: req.user.id, patch });
+      await recordChange(req, 'profile', avatarAssetId ? { ...patch, avatar: true } : patch);
+      return next;
     }),
   ),
 );
@@ -101,7 +105,33 @@ router.get(
 
 router.patch(
   '/me/preferences',
-  route(asHttp(async (req) => Profile.updatePreferences({ userId: req.user.id, patch: req.body }))),
+  route(
+    asHttp(async (req) => {
+      const next = await Profile.updatePreferences({ userId: req.user.id, patch: req.body });
+      await recordChange(req, 'preferences', req.body);
+      return next;
+    }),
+  ),
+);
+
+/**
+ * Notification settings (Phase B). The same data as GET/PATCH
+ * /account/notifications, for clients that use the profile paths.
+ */
+router.get(
+  '/me/notifications',
+  route(async (req) => NotificationService.getSettings(req.user.id)),
+);
+
+router.patch(
+  '/me/notifications',
+  route(
+    asHttp(async (req) => {
+      const next = await NotificationService.updateSettings({ userId: req.user.id, patch: req.body ?? {} });
+      await recordChange(req, 'notifications', req.body);
+      return next;
+    }),
+  ),
 );
 
 /**
@@ -116,7 +146,11 @@ const privacyBody = z.object({
   readReceipts: z.boolean().optional(),
 });
 
-const updatePrivacy = route(async (req) => Profile.updatePrivacy({ userId: req.user.id, patch: req.body }));
+const updatePrivacy = route(async (req) => {
+  const next = await Profile.updatePrivacy({ userId: req.user.id, patch: req.body });
+  await recordChange(req, 'privacy', req.body);
+  return next;
+});
 router.patch('/me/privacy', validate({ body: privacyBody }), updatePrivacy);
 router.put('/me/privacy', validate({ body: privacyBody }), updatePrivacy);
 

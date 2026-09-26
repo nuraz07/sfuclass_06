@@ -56,6 +56,7 @@
     "pg": "^8",
     "pino": "^9",
     "socket.io": "^4",
+    "web-push": "^3.6.7",
     "y-protocols": "^1.0.6",
     "yjs": "^13.6",
     "zod": "^4"

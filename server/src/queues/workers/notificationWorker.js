@@ -1,43 +1,44 @@
 /**
- * notificationWorker — push · email · in-app fan-out (F2, F6)
+ * notificationWorker — in-app · push · email  (F2, F6 · Settings Phase B)
  *
- * Every notification in the product funnels through here: a new post, a mention, a chat
- * message to someone who is offline, a session reminder from ReminderRules, the daily
- * digest. One worker, because the rules that decide whether to send are the same rules
- * every time and they should live in one place.
+ * Every notification in the product ends here: a thread reply, a mention, a
+ * chat message to someone who is away, a lesson reminder, the digest, the
+ * summary after a lesson. One worker, because the rules that decide are the
+ * same every time — settings/notifications.js#decide — and they must see the
+ * settings as they are at delivery, not as they were when the job was queued.
  *
- * Order of decisions, per recipient:
- *   1. Preferences — the channel is off for this kind → drop it, quietly.
- *   2. Presence — an in-app notification always lands; push is for people who are not
- *      looking at the app, otherwise everyone gets told twice.
- *   3. Quiet hours — time-critical kinds (a lesson starting in ten minutes) pass through;
- *      everything else is held for the digest.
- *   4. Dedupe — a Redis key per (recipient, dedupeKey). Three replies in ten seconds is
- *      one push, not three.
+ * Per person:
+ *   1. settings        the type × channel matrix from Settings → Notifications
+ *   2. focus           in a lesson, chat is held and summarised afterwards
+ *   3. presence        someone looking at the app gets no push on top
+ *   4. quiet hours     no push, unless a lesson starts and they allow it
+ *   5. dedupe          three replies in two minutes are one push, not three
  *
- * A dead push token is not an error. SNS says EndpointDisabled, the registry retires the
- * token, and the job succeeds — otherwise every uninstalled app becomes a failed job.
+ * Jobs (queue 'notify'):
+ *   notification.fanout         one notification, many people
+ *   notification.push           v6: push only (the bell entry already exists)
+ *   notification.email          one email; account emails always go out
+ *   notify.inApp                v6 jobs.notify()
+ *   session.reminder            ReminderRules, T-24h and T-10m
+ *   digest.daily                community digest by email
+ *   notification.focus.flush    the summary after a lesson
+ *
+ * Push delivery never throws, so a retried job cannot notify everyone twice.
+ * An email that fails is logged per person for the same reason; only a
+ * single-recipient account email is retried.
  */
-
-import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
-import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 
 import { defineWorker, QUEUE_NAMES, PermanentJobError } from '../queues.js';
 import { utilityConnection } from '../connection.js';
-import { env } from '../../config/env.js';
 import * as NotificationService from '../../community/NotificationService.js';
-import * as DeviceRegistry from '../../identity/DeviceRegistry.js';
-import * as PresenceService from '../../realtime/PresenceService.js';
+import * as LiveState from '../../realtime/liveState.js';
 import * as ScheduleService from '../../scheduling/ScheduleService.js';
 import * as ReminderRules from '../../scheduling/ReminderRules.js';
-import { metrics } from '../../observability/metrics.js';
+import * as Rules from '../../settings/notifications.js';
+import * as Delivery from '../../notifications/delivery.js';
+import * as Focus from '../../notifications/focus.js';
 
-const sns = new SNSClient({ region: env.SNS_REGION ?? env.AWS_REGION });
-const ses = new SESv2Client({ region: env.SES_REGION ?? env.AWS_REGION });
 const redis = utilityConnection('notify');
-
-/** Kinds that ignore quiet hours. Everything else waits for the digest. */
-const TIME_CRITICAL = new Set(['session.reminder.starting_soon', 'session.cancelled', 'security.alert']);
 
 const DEDUPE_TTL_SECONDS = 120;
 
@@ -46,9 +47,24 @@ const DEDUPE_TTL_SECONDS = 120;
  * ------------------------------------------------------------------ */
 
 const handlers = {
-  'notification.fanout': fanout,
+  'notification.fanout': (job, log) => deliver(normalize(job.data), log),
+  'notification.push': (job, log) => deliver(normalize({ ...job.data, channels: ['push'] }), log),
+  'notification.email': emailJob,
+  'notify.inApp': (job, log) =>
+    deliver(
+      normalize({
+        kind: job.data.kind,
+        recipientIds: [job.data.userId],
+        title: job.data.payload?.title ?? job.data.title,
+        body: job.data.payload?.body ?? job.data.body,
+        url: job.data.payload?.url ?? job.data.url,
+        dedupeKey: job.data.dedupeKey,
+      }),
+      log,
+    ),
   'session.reminder': sessionReminder,
   'digest.daily': digest,
+  'notification.focus.flush': focusFlush,
 };
 
 export function createNotificationWorker() {
@@ -60,155 +76,179 @@ export function createNotificationWorker() {
 }
 
 /* ------------------------------------------------------------------ *
- * Generic fan-out
+ * Fan-out
  * ------------------------------------------------------------------ */
 
-/**
- * @param {{ data: {
- *   kind: string, recipientIds: string[], title: string, body: string,
- *   url?: string, actorId?: string, dedupeKey?: string, data?: object,
- *   channels?: Array<'in-app'|'push'|'email'>
- * } }} job
- */
-async function fanout(job, log) {
-  const { kind, recipientIds = [], title, body, url = null, actorId = null, dedupeKey = null } = job.data;
-  if (!kind || recipientIds.length === 0) throw new PermanentJobError('fanout needs a kind and recipients');
+/** Both payload shapes in use: v7 (kind, recipientIds, url) and v6 (type, userIds, href). */
+const normalize = (data = {}) => ({
+  kind: data.kind ?? data.type ?? null,
+  recipientIds: [...new Set(data.recipientIds ?? data.userIds ?? (data.userId ? [data.userId] : []))],
+  title: data.title ?? '',
+  body: data.body ?? null,
+  url: data.url ?? data.href ?? null,
+  actorId: data.actorId ?? null,
+  dedupeKey: data.dedupeKey ?? null,
+  channels: (data.channels ?? ['in-app', 'push', 'email']).map(Rules.normalizeChannel),
+  data: data.data ?? {},
+  skipHold: Boolean(data.skipHold),
+});
 
-  const requested = job.data.channels ?? ['in-app', 'push'];
-  const result = { delivered: 0, suppressed: 0, byChannel: { 'in-app': 0, push: 0, email: 0 } };
+/** 'in-class', 'online' or 'offline', from the presence gateway (realtime/liveState.js). */
+const presenceOf = (userId) => LiveState.stateOf(userId);
 
-  for (const recipientId of recipientIds) {
-    if (recipientId === actorId) continue; // never notify someone about their own action
+const heldItem = (n, category) => ({
+  type: category === 'mentions' ? 'mention' : 'message',
+  from: n.data.from ?? n.title ?? null,
+  conversationId: n.data.conversationId ?? null,
+  channelId: n.data.channelId ?? null,
+});
 
-    const decision = await decide({ recipientId, kind, requested, dedupeKey });
-    if (decision.channels.length === 0) {
+async function deliver(n, log) {
+  if (!n.kind || n.recipientIds.length === 0) {
+    throw new PermanentJobError('a notification needs a kind and recipients', { kind: n.kind });
+  }
+
+  const result = { delivered: 0, suppressed: 0, held: 0, byChannel: { inApp: 0, push: 0, email: 0 } };
+
+  for (const recipientId of n.recipientIds) {
+    // Never tell someone about their own action.
+    if (recipientId === n.actorId) continue;
+
+    const context = await NotificationService.getDeliveryContext(recipientId);
+    if (!context?.active) {
       result.suppressed += 1;
       continue;
     }
 
-    if (decision.channels.includes('in-app')) {
-      await NotificationService.createInApp({ userId: recipientId, kind, title, body, url, actorId, data: job.data.data });
-      result.byChannel['in-app'] += 1;
+    const presence = await presenceOf(recipientId);
+    let decision = Rules.decide({
+      kind: n.kind,
+      settings: context.settings,
+      presence,
+      requested: n.channels,
+      timeZone: context.timeZone,
+    });
+
+    if (decision.hold) {
+      if (!n.skipHold) {
+        await Focus.hold(recipientId, heldItem(n, decision.category));
+        result.held += 1;
+        continue;
+      }
+      decision = Rules.decide({
+        kind: n.kind,
+        settings: context.settings,
+        presence: 'online',
+        requested: n.channels,
+        timeZone: context.timeZone,
+      });
     }
-    if (decision.channels.includes('push')) {
-      result.byChannel.push += await sendPush({ recipientId, title, body, url, kind, data: job.data.data }, log);
+
+    let { channels } = decision;
+
+    if (n.dedupeKey && channels.some((channel) => channel !== 'inApp')) {
+      const fresh = await redis.set(`notify:dedupe:${recipientId}:${n.dedupeKey}`, '1', 'EX', DEDUPE_TTL_SECONDS, 'NX');
+      if (!fresh) channels = channels.filter((channel) => channel === 'inApp');
     }
-    if (decision.channels.includes('email')) {
-      result.byChannel.email += await sendEmail({ recipientId, title, body, url, kind }, log);
+
+    if (channels.length === 0) {
+      result.suppressed += 1;
+      continue;
+    }
+
+    // "Show message text" off: lock screens and inboxes say who, not what.
+    const hideText = Rules.CHAT_CATEGORIES.has(decision.category) && !context.settings.showPreviews;
+    const outsideBody = hideText ? 'Open Classroom to read it.' : n.body;
+
+    if (channels.includes('inApp')) {
+      await NotificationService.createInApp({
+        userId: recipientId,
+        kind: n.kind,
+        title: n.title,
+        body: n.body,
+        url: n.url,
+        actorId: n.actorId,
+        data: n.data,
+      });
+      result.byChannel.inApp += 1;
+    }
+
+    if (channels.includes('push')) {
+      const sent = await Delivery.sendPush({ userId: recipientId, title: n.title, body: outsideBody, url: n.url, kind: n.kind });
+      result.byChannel.push += sent.delivered;
+    }
+
+    if (channels.includes('email') && context.email && !context.emailSuppressed) {
+      try {
+        const rendered = Delivery.renderEmail({
+          title: n.title,
+          body: outsideBody,
+          url: n.url,
+          recipientName: context.displayName,
+        });
+        await Delivery.sendEmail({ to: context.email, ...rendered, kind: n.kind });
+        result.byChannel.email += 1;
+      } catch (cause) {
+        log.error({ err: cause, recipientId, kind: n.kind }, 'notify: email not sent');
+      }
     }
 
     result.delivered += 1;
   }
 
-  metrics.increment?.('notification_fanout', result.delivered, { kind });
-  log.info({ kind, ...result }, 'notify: fan-out done');
+  log.info({ kind: n.kind, ...result }, 'notify: delivered');
   return result;
 }
 
-/** The four gates, in order. Returns the channels that survive all of them. */
-async function decide({ recipientId, kind, requested, dedupeKey }) {
-  const preferences = await NotificationService.getPreferences(recipientId);
-
-  let channels = requested.filter((channel) => NotificationService.isEnabled(preferences, kind, channel));
-  if (channels.length === 0) return { channels };
-
-  // Someone with the app open gets the in-app badge; pushing as well is just noise.
-  const presence = await PresenceService.get(recipientId);
-  if (presence?.state === 'online' || presence?.state === 'in-class') {
-    channels = channels.filter((channel) => channel !== 'push');
-  }
-
-  if (!TIME_CRITICAL.has(kind) && NotificationService.inQuietHours(preferences)) {
-    channels = channels.filter((channel) => channel === 'in-app');
-  }
-
-  if (dedupeKey && channels.length > 0) {
-    const key = `notify:dedupe:${recipientId}:${dedupeKey}`;
-    const fresh = await redis.set(key, '1', 'EX', DEDUPE_TTL_SECONDS, 'NX');
-    if (!fresh) channels = channels.filter((channel) => channel === 'in-app');
-  }
-
-  return { channels };
-}
-
 /* ------------------------------------------------------------------ *
- * Channels
+ * Email
  * ------------------------------------------------------------------ */
 
-async function sendPush({ recipientId, title, body, url, kind, data }, log) {
-  const devices = await DeviceRegistry.activeEndpoints(recipientId);
-  let sent = 0;
+const ACCOUNT_EMAIL = {
+  'email.verify': { actionLabel: 'Confirm email address', body: 'Confirm that this address is yours. The link works for 24 hours.' },
+  'password.reset': { actionLabel: 'Choose a new password', body: 'Someone asked to reset your password. If that was not you, ignore this email. The link works for one hour.' },
+};
 
-  for (const device of devices) {
-    const message =
-      device.platform === 'ios'
-        ? JSON.stringify({
-            APNS: JSON.stringify({
-              aps: { alert: { title, body }, sound: 'default', 'thread-id': kind },
-              url,
-              ...data,
-            }),
-          })
-        : JSON.stringify({
-            GCM: JSON.stringify({
-              notification: { title, body },
-              data: { url: url ?? '', kind, ...data },
-              android: { priority: 'high' },
-            }),
-          });
+/**
+ * One email. Account emails (confirm address, reset password) go out whatever
+ * the settings say, and are retried when the mail server is unavailable.
+ * Anything else follows the settings like every other notification.
+ */
+async function emailJob(job, log) {
+  const kind = job.data.kind ?? job.data.type ?? 'system.email';
+  const userId = job.data.userId;
+  if (!userId) throw new PermanentJobError('an email needs a userId');
 
-    try {
-      await sns.send(
-        new PublishCommand({ TargetArn: device.endpointArn, MessageStructure: 'json', Message: message }),
-      );
-      sent += 1;
-    } catch (error) {
-      // An uninstalled app is not a failure of this job.
-      if (error.name === 'EndpointDisabledException' || error.name === 'InvalidParameterException') {
-        await DeviceRegistry.retireEndpoint(device.id, error.name);
-        log.info({ recipientId, deviceId: device.id }, 'notify: retired a dead push endpoint');
-        continue;
-      }
-      throw error;
-    }
+  if (Rules.categoryOf(kind) !== 'security') {
+    return deliver(normalize({ ...job.data, kind, recipientIds: [userId], channels: ['email'] }), log);
   }
-  return sent;
-}
 
-async function sendEmail({ recipientId, title, body, url, kind }, log) {
-  const recipient = await NotificationService.emailRecipient(recipientId);
-  if (!recipient?.email || recipient.suppressed) return 0;
+  const context = await NotificationService.getDeliveryContext(userId);
+  if (!context?.email) return { skipped: 'no address' };
+  if (context.emailSuppressed) return { skipped: 'address suppressed after a bounce' };
 
-  const rendered = NotificationService.renderEmail({ kind, title, body, url, recipient });
-
-  try {
-    await ses.send(
-      new SendEmailCommand({
-        FromEmailAddress: env.SES_FROM,
-        Destination: { ToAddresses: [recipient.email] },
-        Content: { Simple: { Subject: { Data: rendered.subject }, Body: { Html: { Data: rendered.html }, Text: { Data: rendered.text } } } },
-        // Lets a bounce or complaint be traced back to the notification kind.
-        EmailTags: [{ Name: 'kind', Value: kind.replace(/[^\w-]/g, '_') }],
-      }),
-    );
-    return 1;
-  } catch (error) {
-    if (error.name === 'AccountSuspendedException' || error.name === 'MessageRejected') {
-      log.error({ err: error, recipientId }, 'notify: SES rejected the message');
-      throw new PermanentJobError(`SES rejected: ${error.message}`);
-    }
-    throw error;
-  }
+  const account = ACCOUNT_EMAIL[kind] ?? { actionLabel: 'Open Classroom', body: null };
+  const rendered = Delivery.renderEmail({
+    title: job.data.title ?? 'Classroom',
+    body: job.data.body ?? account.body,
+    url: job.data.url ?? job.data.href,
+    recipientName: context.displayName,
+    actionLabel: account.actionLabel,
+    footer: 'You get this email because of an action on your Classroom account.',
+  });
+  // Throws on a mail server problem: BullMQ retries with backoff.
+  await Delivery.sendEmail({ to: context.email, ...rendered, kind });
+  log.info({ userId, kind }, 'notify: account email sent');
+  return { sent: 1 };
 }
 
 /* ------------------------------------------------------------------ *
- * Scheduling (F1, F3) and digests (F2)
+ * Lesson reminders (F1, F3)
  * ------------------------------------------------------------------ */
 
 /**
- * Enqueued by ReminderRules.enqueueDue(). The reminder row is the source of truth, so this
- * resolves the audience at send time — someone who enrolled an hour ago still gets it, and
- * someone who unenrolled does not.
+ * Enqueued by ReminderRules.enqueueDue(). The reminder row is the source of
+ * truth, so the audience is resolved at send time.
  */
 async function sessionReminder(job, log) {
   const { reminderId, sessionId, ruleKey, template } = job.data;
@@ -219,7 +259,6 @@ async function sessionReminder(job, log) {
     throw new PermanentJobError('Session no longer exists', { sessionId });
   }
   if (session.status !== 'scheduled') {
-    // Cancelled or already started between planning and firing.
     await ReminderRules.markSent(reminderId, { recipients: 0 });
     return { skipped: session.status };
   }
@@ -227,19 +266,17 @@ async function sessionReminder(job, log) {
   const recipientIds = await ScheduleService.listAudience(sessionId);
   const when = ScheduleService.formatLocal(session);
 
-  const result = await fanout(
-    {
-      data: {
-        kind: template,
-        recipientIds,
-        title: session.title,
-        body: ruleKey === 'T-10m' ? 'Starts in 10 minutes' : `Starts ${when}`,
-        url: session.lessonId ? `/lessons/${session.lessonId}/live` : `/sessions/${session.id}`,
-        dedupeKey: `session:${sessionId}:${ruleKey}`,
-        channels: ruleKey === 'T-10m' ? ['push', 'in-app'] : ['email', 'push', 'in-app'],
-        data: { sessionId, lessonId: session.lessonId },
-      },
-    },
+  const result = await deliver(
+    normalize({
+      kind: template,
+      recipientIds,
+      title: session.title,
+      body: ruleKey === 'T-10m' ? 'Starts in 10 minutes' : `Starts ${when}`,
+      url: session.lessonId ? `/lessons/${session.lessonId}/live` : '/',
+      dedupeKey: `session:${sessionId}:${ruleKey}`,
+      channels: ruleKey === 'T-10m' ? ['push', 'in-app'] : ['email', 'push', 'in-app'],
+      data: { sessionId, lessonId: session.lessonId ?? null },
+    }),
     log,
   );
 
@@ -247,18 +284,63 @@ async function sessionReminder(job, log) {
   return result;
 }
 
-/** Daily community digest — one email per user, everything they missed, in one job. */
+/* ------------------------------------------------------------------ *
+ * Digest (F2)
+ * ------------------------------------------------------------------ */
+
 async function digest(job, log) {
   const { userId, date } = job.data;
   const content = await NotificationService.buildDigest({ userId, date });
-  if (!content || content.items.length === 0) return { skipped: 'empty' };
+  if (!content || content.items.length === 0) return { skipped: 'nothing to send' };
 
-  const sent = await sendEmail(
-    { recipientId: userId, title: content.subject, body: content.summary, url: content.url, kind: 'digest.daily' },
+  const context = await NotificationService.getDeliveryContext(userId);
+  if (!context?.email || context.emailSuppressed) return { skipped: 'no address' };
+
+  const rendered = Delivery.renderEmail({
+    title: content.subject,
+    body: content.summary,
+    url: content.url,
+    recipientName: context.displayName,
+    actionLabel: 'Open the community',
+  });
+  await Delivery.sendEmail({ to: context.email, ...rendered, kind: 'digest.daily' });
+  log.info({ userId, items: content.items.length }, 'notify: digest sent');
+  return { sent: 1, items: content.items.length };
+}
+
+/* ------------------------------------------------------------------ *
+ * Focus: the summary after a lesson
+ * ------------------------------------------------------------------ */
+
+async function focusFlush(job, log) {
+  const { userId } = job.data;
+  if (!userId) throw new PermanentJobError('focus flush needs a userId');
+
+  await Focus.clearSchedule(userId);
+
+  if (await Focus.isInLesson(userId)) {
+    // Still teaching or learning: look again in a minute.
+    await Focus.scheduleFlush(userId);
+    return { waiting: true };
+  }
+
+  const items = await Focus.takeHeld(userId);
+  const summary = Focus.summarizeHeld(items);
+  if (!summary) return { empty: true };
+
+  return deliver(
+    normalize({
+      kind: 'chat.focus.summary',
+      recipientIds: [userId],
+      title: summary.title,
+      body: summary.body,
+      url: summary.url,
+      channels: ['in-app', 'push'],
+      skipHold: true,
+      data: { held: summary.count, mentions: summary.mentions },
+    }),
     log,
   );
-  metrics.increment?.('notification_digest_sent', sent);
-  return { sent, items: content.items.length };
 }
 
 export default createNotificationWorker;

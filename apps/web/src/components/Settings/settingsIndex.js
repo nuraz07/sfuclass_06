@@ -27,6 +27,18 @@ export const SETTINGS_INDEX = [
   { tab: 'appearance', anchor: 'motion', label: 'Reduce motion', keywords: 'motion animation reduce' },
   { tab: 'teaching', anchor: 'reactions', label: 'Reactions in your lessons', keywords: 'emoji reactions lesson default' },
   { tab: 'teaching', anchor: 'join-muted', label: 'Learners join muted', keywords: 'muted join learners microphone default' },
+  { tab: 'notifications', anchor: 'matrix', label: 'What you are notified about', keywords: 'notifications types channels email push in app messages mentions chatroom community courses' },
+  { tab: 'notifications', anchor: 'push', label: 'Push on this device', keywords: 'push browser device notifications enable permission' },
+  { tab: 'notifications', anchor: 'test', label: 'Send a test notification', keywords: 'test notification check email push' },
+  { tab: 'notifications', anchor: 'quiet', label: 'Quiet hours', keywords: 'quiet hours night do not disturb sleep silent' },
+  { tab: 'notifications', anchor: 'focus', label: 'Focus during lessons', keywords: 'focus lesson class summary interrupt' },
+  { tab: 'notifications', anchor: 'previews', label: 'Show message text in push and email', keywords: 'preview message text lock screen privacy' },
+  { tab: 'notifications', anchor: 'digest', label: 'Community digest', keywords: 'digest email daily weekly summary community' },
+  { tab: 'notifications', anchor: 'muted', label: 'Muted chats', keywords: 'mute muted unmute chats silence' },
+  { tab: 'security', anchor: 'sessions', label: 'Where you are signed in', keywords: 'devices sessions signed in logged in browsers phone computer' },
+  { tab: 'security', anchor: 'sign-out-others', label: 'Sign out everywhere else', keywords: 'sign out log out everywhere other devices' },
+  { tab: 'security', anchor: 'login-history', label: 'Sign-in history', keywords: 'login sign in history failed attempts security' },
+  { tab: 'activity', anchor: 'changes', label: 'Recent changes', keywords: 'history changes activity log audit' },
 ];
 
 export const searchSettings = (query, tabs) => {

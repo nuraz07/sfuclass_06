@@ -319,8 +319,11 @@ export const updatePrivacy = async ({ userId, patch }) => {
   return own?.privacy ?? null;
 };
 
-/** Notification preferences have no storage yet; the defaults are returned unchanged. */
-export const updateNotifications = async () => ({ ...DEFAULT_NOTIFICATIONS });
+/** Notification settings (Phase B): validated and stored by NotificationService. */
+export const updateNotifications = async ({ userId, patch } = {}) => {
+  const NotificationService = await import('../community/NotificationService.js');
+  return NotificationService.updateSettings({ userId, patch: patch ?? {} });
+};
 
 export const setAvatar = async ({ userId, assetId }) => {
   const { getAssetsForOwner } = await import('../media/UploadService.js');
