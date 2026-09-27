@@ -1,9 +1,6 @@
 /**
  * scheduledRooms.routes — create, plan and enter your own rooms  (Rooms)
  *
- * Links (lobby URL, QR code, calendar file) use the address the browser is
- * on (config/publicUrl.js), so they work for others, also in a Codespace.
- *
  * Mounted under /scheduled-rooms (app.js). The room itself is still joined
  * through the classroom socket at /rooms/<code>; this is everything around
  * it. Rules: rooms/roomRules.js; storage and state: rooms/ScheduledRooms.js.
@@ -13,8 +10,7 @@
  *   POST   /                           create (one room, or one per date of a series)
  *   GET    /mine?when=upcoming|past    rooms I host, co-host or am invited to
  *   GET    /:code                      the room as I may see it, with my entry state
- *   GET    /:code/gate                 may I enter now, and with which live room id?
- *                                     (the classroom page asks first)
+ *   GET    /:code/gate                 may I enter now? (the classroom page asks first)
  *   PATCH  /:code                      edit this date            host
  *   POST   /:code/cancel               { scope, reason }         host
  *   POST   /:code/extend               { minutes }               host, co-host
@@ -36,7 +32,6 @@ import { z } from 'zod';
 import * as Rooms from '../rooms/ScheduledRooms.js';
 import * as Rules from '../rooms/roomRules.js';
 import { rateLimit } from '../middleware/rateLimit.js';
-import { publicAppUrlFor } from '../config/publicUrl.js';
 import { route, validate, requireAuth, tenantOf, notFound, badRequest, forbidden, conflict } from './_helpers.js';
 
 const router = Router();
@@ -102,9 +97,7 @@ const requireHost = async (req) => {
   return loaded;
 };
 
-/** Links in the answer use the address this browser is on, never localhost for a shared link. */
-const detail = (req, room) =>
-  Rooms.detailFor({ room, userId: req.user.id, tenantId: tenantOf(req), baseUrl: publicAppUrlFor(req) });
+const detail = (req, room) => Rooms.detailFor({ room, userId: req.user.id, tenantId: tenantOf(req) });
 
 /* ------------------------------------------------------------------ *
  * Planning
@@ -197,14 +190,7 @@ router.get(
     const room = await Rooms.findByCode(req.params.code);
     if (!room) return { scheduled: false, canEnter: true };
     const { decision } = await Rooms.decide({ room, userId: req.user.id, tenantId: tenantOf(req) });
-    return {
-      scheduled: true,
-      canEnter: decision.allowed,
-      reason: decision.code,
-      message: decision.message,
-      // The id the live room runs under; the code is only the link.
-      roomId: decision.allowed ? Rooms.liveIdOf(room) : null,
-    };
+    return { scheduled: true, canEnter: decision.allowed, reason: decision.code, message: decision.message };
   }),
 );
 
@@ -343,7 +329,7 @@ router.get(
       throw notFound('QR codes are not available on this server.');
     }
     res.set('Cache-Control', 'private, max-age=3600');
-    return { dataUrl: await QRCode.toDataURL(Rooms.roomUrl(room.code, publicAppUrlFor(req)), { margin: 1, width: 264, errorCorrectionLevel: 'M' }) };
+    return { dataUrl: await QRCode.toDataURL(Rooms.roomUrl(room.code), { margin: 1, width: 264, errorCorrectionLevel: 'M' }) };
   }),
 );
 
@@ -361,7 +347,7 @@ router.get(
       res.set('Content-Type', 'text/calendar; charset=utf-8');
       res.set('Content-Disposition', `attachment; filename="${room.code}.ics"`);
       res.set('Cache-Control', 'no-store');
-      res.send(Rules.icsFor({ room, url: Rooms.roomUrl(room.code, publicAppUrlFor(req)) }));
+      res.send(Rules.icsFor({ room, url: Rooms.roomUrl(room.code) }));
     })(req, res).catch(next),
 );
 

@@ -23,7 +23,6 @@
 
 import { randomUUID } from 'node:crypto';
 import { env } from '../config/env.js';
-import { publicAppUrl } from '../config/publicUrl.js';
 import { pool } from '../db/pool.js';
 import { stateRedis as redis } from '../db/redis.js';
 import { logger } from '../observability/logger.js';
@@ -75,9 +74,7 @@ export const relyingParty = (requestOrigin) => {
   const origin = originOf(requestOrigin ?? '') ?? originOf(env.APP_URL);
   if (!origin) throw Object.assign(new Error('Unknown site.'), { code: 'validation_failed' });
 
-  const allowed = new Set(
-    [originOf(env.APP_URL), originOf(publicAppUrl()), ...(env.ALLOWED_ORIGINS ?? []).map(originOf)].filter(Boolean),
-  );
+  const allowed = new Set([originOf(env.APP_URL), ...(env.ALLOWED_ORIGINS ?? []).map(originOf)].filter(Boolean));
   const { hostname, protocol } = new URL(origin);
   const devHost =
     env.NODE_ENV !== 'production' &&

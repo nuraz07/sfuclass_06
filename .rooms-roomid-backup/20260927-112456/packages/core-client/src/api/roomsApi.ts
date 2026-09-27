@@ -26,7 +26,6 @@ export const RoomDetailSchema = z
   .object({
     code: z.string(),
     sessionId: z.string(),
-    liveRoomId: z.string().nullable().default(null),
     seriesId: z.string().nullable().default(null),
     title: z.string(),
     description: z.string().nullable().default(null),
@@ -129,8 +128,6 @@ const GateSchema = z
     canEnter: z.boolean(),
     reason: z.string().nullable().optional(),
     message: z.string().nullable().optional(),
-    /** The live room's id (a UUID) for scheduled rooms; the link's code is not one. */
-    roomId: z.string().nullable().optional(),
   })
   .passthrough();
 export type RoomGate = z.infer<typeof GateSchema>;

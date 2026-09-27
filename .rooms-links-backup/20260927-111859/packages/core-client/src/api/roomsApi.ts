@@ -5,10 +5,6 @@
  * themselves. Paths are the server's (server/src/routes/scheduledRooms.routes.js,
  * mounted under /scheduled-rooms). The room is still joined through the
  * classroom socket at /rooms/<code>.
- *
- * Links in answers (lobby URL, QR code, calendar file) are built by the
- * server for the address this page is on: the page's origin travels along
- * as ?origin=, and the server only uses it when it trusts it.
  */
 
 import { z } from 'zod';
@@ -26,7 +22,6 @@ export const RoomDetailSchema = z
   .object({
     code: z.string(),
     sessionId: z.string(),
-    liveRoomId: z.string().nullable().default(null),
     seriesId: z.string().nullable().default(null),
     title: z.string(),
     description: z.string().nullable().default(null),
@@ -129,8 +124,6 @@ const GateSchema = z
     canEnter: z.boolean(),
     reason: z.string().nullable().optional(),
     message: z.string().nullable().optional(),
-    /** The live room's id (a UUID) for scheduled rooms; the link's code is not one. */
-    roomId: z.string().nullable().optional(),
   })
   .passthrough();
 export type RoomGate = z.infer<typeof GateSchema>;
@@ -200,12 +193,6 @@ const BASE = '/scheduled-rooms';
 const path = (code: string, rest = '') => `${BASE}/${encodeURIComponent(code)}${rest}`;
 const once = { retry: { attempts: 1 } };
 
-/** This page's address, for links the server builds (browsers only). */
-const pageOrigin = (): string | undefined => {
-  const location = (globalThis as { location?: { origin?: string } }).location;
-  return location?.origin && location.origin !== 'null' ? location.origin : undefined;
-};
-
 export const createRoomsApi = (http: HttpClient): RoomsApi => ({
   config: (signal) => http.get(`${BASE}/config`, { schema: ConfigSchema, signal }),
 
@@ -225,7 +212,7 @@ export const createRoomsApi = (http: HttpClient): RoomsApi => ({
   mine: (when = 'upcoming', signal) =>
     http.get(`${BASE}/mine`, { schema: z.object({ items: z.array(RoomListItemSchema) }), query: { when }, signal }),
 
-  get: (code, signal) => http.get(path(code), { schema: RoomDetailSchema, query: { origin: pageOrigin() }, signal }),
+  get: (code, signal) => http.get(path(code), { schema: RoomDetailSchema, signal }),
 
   gate: (code, signal) => http.get(path(code, '/gate'), { schema: GateSchema, signal, retry: { attempts: 2 } }),
 
@@ -255,17 +242,10 @@ export const createRoomsApi = (http: HttpClient): RoomsApi => ({
 
   leaveWaitlist: (code) => http.delete(path(code, '/waitlist'), { schema: RoomDetailSchema }),
 
-  qr: (code) =>
-    http.get(path(code, '/qr'), {
-      schema: z.object({ dataUrl: z.string() }).passthrough(),
-      query: { origin: pageOrigin() },
-      retry: { attempts: 1 },
-    }),
+  qr: (code) => http.get(path(code, '/qr'), { schema: z.object({ dataUrl: z.string() }).passthrough(), retry: { attempts: 1 } }),
 
   calendarFile: async (code) => {
-    const origin = pageOrigin();
-    const query = origin ? `?origin=${encodeURIComponent(origin)}` : '';
-    const response = await http.raw('GET', `${path(code, '/calendar.ics')}${query}`);
+    const response = await http.raw('GET', path(code, '/calendar.ics'));
     if (!response.ok) throw new Error('The calendar file could not be downloaded.');
     return response.blob();
   },

@@ -18,16 +18,6 @@
  * who was let in, the waiting list, held seats — is in Redis next to the
  * seats (capacity/CapacityGuard) and expires a day after the room ends.
  *
- * Two ids, on purpose:
- *
- *   code     "kqz-7hfd-2mx"  the link people share (/rooms/<code>/lobby)
- *   liveId   the session's UUID, the id of the live room on the media node.
- *            Everything that already existed around a live room — lesson
- *            chat, blocks for this lesson, profiles "in this room", seats —
- *            expects a UUID there and rejects anything else (422). So the
- *            classroom page resolves the code to this id (GET …/gate) and
- *            joins with it; the code never reaches those routes.
- *
  * Ad-hoc rooms (any other id in /rooms/<id>) are untouched: admissionFor()
  * answers null for them and the join works exactly as before.
  */
@@ -96,22 +86,6 @@ const toRoom = (row) =>
     cancelReason: row.cancel_reason ?? null,
   };
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-export const isLiveId = (value) => UUID.test(String(value ?? ''));
-
-/** The live room id of a scheduled room: its session's UUID. */
-export const liveIdOf = (room) => room.id;
-
-/** A scheduled room by the id of its live room. null for every other room. */
-export const findByLiveId = async (liveId, client = pool) => {
-  if (!isLiveId(liveId)) return null;
-  const { rows } = await client.query(
-    `SELECT ${COLUMNS} FROM scheduled_sessions s WHERE s.id = $1 AND s.room_code IS NOT NULL`,
-    [liveId],
-  );
-  return toRoom(rows[0]);
-};
-
 export const findByCode = async (code, client = pool) => {
   if (!Rules.isRoomCode(code)) return null;
   const { rows } = await client.query(`SELECT ${COLUMNS} FROM scheduled_sessions s WHERE s.room_code = $1`, [code]);
@@ -164,7 +138,7 @@ const liveHolds = async (room) => {
 const occupancyOf = async (room) => {
   try {
     const { occupancy } = await import('../capacity/CapacityGuard.js');
-    return await occupancy(liveIdOf(room));
+    return await occupancy(room.code);
   } catch {
     return { occupied: 0, userIds: [] };
   }
@@ -215,7 +189,7 @@ export const decide = async ({ room, userId, tenantId = null, now = Date.now() }
 const markLive = (room) =>
   pool
     .query(
-      `UPDATE scheduled_sessions SET status = 'live', room_id = coalesce(room_id, id::text), updated_at = now()
+      `UPDATE scheduled_sessions SET status = 'live', room_id = coalesce(room_id, room_code), updated_at = now()
         WHERE id = $1 AND status = 'scheduled'`,
       [room.id],
     )
@@ -231,15 +205,10 @@ const markLive = (room) =>
  * limit to reserve against and the settings the room starts with.
  */
 export const admissionFor = async ({ roomId, userId, tenantId }) => {
-  // A code is the link, never a live room: joining with it would open a
-  // second room next to the real one. Up-to-date pages never send it.
-  if (Rules.isRoomCode(roomId)) {
-    return { allowed: false, code: 'reload_required', message: 'Reload the page to enter this room.' };
-  }
-  if (!isLiveId(roomId)) return null;
+  if (!Rules.isRoomCode(roomId)) return null;
   let room;
   try {
-    room = await findByLiveId(roomId);
+    room = await findByCode(roomId);
   } catch (cause) {
     // A database problem must not turn every room into a locked one.
     log.error({ err: cause, roomId }, 'scheduled room lookup failed; joining as an ad-hoc room');
@@ -266,7 +235,6 @@ export const admissionFor = async ({ roomId, userId, tenantId }) => {
     // Hosts and co-hosts always get in: 0 is "no limit" for reserveSeat.
     capacity: moderator ? 0 : capacityOf(room),
     code: room.code,
-    liveId: liveIdOf(room),
     endsAt: room.endsAt,
     settings: room.settings,
   };
@@ -390,7 +358,6 @@ export const detailFor = async ({ room, userId, tenantId = null, now = Date.now(
   return {
     code: room.code,
     sessionId: room.id,
-    liveRoomId: liveIdOf(room),
     seriesId: room.seriesId,
     title: room.title,
     description: room.description,
@@ -790,8 +757,7 @@ export const end = async ({ room }) => {
   );
   try {
     const RoomManager = await import('../classroom/RoomManager.js');
-    const liveId = liveIdOf(room);
-    if (RoomManager.getRoom(liveId)) await RoomManager.closeRoom(liveId, 'ended-by-host');
+    if (RoomManager.getRoom(room.code)) await RoomManager.closeRoom(room.code, 'ended-by-host');
   } catch {
     // Not the media process: the enforcer there closes it.
   }
@@ -806,18 +772,17 @@ let enforcer = null;
 let ticks = 0;
 
 const closeEndedRooms = async ({ listRoomIds, closeRoom }) => {
-  const ids = listRoomIds().filter(isLiveId);
-  if (ids.length === 0) return;
+  const codes = listRoomIds().filter(Rules.isRoomCode);
+  if (codes.length === 0) return;
   const { rows } = await pool.query(
-    `SELECT id, room_code, ends_at, status FROM scheduled_sessions
-      WHERE id = ANY($1::uuid[]) AND room_code IS NOT NULL`,
-    [ids],
+    `SELECT room_code, ends_at, status FROM scheduled_sessions WHERE room_code = ANY($1::text[])`,
+    [codes],
   );
   const now = Date.now();
   for (const row of rows) {
     if (row.status === 'cancelled' || row.status === 'ended' || new Date(row.ends_at).getTime() <= now) {
       log.info({ code: row.room_code }, 'room reached its end time; closing');
-      await closeRoom(row.id, 'ended-by-host').catch(() => undefined);
+      await closeRoom(row.room_code, 'ended-by-host').catch(() => undefined);
     }
   }
 };
@@ -896,7 +861,7 @@ export const startEnforcer = ({ listRoomIds, closeRoom, intervalMs = 15_000 }) =
 };
 
 export default {
-  findByCode, findByLiveId, isLiveId, liveIdOf, relationFor, decide, admissionFor, applyToRoom, detailFor, listMine, preview,
+  findByCode, relationFor, decide, admissionFor, applyToRoom, detailFor, listMine, preview,
   create, update, cancel, extend, end, knock, withdrawKnock, listKnocks, admit, deny,
   joinWaitlist, leaveWaitlist, startEnforcer, capacityOf, roomUrl,
 };

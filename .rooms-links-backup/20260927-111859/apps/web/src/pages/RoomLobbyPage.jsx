@@ -3,7 +3,7 @@ import { Link, Navigate, useLocation, useNavigate, useParams } from 'react-route
 import { createRoomsApi, useCore } from '@classroom/core-client';
 
 import DeviceCheck from '../components/Rooms/DeviceCheck.jsx';
-import { countdown, durationLabel, phaseLabel, reasonText, shareLinkFor, timeInZones } from '../components/Rooms/roomModel.js';
+import { countdown, durationLabel, phaseLabel, reasonText, timeInZones } from '../components/Rooms/roomModel.js';
 import { formatDate, formatTime } from '../lib/preferences.js';
 import { onUserEvent } from '../lib/userEvents.js';
 import '../components/Rooms/rooms.css';
@@ -46,7 +46,6 @@ function useNow(intervalMs = 1_000) {
 function SharePanel({ room, rooms, highlight }) {
   const [copied, setCopied] = useState(false);
   const [qr, setQr] = useState(null);
-  const link = shareLinkFor(room, window.location.origin);
 
   useEffect(() => {
     let cancelled = false;
@@ -73,12 +72,12 @@ function SharePanel({ room, rooms, highlight }) {
     <section className={highlight ? 'rm-share is-new' : 'rm-share'} aria-label="Share this room">
       {highlight ? <p className="rm-label">Your room is ready. Share the link:</p> : <p className="rm-label">Link</p>}
       <div className="rm-share__row">
-        <code className="rm-share__url">{link}</code>
+        <code className="rm-share__url">{room.url}</code>
         <button
           type="button"
           className="btn btn--tiny"
           onClick={async () => {
-            setCopied(await copy(link));
+            setCopied(await copy(room.url));
             window.setTimeout(() => setCopied(false), 2_000);
           }}
         >
@@ -94,7 +93,7 @@ function SharePanel({ room, rooms, highlight }) {
           : 'Only invited people can come in; for everyone else the link does nothing.'}{' '}
         Room code <strong>{room.code}</strong>
       </p>
-      {qr ? <img className="rm-share__qr" src={qr} alt={`QR code for ${link}`} width={132} height={132} /> : null}
+      {qr ? <img className="rm-share__qr" src={qr} alt={`QR code for ${room.url}`} width={132} height={132} /> : null}
     </section>
   );
 }

@@ -13,7 +13,6 @@
  */
 
 import { env } from '../config/env.js';
-import { publicAppUrl } from '../config/publicUrl.js';
 
 const read = (name, fallback = undefined) => {
   let value;
@@ -27,7 +26,7 @@ const read = (name, fallback = undefined) => {
 };
 
 export const deliveryConfig = () => ({
-  appUrl: publicAppUrl(),
+  appUrl: String(read('APP_URL', 'http://localhost:5173')).replace(/\/$/, ''),
   mailTransport: read('MAIL_TRANSPORT', 'smtp'),
   smtpHost: read('SMTP_HOST', 'localhost'),
   smtpPort: Number(read('SMTP_PORT', 1025)),

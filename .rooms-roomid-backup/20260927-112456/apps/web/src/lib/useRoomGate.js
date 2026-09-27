@@ -9,10 +9,6 @@ import { createRoomsApi, useCore } from '@classroom/core-client';
  * of on an error. Only scheduled rooms (codes like "kqz-7hfd-2mx") are asked
  * about; any other room id — and any failure to ask — enters as before. The
  * socket join checks again either way.
- *
- * `roomId` in the answer is the id the live room runs under (the session's
- * UUID). The code in the link is only the link: the lesson chat, blocks and
- * profiles expect a UUID and refuse anything else.
  */
 const ROOM_CODE = /^[a-hjkmnp-z2-9]{3}-[a-hjkmnp-z2-9]{4}-[a-hjkmnp-z2-9]{3}$/;
 
@@ -22,11 +18,11 @@ export function useRoomGate(roomId) {
   const { http, status } = useCore();
   const rooms = useMemo(() => createRoomsApi(http), [http]);
   const scheduled = isRoomCode(roomId);
-  const [gate, setGate] = useState({ ready: !scheduled, canEnter: true, scheduled, reason: null, roomId: null });
+  const [gate, setGate] = useState({ ready: !scheduled, canEnter: true, scheduled, reason: null });
 
   useEffect(() => {
     if (!scheduled) {
-      setGate({ ready: true, canEnter: true, scheduled: false, reason: null, roomId: null });
+      setGate({ ready: true, canEnter: true, scheduled: false, reason: null });
       return undefined;
     }
     if (status !== 'authenticated') return undefined;
@@ -34,18 +30,10 @@ export function useRoomGate(roomId) {
     rooms
       .gate(roomId, controller.signal)
       .then((answer) =>
-        setGate({
-          ready: true,
-          canEnter: answer.canEnter,
-          scheduled: answer.scheduled,
-          reason: answer.reason ?? null,
-          roomId: answer.roomId ?? null,
-        }),
+        setGate({ ready: true, canEnter: answer.canEnter, scheduled: answer.scheduled, reason: answer.reason ?? null }),
       )
       .catch(() => {
-        // Could not ask: go to the lobby, which explains and retries, rather
-        // than joining under the code.
-        if (!controller.signal.aborted) setGate({ ready: true, canEnter: false, scheduled: true, reason: null, roomId: null });
+        if (!controller.signal.aborted) setGate({ ready: true, canEnter: true, scheduled: true, reason: null });
       });
     return () => controller.abort();
   }, [rooms, roomId, scheduled, status]);

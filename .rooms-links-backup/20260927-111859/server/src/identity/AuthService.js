@@ -36,7 +36,6 @@ import * as Users from './User.js';
 import * as Sessions from './SessionStore.js';
 import * as Profiles from './Profile.js';
 import * as LoginChallenge from './loginChallenge.js';
-import { publicAppUrl } from '../config/publicUrl.js';
 
 const log = logger.child({ component: 'auth' });
 
@@ -486,7 +485,7 @@ const sendVerificationEmail = async ({ user }) => {
     userId: user.userId,
     type: 'email.verify',
     title: 'Confirm your email address',
-    href: `${publicAppUrl()}/verify-email?token=${token}`,
+    href: `${env.APP_URL}/verify-email?token=${token}`,
   });
 };
 
@@ -514,7 +513,7 @@ export const requestPasswordReset = async ({ email }) => {
       userId: user.userId,
       type: 'password.reset',
       title: 'Reset your password',
-      href: `${publicAppUrl()}/reset-password?token=${token}`,
+      href: `${env.APP_URL}/reset-password?token=${token}`,
     }).catch((cause) => log.error({ err: cause }, 'reset email not queued'));
   }
 

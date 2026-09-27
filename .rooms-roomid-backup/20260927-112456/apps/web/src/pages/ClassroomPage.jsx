@@ -28,9 +28,6 @@ export default function ClassroomPage() {
   const { session, status } = useCore();
   // Scheduled rooms: too early, not invited or no seat → the lobby, not an error.
   const gate = useRoomGate(roomId);
-  // The live room's id: a scheduled room runs under its session UUID (the
-  // code in the address is only the link); every other room under its URL id.
-  const liveRoomId = gate.scheduled ? gate.roomId : roomId;
 
   const { sfu, deviceAdapter: baseDeviceAdapter, screenShareAdapter } = useSfuClient();
   // Settings → Lessons: chosen camera and microphone, noise suppression, data
@@ -72,14 +69,14 @@ export default function ClassroomPage() {
     () => ({
       sfu,
       deviceAdapter,
-      roomId: liveRoomId,
-      autoJoin: status === 'authenticated' && gate.ready && gate.canEnter && Boolean(liveRoomId),
+      roomId,
+      autoJoin: status === 'authenticated' && gate.ready && gate.canEnter,
       // Above ten people, arriving unmuted is a room full of keyboard noise.
       startMuted: joinDefaults.startMuted,
       startCameraOff: joinDefaults.startCameraOff,
       onReaction,
     }),
-    [sfu, deviceAdapter, liveRoomId, status, onReaction, gate.ready, gate.canEnter],
+    [sfu, deviceAdapter, roomId, status, onReaction, gate.ready, gate.canEnter],
   );
   const classroom = useClassroom(classroomOptions);
 
@@ -246,7 +243,7 @@ export default function ClassroomPage() {
 
         {showParticipants && (
           <ClassroomChatPanel
-            roomId={liveRoomId}
+            roomId={roomId}
             peers={peers}
             selfPeerId={selfPeerId}
             canModerate={canModerate}

@@ -258,31 +258,3 @@ export const destinationFor = (input) => {
   if (ROOM_ID.test(raw)) return `/rooms/${raw}`;
   return null;
 };
-
-// ---------------------------------------------------------------------------
-// Sharing
-// ---------------------------------------------------------------------------
-
-const LOCAL = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/;
-
-const hostOf = (url) => {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
-};
-
-/**
- * The link to share for a room. The server builds it for the address this
- * page is on; should it still point at this machine (an older server, a
- * setting), the page's own address is used instead — a localhost link only
- * ever works for the person who made it.
- */
-export const shareLinkFor = (room, pageOrigin) => {
-  const fromServer = room?.url ?? '';
-  if (fromServer && !(LOCAL.test(hostOf(fromServer)) && pageOrigin && !LOCAL.test(hostOf(pageOrigin)))) {
-    return fromServer;
-  }
-  return pageOrigin ? `${pageOrigin.replace(/\/$/, '')}/rooms/${room.code}/lobby` : fromServer;
-};

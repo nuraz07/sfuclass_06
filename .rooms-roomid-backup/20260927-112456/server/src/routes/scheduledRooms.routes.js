@@ -13,8 +13,7 @@
  *   POST   /                           create (one room, or one per date of a series)
  *   GET    /mine?when=upcoming|past    rooms I host, co-host or am invited to
  *   GET    /:code                      the room as I may see it, with my entry state
- *   GET    /:code/gate                 may I enter now, and with which live room id?
- *                                     (the classroom page asks first)
+ *   GET    /:code/gate                 may I enter now? (the classroom page asks first)
  *   PATCH  /:code                      edit this date            host
  *   POST   /:code/cancel               { scope, reason }         host
  *   POST   /:code/extend               { minutes }               host, co-host
@@ -197,14 +196,7 @@ router.get(
     const room = await Rooms.findByCode(req.params.code);
     if (!room) return { scheduled: false, canEnter: true };
     const { decision } = await Rooms.decide({ room, userId: req.user.id, tenantId: tenantOf(req) });
-    return {
-      scheduled: true,
-      canEnter: decision.allowed,
-      reason: decision.code,
-      message: decision.message,
-      // The id the live room runs under; the code is only the link.
-      roomId: decision.allowed ? Rooms.liveIdOf(room) : null,
-    };
+    return { scheduled: true, canEnter: decision.allowed, reason: decision.code, message: decision.message };
   }),
 );
 

@@ -8,7 +8,6 @@ import {
   countdown,
   defaultForm,
   destinationFor,
-  shareLinkFor,
   durationLabel,
   formToInput,
   localInputValue,
@@ -110,13 +109,4 @@ test('a pasted code or link leads to the right place', () => {
   assert.equal(destinationFor('00000000-0000-0000-0000-000000000000'), '/rooms/00000000-0000-0000-0000-000000000000');
   assert.equal(destinationFor('not a room!'), null);
   assert.equal(destinationFor(''), null);
-});
-
-test('a shared link never points at localhost when the page is not on it', () => {
-  const room = { code: 'kqz-7hfd-2mx', url: 'http://localhost:5173/rooms/kqz-7hfd-2mx/lobby' };
-  const page = 'https://cs-5173.app.github.dev';
-  assert.equal(shareLinkFor(room, page), 'https://cs-5173.app.github.dev/rooms/kqz-7hfd-2mx/lobby');
-  assert.equal(shareLinkFor({ ...room, url: 'https://cs-5173.app.github.dev/rooms/kqz-7hfd-2mx/lobby' }, page), 'https://cs-5173.app.github.dev/rooms/kqz-7hfd-2mx/lobby');
-  assert.equal(shareLinkFor(room, 'http://localhost:5173'), room.url);
-  assert.equal(shareLinkFor({ ...room, url: 'https://class.example.org/rooms/kqz-7hfd-2mx/lobby' }, page), 'https://class.example.org/rooms/kqz-7hfd-2mx/lobby');
 });
