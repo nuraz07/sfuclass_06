@@ -139,8 +139,6 @@ export interface CoreContextValue {
   /** Throws SecondFactorRequired when the account has two-step sign-in. */
   signIn(credentials: { email: string; password: string }): Promise<Session>;
   /** The second step with a code from the authenticator app or a recovery code. */
-  /** Creates an account and signs it in (Landing). */
-  signUp(input: { displayName: string; email: string; password: string }): Promise<Session>;
   completeSignIn(input: { challengeId: string; code: string }): Promise<Session>;
   /** Options for a passkey: the second step (with a challengeId) or a sign-in on its own. */
   passkeyOptions(input?: { challengeId?: string | null }): Promise<PasskeyOptions>;
@@ -379,35 +377,6 @@ export function CoreProvider({
     [http, csrfHeaders, adopt],
   );
 
-  const signUp = useCallback<CoreContextValue['signUp']>(
-    async ({ displayName, email, password }) => {
-      const headers = await csrfHeaders();
-      let timeZone: string | undefined;
-      try {
-        timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      } catch {
-        timeZone = undefined;
-      }
-      const language = (globalThis as { navigator?: { language?: string } }).navigator?.language;
-      const result = (await http.post(
-        '/auth/register',
-        {
-          displayName,
-          email,
-          password,
-          timeZone,
-          locale: language ? language.slice(0, 2).toLowerCase() : undefined,
-          device: { platform: 'web' },
-          wantsRefreshToken: true,
-        },
-        // Not retried: a second attempt would only meet "already exists".
-        { anonymous: true, headers, retry: { attempts: 1 } },
-      )) as TokenResponse;
-      return adopt(result);
-    },
-    [http, csrfHeaders, adopt],
-  );
-
   const completeSignIn = useCallback<CoreContextValue['completeSignIn']>(
     async ({ challengeId, code }) => {
       const headers = await csrfHeaders();
@@ -498,7 +467,6 @@ export function CoreProvider({
       wsUrl,
       getAccessToken,
       signIn,
-      signUp,
       completeSignIn,
       passkeyOptions,
       signInWithPasskey,
@@ -515,7 +483,6 @@ export function CoreProvider({
       wsUrl,
       getAccessToken,
       signIn,
-      signUp,
       completeSignIn,
       passkeyOptions,
       signInWithPasskey,

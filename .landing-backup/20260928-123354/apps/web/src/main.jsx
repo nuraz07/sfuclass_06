@@ -4,7 +4,6 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { CoreProvider } from '@classroom/core-client';
 import ErrorBoundary from './components/system/ErrorBoundary.jsx';
 import AppLayout from './pages/AppLayout.jsx';
-import AuthGate from './components/system/AuthGate.jsx';
 import '@classroom/ui-tokens/tokens.css';
 import './app.css';
 import { applyCachedAppearance } from './lib/preferences.js';
@@ -38,8 +37,6 @@ const SettingsPage = lazy(() => import('./pages/SettingsPage.jsx'));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage.jsx'));
 const RoomEditorPage = lazy(() => import('./pages/RoomEditorPage.jsx'));
 const RoomLobbyPage = lazy(() => import('./pages/RoomLobbyPage.jsx'));
-const SignupPage = lazy(() => import('./pages/SignupPage.jsx'));
-const LandingPage = lazy(() => import('./pages/LandingPage.jsx'));
 
 function Loading() {
   return <p className="app app-empty">Loading…</p>;
@@ -57,12 +54,7 @@ createRoot(document.getElementById('root')).render(
           <Suspense fallback={<Loading />}>
             <Routes>
               <Route path="/login" element={<LoginPage />} />
-              <Route path="/signup" element={<SignupPage />} />
-              <Route path="/register" element={<Navigate to="/signup" replace />} />
-              {/* The homepage, also for signed-in people who want to see or share it. */}
-              <Route path="/welcome" element={<LandingPage />} />
 
-              <Route element={<AuthGate />}>
               <Route element={<AppLayout />}>
                 <Route index element={<DashboardPage />} />
                 <Route path="courses/:courseId" element={<CoursePage />} />
@@ -78,7 +70,6 @@ createRoot(document.getElementById('root')).render(
                 <Route path="settings/:tab" element={<SettingsPage />} />
                 <Route path="rooms/new" element={<RoomEditorPage />} />
                 <Route path="rooms/:code/edit" element={<RoomEditorPage />} />
-              </Route>
               </Route>
 
               {/* The classroom sits outside the layout on purpose: no nav, no

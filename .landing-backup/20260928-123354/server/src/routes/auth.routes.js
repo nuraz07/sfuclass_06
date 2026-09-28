@@ -417,49 +417,6 @@ router.put(
   }),
 );
 
-/**
- * Create an account (Landing). Answers like /login: the new account is signed
- * in at once. Refused when SIGNUP_MODE=closed; new accounts are learners.
- * Organisation and rules: identity/signup.js.
- */
-router.post(
-  '/register',
-  rateLimit({ key: 'auth:register', points: 5, durationSec: 3600, by: ['ip'] }),
-  validate({
-    body: z.object({
-      displayName: z.string().trim().min(1).max(80),
-      email: z.string().trim().email().max(254),
-      password: z.string().min(1).max(512),
-      timeZone: z.string().max(64).optional(),
-      locale: z.string().max(12).optional(),
-      device: deviceSchema.optional(),
-      wantsRefreshToken: z.boolean().default(false),
-    }),
-  }),
-  route(async (req, res) => {
-    const { registerOpen } = await import('../identity/signup.js');
-    const helpers = await import('./_helpers.js');
-    let tokens;
-    try {
-      tokens = await registerOpen({
-        displayName: req.body.displayName,
-        email: req.body.email,
-        password: req.body.password,
-        timeZone: req.body.timeZone ?? null,
-        locale: req.body.locale ?? null,
-        device: req.body.device ?? { platform: 'web' },
-      });
-    } catch (error) {
-      if (error?.code === 'conflict') throw helpers.conflict(error.message);
-      if (error?.code === 'forbidden') throw helpers.forbidden(error.message);
-      if (error?.code === 'validation_failed') throw helpers.badRequest(error.message);
-      throw error;
-    }
-    res.status(201);
-    return respondWithSession(req, res, tokens);
-  }),
-);
-
 /** Who am I — cheap enough to call on app boot, and it proves the token is live. */
 router.get(
   '/me',
