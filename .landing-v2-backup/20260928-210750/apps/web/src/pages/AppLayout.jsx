@@ -1,11 +1,9 @@
 import { useEffect, useMemo, useRef } from 'react';
-import { Outlet, useNavigate } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { createAccountApi, createProfileApi, useCore } from '@classroom/core-client';
 import ErrorBoundary from '../components/system/ErrorBoundary.jsx';
 import NotificationToasts from '../components/system/NotificationToasts.jsx';
 import DeletionBanner from '../components/system/DeletionBanner.jsx';
-import AppHeader from '../components/system/AppHeader.jsx';
-import '../styles/theme.css';
 import { cacheLocale, cachePreferences } from '../lib/preferences.js';
 import { onServiceWorkerMessage, resyncPush } from '../lib/pushClient.js';
 import { onUserEvent } from '../lib/userEvents.js';
@@ -28,7 +26,18 @@ export default function AppLayout() {
     <div className="app">
       <PreferencesSync />
       <SessionWatch />
-      <AppHeader />
+      <header className="app__bar">
+        <span className="app__brand">Classroom</span>
+        <nav className="app__nav">
+          <NavLink to="/" end>
+            Dashboard
+          </NavLink>
+          <NavLink to="/community">Community</NavLink>
+          <NavLink to="/messages">Messages</NavLink>
+          <NavLink to="/media">Media</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
+        </nav>
+      </header>
 
       <DeletionBanner />
 

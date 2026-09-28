@@ -53,22 +53,3 @@ test('odd browser languages and zones never break the page', () => {
   assert.match(clock('2026-03-10T10:00:00Z', 'Not/AZone', 'en-US@posix'), /\d{1,2}[:.]\d{2}/);
   assert.equal(guestTimes({ time: '2026-03-10T10:00:00Z', ownZone: 'UTC', locale: 'en-US@posix', count: 3 }).length, 4);
 });
-
-import { activeStep, enterProgress, validateContact } from '../landingModel.js';
-
-test('contact form validation', () => {
-  const good = { name: 'Anna', email: 'anna@example.com', topic: 'school', message: 'We have 40 teachers and would like a demo.' };
-  assert.deepEqual(validateContact(good), {});
-  const bad = validateContact({ name: '', email: 'x', topic: 'spam', message: 'hi' });
-  assert.deepEqual(Object.keys(bad).sort(), ['email', 'message', 'name', 'topic']);
-  assert.ok(validateContact({ ...good, message: 'x'.repeat(4001) }).message);
-});
-
-test('scroll progress and the active story step', () => {
-  assert.equal(enterProgress({ top: 900, height: 200, viewport: 900 }), 0);
-  assert.equal(enterProgress({ top: 350, height: 200, viewport: 900 }), 1);
-  assert.equal(enterProgress({ top: 625, height: 200, viewport: 900 }), 0.5);
-  assert.equal(activeStep([100, 500, 900], 450), 0);
-  assert.equal(activeStep([-200, 300, 900], 450), 1);
-  assert.equal(activeStep([-900, -500, -100], 450), 2);
-});
