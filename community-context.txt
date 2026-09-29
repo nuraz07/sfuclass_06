@@ -1,0 +1,4255 @@
+=== TREE ===
+apps/web/src/components/Community:
+NotificationBell.jsx
+PostComposer.jsx
+PresenceAvatars.jsx
+SpaceList.jsx
+ThreadView.jsx
+community.css
+
+apps/web/src/pages:
+AppLayout.jsx
+ClassroomPage.jsx
+CommunityPage.jsx
+CourseBuilderPage.jsx
+CoursePage.jsx
+DashboardPage.jsx
+LandingPage.jsx
+LoginPage.jsx
+MediaPage.jsx
+MessagesPage.jsx
+NotFoundPage.jsx
+RoomEditorPage.jsx
+RoomLobbyPage.jsx
+SettingsPage.jsx
+SignupPage.jsx
+
+server/src/community:
+FeedService.js
+ModerationService.js
+NotificationService.js
+SpaceService.js
+models
+
+server/src/routes:
+_helpers.js
+account.routes.js
+accountSecurity.routes.js
+assignment.routes.js
+auth.routes.js
+billing.routes.js
+classroom.routes.js
+community.routes.js
+course.routes.js
+health.routes.js
+media.routes.js
+messaging.routes.js
+profile.routes.js
+progress.routes.js
+public.routes.js
+room-routes.js
+rooms.routes.js
+route-resolve.routes.js
+scheduledRooms.routes.js
+=== TABLES ===
+server/src/db/migrations/004_community.sql:8:create table if not exists spaces (
+server/src/db/migrations/004_community.sql-9-  id          uuid        primary key default gen_random_uuid(),
+server/src/db/migrations/004_community.sql-10-  tenant_id   uuid        not null references tenants (id) on delete cascade,
+server/src/db/migrations/004_community.sql-11-  course_id   uuid        references courses (id) on delete cascade,  -- null = standalone
+server/src/db/migrations/004_community.sql-12-  name        text        not null,
+server/src/db/migrations/004_community.sql-13-  description text,
+server/src/db/migrations/004_community.sql-14-  visibility  text        not null default 'open',
+server/src/db/migrations/004_community.sql-15-  created_by  uuid        references users (id),
+server/src/db/migrations/004_community.sql-16-  created_at  timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-17-  updated_at  timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-18-  archived_at timestamptz,
+server/src/db/migrations/004_community.sql-19-  constraint spaces_visibility_check check (visibility in ('open', 'closed'))
+server/src/db/migrations/004_community.sql-20-);
+server/src/db/migrations/004_community.sql-21-
+server/src/db/migrations/004_community.sql-22--- One auto-provisioned space per course, created when the course is published.
+server/src/db/migrations/004_community.sql-23-create unique index if not exists spaces_course_key on spaces (course_id) where course_id is not null;
+server/src/db/migrations/004_community.sql-24-create index if not exists spaces_tenant_idx on spaces (tenant_id) where archived_at is null;
+server/src/db/migrations/004_community.sql-25-
+server/src/db/migrations/004_community.sql-26-create table if not exists memberships (
+server/src/db/migrations/004_community.sql-27-  space_id  uuid        not null references spaces (id) on delete cascade,
+server/src/db/migrations/004_community.sql-28-  user_id   uuid        not null references users (id) on delete cascade,
+server/src/db/migrations/004_community.sql-29-  role      text        not null default 'member',
+server/src/db/migrations/004_community.sql-30-  muted     boolean     not null default false,
+server/src/db/migrations/004_community.sql-31-  joined_at timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-32-  primary key (space_id, user_id),
+server/src/db/migrations/004_community.sql-33-  constraint memberships_role_check check (role in ('owner', 'moderator', 'member'))
+--
+server/src/db/migrations/004_community.sql:41:create table if not exists threads (
+server/src/db/migrations/004_community.sql-42-  id             uuid        primary key default gen_random_uuid(),
+server/src/db/migrations/004_community.sql-43-  space_id       uuid        not null references spaces (id) on delete cascade,
+server/src/db/migrations/004_community.sql-44-  title          text        not null,
+server/src/db/migrations/004_community.sql-45-  author_id      uuid        not null references users (id),
+server/src/db/migrations/004_community.sql-46-  pinned         boolean     not null default false,
+server/src/db/migrations/004_community.sql-47-  locked         boolean     not null default false,
+server/src/db/migrations/004_community.sql-48-  post_count     integer     not null default 0,
+server/src/db/migrations/004_community.sql-49-  last_post_at   timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-50-  created_at     timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-51-  updated_at     timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-52-  deleted_at     timestamptz
+server/src/db/migrations/004_community.sql-53-);
+server/src/db/migrations/004_community.sql-54-
+server/src/db/migrations/004_community.sql-55--- Two orderings the feed actually uses: most recently active, and newest.
+server/src/db/migrations/004_community.sql-56-create index if not exists threads_space_active_idx
+server/src/db/migrations/004_community.sql-57-  on threads (space_id, pinned desc, last_post_at desc, id desc) where deleted_at is null;
+server/src/db/migrations/004_community.sql-58-create index if not exists threads_space_created_idx
+server/src/db/migrations/004_community.sql-59-  on threads (space_id, created_at desc, id desc) where deleted_at is null;
+server/src/db/migrations/004_community.sql-60-
+server/src/db/migrations/004_community.sql:61:create table if not exists posts (
+server/src/db/migrations/004_community.sql-62-  id          uuid        primary key default gen_random_uuid(),
+server/src/db/migrations/004_community.sql-63-  thread_id   uuid        not null references threads (id) on delete cascade,
+server/src/db/migrations/004_community.sql-64-  author_id   uuid        not null references users (id),
+server/src/db/migrations/004_community.sql-65-  reply_to_id uuid        references posts (id) on delete set null,
+server/src/db/migrations/004_community.sql-66-  body        text        not null,
+server/src/db/migrations/004_community.sql-67-  client_id   text,                              -- dedupe key for the offline outbox
+server/src/db/migrations/004_community.sql-68-  created_at  timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-69-  edited_at   timestamptz,
+server/src/db/migrations/004_community.sql-70-  deleted_at  timestamptz,
+server/src/db/migrations/004_community.sql-71-  deleted_by  uuid        references users (id)
+server/src/db/migrations/004_community.sql-72-);
+server/src/db/migrations/004_community.sql-73-
+server/src/db/migrations/004_community.sql-74--- Keyset pagination inside a thread.
+server/src/db/migrations/004_community.sql-75-create index if not exists posts_thread_keyset_idx on posts (thread_id, created_at, id);
+server/src/db/migrations/004_community.sql-76-create index if not exists posts_author_idx on posts (author_id, created_at desc);
+server/src/db/migrations/004_community.sql-77-create unique index if not exists posts_client_id_key
+server/src/db/migrations/004_community.sql-78-  on posts (author_id, client_id) where client_id is not null;
+server/src/db/migrations/004_community.sql-79-
+server/src/db/migrations/004_community.sql:80:create table if not exists post_attachments (
+server/src/db/migrations/004_community.sql-81-  post_id  uuid not null references posts (id) on delete cascade,
+server/src/db/migrations/004_community.sql-82-  asset_id uuid not null,                        -- fk added in 005
+server/src/db/migrations/004_community.sql-83-  position integer not null default 0,
+server/src/db/migrations/004_community.sql-84-  primary key (post_id, asset_id)
+server/src/db/migrations/004_community.sql-85-);
+server/src/db/migrations/004_community.sql-86-
+server/src/db/migrations/004_community.sql:87:create table if not exists post_reactions (
+server/src/db/migrations/004_community.sql-88-  post_id    uuid        not null references posts (id) on delete cascade,
+server/src/db/migrations/004_community.sql-89-  user_id    uuid        not null references users (id) on delete cascade,
+server/src/db/migrations/004_community.sql-90-  emoji      text        not null,
+server/src/db/migrations/004_community.sql-91-  created_at timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-92-  primary key (post_id, user_id, emoji)
+server/src/db/migrations/004_community.sql-93-);
+server/src/db/migrations/004_community.sql-94-
+server/src/db/migrations/004_community.sql-95--- ---------------------------------------------------------------- --
+server/src/db/migrations/004_community.sql-96--- Moderation
+server/src/db/migrations/004_community.sql-97--- ---------------------------------------------------------------- --
+server/src/db/migrations/004_community.sql-98-create table if not exists community_reports (
+server/src/db/migrations/004_community.sql-99-  id          uuid        primary key default gen_random_uuid(),
+server/src/db/migrations/004_community.sql-100-  tenant_id   uuid        not null references tenants (id) on delete cascade,
+server/src/db/migrations/004_community.sql-101-  target_type text        not null,
+server/src/db/migrations/004_community.sql-102-  target_id   uuid        not null,
+server/src/db/migrations/004_community.sql-103-  reporter_id uuid        not null references users (id),
+server/src/db/migrations/004_community.sql-104-  reason      text        not null,
+server/src/db/migrations/004_community.sql-105-  note        text,
+server/src/db/migrations/004_community.sql-106-  status      text        not null default 'open',
+server/src/db/migrations/004_community.sql-107-  resolved_by uuid        references users (id),
+server/src/db/migrations/004_community.sql-108-  resolved_at timestamptz,
+server/src/db/migrations/004_community.sql-109-  resolution  text,
+server/src/db/migrations/004_community.sql-110-  created_at  timestamptz not null default now(),
+server/src/db/migrations/004_community.sql-111-  constraint community_reports_target_check check (target_type in ('post', 'thread', 'space', 'user')),
+server/src/db/migrations/004_community.sql-112-  constraint community_reports_status_check check (status in ('open', 'resolved', 'dismissed'))
+--
+server/src/db/migrations/008_messaging.sql:10:create table if not exists channels (
+server/src/db/migrations/008_messaging.sql-11-  id              uuid        primary key default gen_random_uuid(),
+server/src/db/migrations/008_messaging.sql-12-  tenant_id       uuid        not null references tenants (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-13-  scope           text        not null default 'public',
+server/src/db/migrations/008_messaging.sql-14-  space_id        uuid        references spaces (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-15-  course_id       uuid        references courses (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-16-  name            text        not null,
+server/src/db/migrations/008_messaging.sql-17-  topic           text,
+server/src/db/migrations/008_messaging.sql-18-  slow_mode_seconds integer   not null default 0,
+server/src/db/migrations/008_messaging.sql-19-  archived_at     timestamptz,
+server/src/db/migrations/008_messaging.sql-20-  created_at      timestamptz not null default now(),
+server/src/db/migrations/008_messaging.sql-21-  constraint channels_scope_check check (scope in ('public', 'space', 'course')),
+server/src/db/migrations/008_messaging.sql-22-  -- A space or course channel must say which; a public one must not.
+server/src/db/migrations/008_messaging.sql-23-  constraint channels_scope_target_check check (
+server/src/db/migrations/008_messaging.sql-24-    (scope = 'public' and space_id is null and course_id is null) or
+server/src/db/migrations/008_messaging.sql-25-    (scope = 'space'  and space_id is not null) or
+server/src/db/migrations/008_messaging.sql-26-    (scope = 'course' and course_id is not null)
+server/src/db/migrations/008_messaging.sql-27-  )
+server/src/db/migrations/008_messaging.sql-28-);
+server/src/db/migrations/008_messaging.sql-29-
+server/src/db/migrations/008_messaging.sql-30-create unique index if not exists channels_space_key on channels (space_id) where space_id is not null;
+server/src/db/migrations/008_messaging.sql-31-create unique index if not exists channels_course_key on channels (course_id) where course_id is not null;
+server/src/db/migrations/008_messaging.sql-32-create index if not exists channels_tenant_idx on channels (tenant_id) where archived_at is null;
+server/src/db/migrations/008_messaging.sql-33-
+server/src/db/migrations/008_messaging.sql-34--- ---------------------------------------------------------------- --
+server/src/db/migrations/008_messaging.sql-35--- Conversations — direct 1:1 and small groups
+--
+server/src/db/migrations/008_messaging.sql:73:create table if not exists channel_participants (
+server/src/db/migrations/008_messaging.sql-74-  channel_id           uuid        not null references channels (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-75-  user_id              uuid        not null references users (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-76-  muted                boolean     not null default false,
+server/src/db/migrations/008_messaging.sql-77-  last_read_at         timestamptz,
+server/src/db/migrations/008_messaging.sql-78-  last_read_message_id uuid,
+server/src/db/migrations/008_messaging.sql-79-  muted_until          timestamptz,               -- moderation mute, not a preference
+server/src/db/migrations/008_messaging.sql-80-  primary key (channel_id, user_id)
+server/src/db/migrations/008_messaging.sql-81-);
+server/src/db/migrations/008_messaging.sql-82-
+server/src/db/migrations/008_messaging.sql-83--- ---------------------------------------------------------------- --
+server/src/db/migrations/008_messaging.sql-84--- Messages
+server/src/db/migrations/008_messaging.sql-85--- ---------------------------------------------------------------- --
+server/src/db/migrations/008_messaging.sql-86-create table if not exists messages (
+server/src/db/migrations/008_messaging.sql-87-  id              uuid        primary key default gen_random_uuid(),
+server/src/db/migrations/008_messaging.sql-88-  tenant_id       uuid        not null references tenants (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-89-  conversation_id uuid        references conversations (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-90-  channel_id      uuid        references channels (id) on delete cascade,
+server/src/db/migrations/008_messaging.sql-91-  sender_id       uuid        not null references users (id),
+server/src/db/migrations/008_messaging.sql-92-  body            text        not null default '',
+server/src/db/migrations/008_messaging.sql-93-  reply_to_id     uuid        references messages (id) on delete set null,
+server/src/db/migrations/008_messaging.sql-94-  mentions        uuid[]      not null default '{}',
+server/src/db/migrations/008_messaging.sql-95-  -- Client-generated. At-least-once delivery from the outbox becomes exactly-once here.
+server/src/db/migrations/008_messaging.sql-96-  client_id       text,
+server/src/db/migrations/008_messaging.sql-97-  created_at      timestamptz not null default now(),
+server/src/db/migrations/008_messaging.sql-98-  edited_at       timestamptz,
+
+=== FILE: apps/web/src/pages/CommunityPage.jsx (14 lines) ===
+/**
+ * Community — not implemented yet.
+ *
+ * main.jsx lazy-imports this route, so the file has to exist or navigating to
+ * it throws a dynamic-import failure that looks like a build problem. Saying so
+ * plainly is better than a blank screen.
+ */
+export default function CommunityPage() {
+  return (
+    <section className="page">
+      <h1>Community</h1>
+      <p className="muted">This part of the product has not been built yet.</p>
+    </section>
+  );
+}
+=== FILE: server/src/community/FeedService.js (306 lines) ===
+// classroom-app/server/src/community/FeedService.js
+/**
+ * Feed and threads  (F2)  [NEW]
+ *
+ * Reading a space, opening a thread, posting a reply.
+ *
+ * The feed is cursor paginated, never offset. An offset feed shifts under the
+ * reader every time somebody posts — which in a busy space is constantly, and
+ * produces the effect where scrolling shows you the same thread twice and skips
+ * the one between them.
+ *
+ * The cursor carries its sort order. A cursor issued for "active" is
+ * meaningless against "recent", and silently accepting it would page through
+ * the wrong column; Thread.feed rejects the mismatch rather than returning
+ * plausible nonsense.
+ */
+
+import { logger } from '../observability/logger.js';
+import * as Threads from './models/Thread.js';
+import * as Posts from './models/Post.js';
+import * as Memberships from './models/Membership.js';
+import * as Spaces from './models/Space.js';
+import { assertMember } from './SpaceService.js';
+
+const log = logger.child({ component: 'feed' });
+
+const EXCERPT_LENGTH = 280;
+
+const excerpt = (body) =>
+  body.length <= EXCERPT_LENGTH ? body : `${body.slice(0, EXCERPT_LENGTH - 1).trimEnd()}…`;
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+export const getFeed = async ({ viewerId, spaceId, ...query }) => {
+  // A space feed requires membership; the cross-space feed is already scoped
+  // to the viewer's spaces by the query itself.
+  if (spaceId) await assertMember({ spaceId, userId: viewerId });
+
+  return Threads.feed({ viewerId, spaceId, ...query });
+};
+
+/**
+ * A thread with its first page of replies. One call, because rendering a thread
+ * needs both and two round trips is two spinners.
+ */
+export const getThread = async ({ threadId, viewerId, cursor, limit = 25 }) => {
+  const thread = await Threads.findById(threadId, viewerId);
+  if (!thread || thread.deletedAt) {
+    throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+  }
+
+  await assertMember({ spaceId: thread.spaceId, userId: viewerId });
+
+  const posts = await Posts.listByThread({ threadId, cursor, limit });
+
+  // Opening a thread is reading it. Fire and forget: a failed read marker is
+  // a wrong badge, not a broken page.
+  void Memberships.markRead({ spaceId: thread.spaceId, userId: viewerId }).catch(() => undefined);
+
+  return { ...thread, posts };
+};
+
+export const listPosts = async ({ threadId, viewerId, cursor, limit }) => {
+  const thread = await Threads.findById(threadId, viewerId);
+  if (!thread) throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+
+  await assertMember({ spaceId: thread.spaceId, userId: viewerId });
+  return Posts.listByThread({ threadId, cursor, limit });
+};
+
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
+const assertCanPost = async ({ spaceId, userId }) => {
+  const [space, membership] = await Promise.all([
+    Spaces.findById(spaceId, userId),
+    Memberships.find({ spaceId, userId }),
+  ]);
+
+  if (!space) throw Object.assign(new Error('space not found'), { code: 'not_found' });
+
+  const verdict = Memberships.canPost(membership, space);
+  if (!verdict.allowed) {
+    throw Object.assign(new Error(verdict.reason ?? 'you cannot post here'), { code: verdict.code });
+  }
+
+  return { space, membership };
+};
+
+export const createThread = async ({ viewerId, spaceId, kind, title, body, tags, attachmentIds = [], mentions = [] }) => {
+  await assertCanPost({ spaceId, userId: viewerId });
+
+  const attachments = await resolveAttachments(attachmentIds, viewerId);
+
+  const thread = await Threads.insert({
+    spaceId,
+    authorId: viewerId,
+    kind,
+    title,
+    body,
+    tags,
+    attachments,
+  });
+
+  // The author follows their own thread, so replies reach them without them
+  // having to opt in to a conversation they started.
+  await Threads.follow({ threadId: thread.threadId, userId: viewerId, following: true });
+
+  broadcast(spaceId, 'community:thread.created', {
+    spaceId,
+    threadId: thread.threadId,
+    title: thread.title,
+    author: thread.author,
+    createdAt: thread.createdAt,
+  });
+
+  if (mentions.length > 0) await notifyMentions({ mentions, thread, actorId: viewerId, body });
+
+  log.info({ threadId: thread.threadId, spaceId, viewerId }, 'thread created');
+  return thread;
+};
+
+export const createPost = async ({ viewerId, threadId, body, replyToPostId, attachmentIds = [], mentions = [], idempotencyKey }) => {
+  const thread = await Threads.findById(threadId, viewerId);
+  if (!thread || thread.deletedAt) {
+    throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+  }
+  if (thread.locked) {
+    throw Object.assign(new Error('this thread is locked'), { code: 'conflict' });
+  }
+
+  await assertCanPost({ spaceId: thread.spaceId, userId: viewerId });
+
+  const attachments = await resolveAttachments(attachmentIds, viewerId);
+
+  const post = await Posts.insert({
+    threadId,
+    authorId: viewerId,
+    body,
+    replyToPostId,
+    mentions,
+    attachments,
+    idempotencyKey,
+  });
+
+  // Replying is following, unless they have explicitly unfollowed.
+  await Threads.follow({ threadId, userId: viewerId, following: true }).catch(() => undefined);
+
+  broadcast(thread.spaceId, 'community:post.created', {
+    spaceId: thread.spaceId,
+    threadId,
+    postId: post.postId,
+    author: post.author,
+    excerpt: excerpt(body),
+    mentionsViewer: false,
+    postCount: thread.postCount + 1,
+    createdAt: post.createdAt,
+  });
+
+  const { notifyThreadReply } = await import('./NotificationService.js');
+  void notifyThreadReply({ threadId, actorId: viewerId, excerpt: excerpt(body) }).catch(() => undefined);
+
+  if (mentions.length > 0) await notifyMentions({ mentions, thread, actorId: viewerId, body, postId: post.postId });
+
+  return post;
+};
+
+export const editThread = async ({ viewerId, threadId, patch }) => {
+  const thread = await Threads.findById(threadId, viewerId);
+  if (!thread) throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+
+  const membership = await Memberships.find({ spaceId: thread.spaceId, userId: viewerId });
+  const isAuthor = thread.author?.userId === viewerId;
+
+  // A moderator may edit, but only to remove something. Rewriting someone
+  // else's post under their name is not moderation.
+  if (!isAuthor && !Memberships.isModerator(membership)) {
+    throw Object.assign(new Error('you can only edit your own posts'), { code: 'forbidden' });
+  }
+
+  const updated = await Threads.update(threadId, patch, viewerId);
+  broadcast(thread.spaceId, 'community:thread.updated', {
+    spaceId: thread.spaceId,
+    threadId,
+    change: 'edited',
+    actor: thread.author,
+  });
+  return updated;
+};
+
+export const editPost = async ({ viewerId, postId, body }) => {
+  const post = await Posts.findById(postId);
+  if (!post) throw Object.assign(new Error('post not found'), { code: 'not_found' });
+  if (post.author?.userId !== viewerId) {
+    throw Object.assign(new Error('you can only edit your own posts'), { code: 'forbidden' });
+  }
+  return Posts.update(postId, { body });
+};
+
+export const acceptAnswer = async ({ viewerId, threadId, postId }) => {
+  const thread = await Threads.findById(threadId, viewerId);
+  if (!thread) throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+
+  const membership = await Memberships.find({ spaceId: thread.spaceId, userId: viewerId });
+  // The person who asked decides what answered it. A moderator can too, for
+  // the questions whose authors never come back.
+  if (thread.author?.userId !== viewerId && !Memberships.isModerator(membership)) {
+    throw Object.assign(new Error('only the author can accept an answer'), { code: 'forbidden' });
+  }
+
+  await Posts.acceptAnswer({ threadId, postId });
+  return Threads.findById(threadId, viewerId);
+};
+
+export const react = async ({ viewerId, targetType, targetId, emoji, action }) => {
+  const spaceId =
+    targetType === 'thread'
+      ? (await Threads.findById(targetId, viewerId))?.spaceId
+      : (await Threads.findById((await Posts.findById(targetId))?.threadId, viewerId))?.spaceId;
+
+  if (!spaceId) throw Object.assign(new Error('not found'), { code: 'not_found' });
+  await assertMember({ spaceId, userId: viewerId });
+
+  const reactions = await Posts.react({ targetType, targetId, userId: viewerId, emoji, action });
+
+  broadcast(spaceId, 'community:reaction.changed', {
+    targetType,
+    targetId,
+    emoji,
+    userId: viewerId,
+    action,
+    count: reactions.find((entry) => entry.emoji === emoji)?.count ?? 0,
+  });
+
+  return reactions;
+};
+
+export const follow = async ({ viewerId, threadId, following }) => {
+  const thread = await Threads.findById(threadId, viewerId);
+  if (!thread) throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+  await assertMember({ spaceId: thread.spaceId, userId: viewerId });
+  return Threads.follow({ threadId, userId: viewerId, following });
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Attachments must already be `ready` and must belong to the person posting.
+ * Without the ownership check, a guessed asset id would let anyone attach
+ * somebody else's file to their own post.
+ */
+const resolveAttachments = async (assetIds, userId) => {
+  if (assetIds.length === 0) return [];
+
+  const { getAssetsForOwner } = await import('../media/UploadService.js');
+  const assets = await getAssetsForOwner({ assetIds, userId });
+
+  const notReady = assets.filter((asset) => asset.status !== 'ready');
+  if (notReady.length > 0) {
+    throw Object.assign(new Error('one or more attachments are still processing'), {
+      code: 'asset_not_ready',
+    });
+  }
+  if (assets.length !== assetIds.length) {
+    throw Object.assign(new Error('unknown attachment'), { code: 'not_found' });
+  }
+
+  return assets.map((asset) => ({
+    assetId: asset.assetId,
+    kind: asset.kind,
+    fileName: asset.fileName,
+    contentType: asset.contentType,
+    sizeBytes: asset.sizeBytes,
+    thumbnailUrl: asset.thumbnailUrl ?? null,
+    url: null, // signed when the thread is read
+  }));
+};
+
+const notifyMentions = async ({ mentions, thread, actorId, body, postId = null }) => {
+  const { notifyMany } = await import('./NotificationService.js');
+  // Someone mentioning themselves is not a notification.
+  const recipients = mentions.filter((userId) => userId !== actorId);
+  if (recipients.length === 0) return;
+
+  await notifyMany({
+    userIds: recipients,
+    type: 'thread.mention',
+    title: `You were mentioned in “${thread.title}”`,
+    body: excerpt(body),
+    href: `/spaces/${thread.spaceId}/threads/${thread.threadId}${postId ? `#${postId}` : ''}`,
+    actorId,
+    data: { threadId: thread.threadId, postId },
+  });
+};
+
+const broadcast = (spaceId, event, payload) => {
+  void import('../realtime/presenceGateway.js')
+    .then(({ broadcastToSpace }) => broadcastToSpace(spaceId, event, payload))
+    .catch(() => undefined);
+};
+
+export default { getFeed, getThread, createThread, createPost, react, follow, acceptAnswer };
+=== FILE: server/src/community/ModerationService.js (400 lines) ===
+// classroom-app/server/src/community/ModerationService.js
+/**
+ * Moderation  (F2)  [NEW]
+ *
+ * Reports, mutes, suspensions and removals.
+ *
+ * Three principles, and they are why this is a service rather than a few
+ * UPDATE statements scattered through the routes:
+ *
+ *   Nothing is ever hard-deleted. Removed content is emptied and flagged; the
+ *   row stays. A moderator reviewing a pattern of behaviour needs to see what
+ *   was said, and a person appealing a decision needs it to still exist.
+ *
+ *   Every action is written to an audit log with an actor and a reason. "Who
+ *   deleted this and why" is the first question asked in every moderation
+ *   dispute, and it is unanswerable after the fact unless it was recorded at
+ *   the time.
+ *
+ *   Reports are deduplicated per reporter and target, but counted. Ten people
+ *   reporting one post is a signal; one person reporting it ten times is not.
+ */
+
+import { pool } from '../db/pool.js';
+import { logger } from '../observability/logger.js';
+import * as Threads from './models/Thread.js';
+import * as Posts from './models/Post.js';
+import * as Memberships from './models/Membership.js';
+import { assertModerator } from './SpaceService.js';
+
+const log = logger.child({ component: 'moderation' });
+
+/** Reports at or above this escalate the item for priority review. */
+const ESCALATION_THRESHOLD = 3;
+
+// ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
+
+/**
+ * Anyone may report. The insert is idempotent per (reporter, target) so a
+ * frustrated user cannot inflate the count by pressing the button repeatedly.
+ */
+export const report = async ({ reporterId, targetType, targetId, reason, detail = null }) => {
+  const { rows } = await pool.query(
+    `INSERT INTO moderation_reports (reporter_id, target_type, target_id, reason, detail)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (reporter_id, target_type, target_id) DO UPDATE
+       SET reason = EXCLUDED.reason, detail = EXCLUDED.detail, updated_at = now()
+     RETURNING id, created_at`,
+    [reporterId, targetType, targetId, reason, detail],
+  );
+
+  const { rows: counted } = await pool.query(
+    `SELECT count(DISTINCT reporter_id)::int AS reporters
+       FROM moderation_reports
+      WHERE target_type = $1 AND target_id = $2 AND status = 'received'`,
+    [targetType, targetId],
+  );
+
+  const reporters = counted[0].reporters;
+
+  // Distinct reporters, not reports: the threshold is about consensus.
+  if (reporters >= ESCALATION_THRESHOLD) {
+    await escalate({ targetType, targetId, reporters });
+  }
+
+  log.info({ targetType, targetId, reason, reporters }, 'content reported');
+
+  return {
+    reportId: rows[0].id,
+    status: 'received',
+    createdAt: rows[0].created_at.toISOString(),
+  };
+};
+
+const escalate = async ({ targetType, targetId, reporters }) => {
+  await pool.query(
+    `UPDATE moderation_reports SET status = 'reviewing', escalated_at = now()
+      WHERE target_type = $1 AND target_id = $2 AND status = 'received'`,
+    [targetType, targetId],
+  );
+
+  log.warn({ targetType, targetId, reporters }, 'content escalated for review');
+
+  // Moderators of the owning space are told; this is not left to whoever
+  // happens to open the queue.
+  const spaceId = await spaceOf({ targetType, targetId });
+  if (!spaceId) return;
+
+  const { rows } = await pool.query(
+    `SELECT user_id FROM space_memberships WHERE space_id = $1 AND role IN ('owner','moderator')`,
+    [spaceId],
+  );
+
+  const { notifyMany } = await import('./NotificationService.js');
+  await notifyMany({
+    userIds: rows.map((row) => row.user_id),
+    type: 'space.invite', // reuses the moderation channel; see NotificationService
+    title: 'Content needs review',
+    body: `${reporters} people reported the same item.`,
+    href: `/spaces/${spaceId}/moderation`,
+    data: { targetType, targetId },
+  }).catch(() => undefined);
+};
+
+const spaceOf = async ({ targetType, targetId }) => {
+  if (targetType === 'thread') {
+    const thread = await Threads.findById(targetId);
+    return thread?.spaceId ?? null;
+  }
+  if (targetType === 'post') {
+    const post = await Posts.findById(targetId);
+    if (!post) return null;
+    const thread = await Threads.findById(post.threadId);
+    return thread?.spaceId ?? null;
+  }
+  return null;
+};
+
+// ---------------------------------------------------------------------------
+// The queue
+// ---------------------------------------------------------------------------
+
+export const listReports = async ({ spaceId, actorId, status = 'received', cursor, limit = 25 }) => {
+  await assertModerator({ spaceId, userId: actorId });
+
+  const params = [spaceId, status];
+  let where = 'r.status = $2';
+
+  if (cursor) {
+    const [at, id] = Buffer.from(cursor, 'base64url').toString().split('|');
+    params.push(at, id);
+    where += ` AND (r.created_at, r.id) < ($3::timestamptz, $4::uuid)`;
+  }
+  params.push(limit + 1);
+
+  // Grouped by target: a moderator reviews an item once, not once per report.
+  const { rows } = await pool.query(
+    `SELECT r.target_type, r.target_id,
+            count(DISTINCT r.reporter_id)::int AS reporters,
+            array_agg(DISTINCT r.reason) AS reasons,
+            min(r.created_at) AS created_at,
+            max(r.id::text)::uuid AS id
+       FROM moderation_reports r
+      WHERE ${where}
+        AND coalesce(
+              (SELECT t.space_id FROM threads t WHERE t.id = r.target_id),
+              (SELECT th.space_id FROM posts p JOIN threads th ON th.id = p.thread_id WHERE p.id = r.target_id)
+            ) = $1
+      GROUP BY r.target_type, r.target_id
+      ORDER BY created_at DESC
+      LIMIT $${params.length}`,
+    params,
+  );
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+
+  return {
+    items: page.map((row) => ({
+      targetType: row.target_type,
+      targetId: row.target_id,
+      reporters: row.reporters,
+      reasons: row.reasons,
+      createdAt: row.created_at.toISOString(),
+    })),
+    hasMore,
+    nextCursor: hasMore && page.at(-1)
+      ? Buffer.from(`${page.at(-1).created_at.toISOString()}|${page.at(-1).id}`).toString('base64url')
+      : null,
+  };
+};
+
+export const resolveReports = async ({ targetType, targetId, actorId, outcome, note = null }) => {
+  const spaceId = await spaceOf({ targetType, targetId });
+  await assertModerator({ spaceId, userId: actorId });
+
+  const { rowCount } = await pool.query(
+    `UPDATE moderation_reports
+        SET status = $3, resolved_by = $4, resolved_at = now(), resolution_note = $5
+      WHERE target_type = $1 AND target_id = $2 AND status IN ('received','reviewing')`,
+    [targetType, targetId, outcome, actorId, note],
+  );
+
+  await audit({ actorId, action: `report.${outcome}`, targetType, targetId, spaceId, reason: note });
+  return rowCount;
+};
+
+// ---------------------------------------------------------------------------
+// Actions on content
+// ---------------------------------------------------------------------------
+
+export const removeThread = async ({ threadId, actorId, reason }) => {
+  const thread = await Threads.findById(threadId);
+  if (!thread) throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+
+  await assertModerator({ spaceId: thread.spaceId, userId: actorId });
+  await Threads.softDelete(threadId);
+  await audit({ actorId, action: 'thread.remove', targetType: 'thread', targetId: threadId, spaceId: thread.spaceId, reason });
+
+  broadcast(thread.spaceId, {
+    spaceId: thread.spaceId,
+    targetType: 'thread',
+    targetId: threadId,
+    removedBy: 'moderator',
+    removedAt: new Date().toISOString(),
+  });
+
+  // The author is told. Silent removal is how people conclude a platform is
+  // arbitrary, and it costs one notification to avoid.
+  if (thread.author) {
+    const { notify } = await import('./NotificationService.js');
+    await notify({
+      userId: thread.author.userId,
+      type: 'thread.reply',
+      title: 'Your post was removed',
+      body: reason ?? 'It did not meet the community guidelines.',
+      href: `/spaces/${thread.spaceId}`,
+      actorId,
+    }).catch(() => undefined);
+  }
+
+  log.warn({ threadId, actorId, reason }, 'thread removed');
+  return true;
+};
+
+export const removePost = async ({ postId, actorId, reason }) => {
+  const post = await Posts.findById(postId);
+  if (!post) throw Object.assign(new Error('post not found'), { code: 'not_found' });
+
+  const thread = await Threads.findById(post.threadId);
+  await assertModerator({ spaceId: thread.spaceId, userId: actorId });
+
+  await Posts.softDelete(postId);
+  await audit({ actorId, action: 'post.remove', targetType: 'post', targetId: postId, spaceId: thread.spaceId, reason });
+
+  broadcast(thread.spaceId, {
+    spaceId: thread.spaceId,
+    targetType: 'post',
+    targetId: postId,
+    removedBy: 'moderator',
+    removedAt: new Date().toISOString(),
+  });
+
+  return true;
+};
+
+export const restoreThread = async ({ threadId, actorId }) => {
+  const thread = await Threads.findById(threadId);
+  if (!thread) throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+
+  await assertModerator({ spaceId: thread.spaceId, userId: actorId });
+  await Threads.restore(threadId);
+  await audit({ actorId, action: 'thread.restore', targetType: 'thread', targetId: threadId, spaceId: thread.spaceId });
+  return true;
+};
+
+/** Pin, lock, resolve, move. One route, one audit entry per call. */
+export const applyThreadAction = async ({ threadId, actorId, action, targetSpaceId, reason }) => {
+  const thread = await Threads.findById(threadId);
+  if (!thread) throw Object.assign(new Error('thread not found'), { code: 'not_found' });
+
+  await assertModerator({ spaceId: thread.spaceId, userId: actorId });
+
+  const patches = {
+    pin: { pinned: true },
+    unpin: { pinned: false },
+    lock: { locked: true },
+    unlock: { locked: false },
+    move: { spaceId: targetSpaceId },
+  };
+
+  if (action === 'delete') return removeThread({ threadId, actorId, reason });
+  if (action === 'restore') return restoreThread({ threadId, actorId });
+
+  const patch = patches[action];
+  if (!patch) throw Object.assign(new Error(`unknown action: ${action}`), { code: 'validation_failed' });
+
+  // Moving into a space the moderator does not moderate would be a way to
+  // dump content somewhere they have no standing.
+  if (action === 'move') await assertModerator({ spaceId: targetSpaceId, userId: actorId });
+
+  const updated = await Threads.update(threadId, patch, actorId);
+  await audit({ actorId, action: `thread.${action}`, targetType: 'thread', targetId: threadId, spaceId: thread.spaceId, reason });
+
+  broadcastUpdate(thread.spaceId, { spaceId: thread.spaceId, threadId, change: action, actor: null });
+  return updated;
+};
+
+// ---------------------------------------------------------------------------
+// Actions on people
+// ---------------------------------------------------------------------------
+
+/**
+ * A mute is time-boxed by default. An indefinite mute is a suspension wearing a
+ * friendlier name, and pretending otherwise makes it easy to forget somebody
+ * was silenced a year ago.
+ */
+export const mute = async ({ spaceId, userId, actorId, hours = 24, reason }) => {
+  await assertModerator({ spaceId, userId: actorId });
+
+  const until = hours ? new Date(Date.now() + hours * 3_600_000).toISOString() : null;
+  await Memberships.update({ spaceId, userId, patch: { mutedUntil: until } });
+  await audit({ actorId, action: 'member.mute', targetType: 'user', targetId: userId, spaceId, reason });
+
+  const { notify } = await import('./NotificationService.js');
+  await notify({
+    userId,
+    type: 'space.invite',
+    title: hours ? `You cannot post for ${hours} hours` : 'You cannot post in this space',
+    body: reason ?? null,
+    href: `/spaces/${spaceId}`,
+    actorId,
+  }).catch(() => undefined);
+
+  log.warn({ spaceId, userId, actorId, hours }, 'member muted');
+  return { mutedUntil: until };
+};
+
+export const unmute = async ({ spaceId, userId, actorId }) => {
+  await assertModerator({ spaceId, userId: actorId });
+  await Memberships.update({ spaceId, userId, patch: { mutedUntil: null } });
+  await audit({ actorId, action: 'member.unmute', targetType: 'user', targetId: userId, spaceId });
+  return true;
+};
+
+/** Loses access, keeps history. Deleting the membership would take it with it. */
+export const suspend = async ({ spaceId, userId, actorId, reason }) => {
+  const actor = await assertModerator({ spaceId, userId: actorId });
+
+  const target = await Memberships.find({ spaceId, userId });
+  if (target?.role === 'owner') {
+    throw Object.assign(new Error('the owner cannot be suspended'), { code: 'forbidden' });
+  }
+  if (target?.role === 'moderator' && actor.role !== 'owner') {
+    throw Object.assign(new Error('only the owner can suspend a moderator'), { code: 'forbidden' });
+  }
+
+  await Memberships.update({ spaceId, userId, patch: { suspended: true } });
+  await audit({ actorId, action: 'member.suspend', targetType: 'user', targetId: userId, spaceId, reason });
+
+  log.warn({ spaceId, userId, actorId, reason }, 'member suspended');
+  return true;
+};
+
+export const reinstate = async ({ spaceId, userId, actorId }) => {
+  await assertModerator({ spaceId, userId: actorId });
+  await Memberships.update({ spaceId, userId, patch: { suspended: false } });
+  await audit({ actorId, action: 'member.reinstate', targetType: 'user', targetId: userId, spaceId });
+  return true;
+};
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+/**
+ * Append-only. Every moderation action lands here whether or not anyone ever
+ * reads it, because the moment it is needed is always after the fact.
+ */
+const audit = async ({ actorId, action, targetType, targetId, spaceId, reason = null }) => {
+  await pool
+    .query(
+      `INSERT INTO moderation_audit (actor_id, action, target_type, target_id, space_id, reason)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [actorId, action, targetType, targetId, spaceId, reason],
+    )
+    .catch((cause) => log.error({ err: cause, action, targetId }, 'AUDIT WRITE FAILED'));
+};
+
+export const auditTrail = async ({ spaceId, actorId, limit = 100 }) => {
+  await assertModerator({ spaceId, userId: actorId });
+  const { rows } = await pool.query(
+    `SELECT a.*, u.display_name AS actor_name
+       FROM moderation_audit a JOIN users u ON u.id = a.actor_id
+      WHERE a.space_id = $1 ORDER BY a.created_at DESC LIMIT $2`,
+    [spaceId, limit],
+  );
+  return rows.map((row) => ({
+    action: row.action,
+    actor: { userId: row.actor_id, displayName: row.actor_name },
+    targetType: row.target_type,
+    targetId: row.target_id,
+    reason: row.reason,
+    createdAt: row.created_at.toISOString(),
+  }));
+};
+
+const broadcast = (spaceId, payload) => {
+  void import('../realtime/presenceGateway.js')
+    .then(({ broadcastToSpace }) => broadcastToSpace(spaceId, 'community:content.removed', payload))
+    .catch(() => undefined);
+};
+
+const broadcastUpdate = (spaceId, payload) => {
+  void import('../realtime/presenceGateway.js')
+    .then(({ broadcastToSpace }) => broadcastToSpace(spaceId, 'community:thread.updated', payload))
+    .catch(() => undefined);
+};
+
+export default { report, listReports, resolveReports, removeThread, removePost, mute, suspend, applyThreadAction };
+=== FILE: server/src/community/SpaceService.js (256 lines) ===
+// classroom-app/server/src/community/SpaceService.js
+/**
+ * Spaces  (F2)  [NEW]
+ *
+ * Creation, membership and the course link.
+ *
+ * `provisionForCourse` is the one worth reading. CourseService calls it on
+ * every publish, which means it runs again on every republish — so it has to be
+ * idempotent, and it has to backfill members who enrolled before the space
+ * existed. Getting either wrong produces a second empty discussion space on a
+ * course that already had one.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { pool } from '../db/pool.js';
+import { logger } from '../observability/logger.js';
+import * as Spaces from './models/Space.js';
+import * as Memberships from './models/Membership.js';
+import * as Presence from '../realtime/PresenceService.js';
+
+const log = logger.child({ component: 'spaces' });
+
+const slugify = (name) =>
+  name
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^\w\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .slice(0, 80) || 'space';
+
+const uniqueSlug = async (name) => {
+  const base = slugify(name);
+  return (await Spaces.slugExists(base)) ? `${base}-${randomUUID().slice(0, 6)}` : base;
+};
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+/** Online counts come from Redis, so they are attached after the SQL read. */
+const withPresence = async (spaces) => {
+  const list = Array.isArray(spaces) ? spaces : [spaces];
+  if (list.length === 0) return spaces;
+
+  const counts = await Presence.spaceCounts(list.map((space) => space.spaceId)).catch(() => ({}));
+  const decorated = list.map((space) => ({ ...space, onlineCount: counts[space.spaceId] ?? 0 }));
+
+  return Array.isArray(spaces) ? decorated : decorated[0];
+};
+
+export const getSpace = async ({ spaceId, slug, viewerId }) => {
+  const space = spaceId
+    ? await Spaces.findById(spaceId, viewerId)
+    : await Spaces.findBySlug(slug, viewerId);
+
+  if (!space) throw Object.assign(new Error('space not found'), { code: 'not_found' });
+
+  // A private space does not exist as far as a non-member is concerned. 404
+  // rather than 403: the name of a private space is itself information.
+  if (space.visibility === 'private' && !space.joined) {
+    throw Object.assign(new Error('space not found'), { code: 'not_found' });
+  }
+
+  return withPresence(space);
+};
+
+export const listSpaces = async (query) => {
+  const page = await Spaces.list(query);
+  return { ...page, items: await withPresence(page.items) };
+};
+
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
+export const createSpace = async ({ ownerId, name, slug, description, visibility, courseId = null }) => {
+  const space = await Spaces.insert({
+    name,
+    slug: slug ?? (await uniqueSlug(name)),
+    description,
+    visibility,
+    courseId,
+    ownerId,
+  });
+
+  await Memberships.join({ spaceId: space.spaceId, userId: ownerId, role: 'owner' });
+  log.info({ spaceId: space.spaceId, ownerId, courseId }, 'space created');
+
+  return Spaces.findById(space.spaceId, ownerId);
+};
+
+export const updateSpace = async ({ spaceId, actorId, patch }) => {
+  await assertModerator({ spaceId, userId: actorId });
+
+  if (patch.slug && (await Spaces.slugExists(patch.slug))) {
+    throw Object.assign(new Error('that address is already taken'), { code: 'conflict' });
+  }
+  return Spaces.update(spaceId, patch, actorId);
+};
+
+// ---------------------------------------------------------------------------
+// Course provisioning
+// ---------------------------------------------------------------------------
+
+/**
+ * Called by CourseService on every publish. Idempotent in both directions: it
+ * does not create a second space, and it does backfill members who enrolled
+ * while the course was still a draft.
+ */
+export const provisionForCourse = async ({ courseId }) => {
+  const { rows } = await pool.query(
+    `SELECT id, title, slug, owner_id, space_id FROM courses WHERE id = $1`,
+    [courseId],
+  );
+  const course = rows[0];
+  if (!course) return null;
+
+  let space = await Spaces.findByCourse(courseId, course.owner_id);
+
+  if (!space) {
+    space = await createSpace({
+      ownerId: course.owner_id,
+      name: course.title,
+      slug: `course-${course.slug}`,
+      description: `Discussion for ${course.title}.`,
+      // Course spaces are members-only by default: the people in them are the
+      // people who paid for or were enrolled in the course.
+      visibility: 'members',
+      courseId,
+    });
+
+    await pool.query(`UPDATE courses SET space_id = $2 WHERE id = $1`, [courseId, space.spaceId]);
+    log.info({ courseId, spaceId: space.spaceId }, 'space provisioned for course');
+  }
+
+  // Runs every time. A republish six months in picks up everyone who has
+  // enrolled since, and the ON CONFLICT makes repeats free.
+  const { rows: learners } = await pool.query(
+    `SELECT user_id FROM enrollments WHERE course_id = $1 AND status IN ('active','completed')`,
+    [courseId],
+  );
+
+  const added = await Memberships.joinMany({
+    spaceId: space.spaceId,
+    userIds: learners.map((row) => row.user_id),
+  });
+
+  if (added > 0) log.info({ courseId, spaceId: space.spaceId, added }, 'learners added to course space');
+
+  return { ...space, membersAdded: added };
+};
+
+/** Called when someone enrols after the course was published. */
+export const addLearnerToCourseSpace = async ({ courseId, userId }) => {
+  const space = await Spaces.findByCourse(courseId);
+  if (!space) return null;
+  return Memberships.join({ spaceId: space.spaceId, userId });
+};
+
+// ---------------------------------------------------------------------------
+// Membership
+// ---------------------------------------------------------------------------
+
+export const join = async ({ spaceId, userId }) => {
+  const space = await Spaces.findById(spaceId, userId);
+  if (!space) throw Object.assign(new Error('space not found'), { code: 'not_found' });
+
+  // A course space is not joined by asking: enrolling in the course is what
+  // puts you in it.
+  if (space.courseId) {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM enrollments WHERE course_id = $1 AND user_id = $2 AND status IN ('active','completed')`,
+      [space.courseId, userId],
+    );
+    if (rows.length === 0) {
+      throw Object.assign(new Error('enrol in the course to join this space'), { code: 'forbidden' });
+    }
+  } else if (space.visibility === 'private') {
+    throw Object.assign(new Error('this space is invite only'), { code: 'forbidden' });
+  }
+
+  const membership = await Memberships.join({ spaceId, userId });
+  log.info({ spaceId, userId }, 'joined space');
+  return membership;
+};
+
+export const leave = ({ spaceId, userId }) => Memberships.leave({ spaceId, userId });
+
+export const invite = async ({ spaceId, actorId, userIds }) => {
+  await assertModerator({ spaceId, userId: actorId });
+  const added = await Memberships.joinMany({ spaceId, userIds });
+
+  const space = await Spaces.findById(spaceId, actorId);
+  const { notifyMany } = await import('./NotificationService.js');
+  await notifyMany({
+    userIds,
+    type: 'space.invite',
+    title: `You were added to ${space.name}`,
+    href: `/spaces/${space.slug}`,
+    actorId,
+    data: { spaceId },
+  });
+
+  return { added };
+};
+
+export const updateMembership = async ({ spaceId, actorId, userId, patch }) => {
+  const actor = await assertModerator({ spaceId, userId: actorId });
+
+  // Only an owner changes roles. A moderator can mute and suspend, which is
+  // what moderation needs, but cannot appoint other moderators.
+  if (patch.role !== undefined && actor.role !== 'owner') {
+    throw Object.assign(new Error('only the owner can change roles'), { code: 'forbidden' });
+  }
+  return Memberships.update({ spaceId, userId, patch });
+};
+
+export const listMembers = async ({ spaceId, viewerId, cursor, limit }) => {
+  await assertMember({ spaceId, userId: viewerId });
+  const page = await Memberships.listMembers({ spaceId, cursor, limit });
+
+  const presence = await Presence.getMany(page.items.map((member) => member.userId)).catch(() => []);
+  const byUser = new Map(presence.map((entry) => [entry.userId, entry]));
+
+  return {
+    ...page,
+    items: page.items.map((member) => ({
+      ...member,
+      presence: byUser.get(member.userId)?.state ?? 'offline',
+    })),
+  };
+};
+
+export const markRead = ({ spaceId, userId }) => Memberships.markRead({ spaceId, userId });
+
+// ---------------------------------------------------------------------------
+// Guards
+// ---------------------------------------------------------------------------
+
+export const assertMember = async ({ spaceId, userId }) => {
+  const membership = await Memberships.find({ spaceId, userId });
+  if (!membership || membership.suspended) {
+    throw Object.assign(new Error('you are not a member of this space'), { code: 'forbidden' });
+  }
+  return membership;
+};
+
+export const assertModerator = async ({ spaceId, userId }) => {
+  const membership = await Memberships.find({ spaceId, userId });
+  if (!Memberships.isModerator(membership)) {
+    throw Object.assign(new Error('you are not a moderator of this space'), { code: 'forbidden' });
+  }
+  return membership;
+};
+
+export default { getSpace, listSpaces, createSpace, updateSpace, provisionForCourse, join, leave, invite };
+=== FILE: server/src/routes/room-routes.js (106 lines) ===
+/**
+ * server/src/routes/rooms.routes.js
+ *
+ * Room to SFU node resolution for clients  (F1)
+ *
+ *   GET /rooms/:roomId/node[?avoid=nodeA,nodeB]
+ *     →  { nodeId, wsUrl, expiresAt, region, draining }
+ *
+ * The contract packages/core-client/src/rtc/nodeResolver.ts validates
+ * (SfuNodeSchema). The client asks this before it joins a room; the answer
+ * comes from RoomRegistry, which assigns the least-loaded node on first ask
+ * (SET NX, so two people opening a new lesson at once land on the same node).
+ *
+ * Why this exists next to route-resolve.routes.js: version 7 moves placement
+ * into the room.join acknowledgement and turns the old public route into an
+ * ops-only one under /internal. The client and the signalling handlers in this
+ * codebase still follow the v6 flow — resolve the node, then join on it — so
+ * this route keeps that flow working until both sides move to the v7 join
+ * acknowledgement together. It reveals no addresses beyond what the client
+ * connects to anyway, and only to an authenticated user.
+ *
+ * Node.js 22, ESM.
+ */
+
+import { Router } from 'express';
+
+import { env, isProduction } from '../config/env.js';
+import { resolveNode } from '../classroom/RoomRegistry.js';
+import { logger } from '../observability/logger.js';
+
+const log = logger.child({ component: 'rooms' });
+
+/** Same alphabet PresenceService and the registry accept. */
+const ROOM_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const NODE_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+
+/**
+ * How long a client may cache the answer. Short on purpose: nodeResolver caps
+ * it at five minutes anyway, and a drain must reach clients within that.
+ */
+const ASSIGNMENT_TTL_MS = 5 * 60_000;
+
+const error = (res, status, code, message, traceId) =>
+  res.status(status).json({ error: { code, message, traceId: traceId ?? '' } });
+
+/**
+ * The socket origin the client should use for this node.
+ *
+ * Empty string means "the realtime service you are already configured for"
+ * (VITE_WS_URL, or the page origin when that is empty). That is always right
+ * for the node running inside this process — development runs api, signalling
+ * and SFU in one process, and the browser reaches it through the Vite proxy or
+ * a Codespaces forward, never at the node's own announced address.
+ */
+const wsUrlFor = (node) => {
+  if (!isProduction && node.nodeId === env.SFU_NODE_ID) return '';
+  return typeof node.wsUrl === 'string' ? node.wsUrl : '';
+};
+
+export const roomRoutes = Router();
+
+roomRoutes.get('/:roomId/node', async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return error(res, 401, 'unauthenticated', 'Sign in to join a room.', req.traceId);
+    }
+
+    const { roomId } = req.params;
+    if (!ROOM_ID.test(roomId)) {
+      return error(res, 400, 'validation_failed', 'Invalid room id.', req.traceId);
+    }
+
+    const avoid = String(req.query.avoid ?? '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => NODE_ID.test(id))
+      .slice(0, 10);
+
+    let node;
+    try {
+      node = await resolveNode({ roomId, avoid });
+    } catch (cause) {
+      if (cause?.code === 'sfu_unavailable') {
+        // nodeResolver retries a 503: a node may be registering right now.
+        res.set('Retry-After', '2');
+        return error(res, 503, 'sfu_unavailable', 'No media server is available right now.', req.traceId);
+      }
+      throw cause;
+    }
+
+    const body = {
+      nodeId: node.nodeId,
+      wsUrl: wsUrlFor(node),
+      expiresAt: new Date(Date.now() + ASSIGNMENT_TTL_MS).toISOString(),
+      region: node.region ?? env.MEDIA_REGION ?? env.AWS_REGION ?? null,
+      draining: Boolean(node.draining),
+    };
+
+    log.debug({ roomId, nodeId: body.nodeId, assigned: Boolean(node.assigned) }, 'room node resolved');
+    res.set('Cache-Control', 'no-store');
+    return res.json(body);
+  } catch (cause) {
+    return next(cause);
+  }
+});
+
+export default roomRoutes;
+=== FILE: server/src/routes/profile.routes.js (325 lines) ===
+/**
+ * profile.routes — own profile · privacy · other people · blocking (F6)
+ *
+ * Mounted under /profiles (app.js), so every path here is relative to it:
+ * '/me' is GET /profiles/me. (The previous version repeated the prefix, which
+ * made every route answer at /profiles/profiles/… and the client's calls 404.)
+ *
+ * A profile read is filtered by the viewer, and `canMessage` comes back
+ * computed by ConversationService.canMessage — the same rule the send path
+ * enforces — so the Message button and the send always agree. `roomId` in the
+ * query lets that rule count a shared live lesson as shared context.
+ *
+ * Both the contract's paths (profileApi: PATCH /me/privacy, POST /me/blocks,
+ * DELETE /me/blocks/:userId) and the older ones (PUT /me/privacy,
+ * PUT|DELETE /:userId/block) are served, so no client breaks while it moves.
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+
+import * as Profile from '../identity/Profile.js';
+import * as ConversationService from '../messaging/ConversationService.js';
+import * as ChatModerationService from '../messaging/ChatModerationService.js';
+import * as UploadService from '../media/UploadService.js';
+import { rateLimit } from '../middleware/rateLimit.js';
+import * as NotificationService from '../community/NotificationService.js';
+import { recordChange } from '../settings/changeLog.js';
+import { route, validate, requireAuth, tenantOf, q, notFound, badRequest, forbidden } from './_helpers.js';
+
+const router = Router();
+router.use(requireAuth);
+
+const userIdParam = z.object({ userId: z.string().uuid() });
+
+/** Errors the profile domain raises with a code, as the HTTP answers clients understand. */
+const asHttp = (fn) => async (req, res) => {
+  try {
+    return await fn(req, res);
+  } catch (error) {
+    switch (error?.code) {
+      case 'validation_failed':
+        throw badRequest(error.message);
+      case 'forbidden':
+        throw forbidden(error.message);
+      case 'not_found':
+        throw notFound(error.message);
+      case 'conflict':
+        throw Object.assign(badRequest(error.message), { status: 409 });
+      default:
+        throw error;
+    }
+  }
+};
+
+const TIME_ZONES = new Set(Intl.supportedValuesOf('timeZone'));
+
+/* ------------------------------------------------------------------ *
+ * Own profile
+ * ------------------------------------------------------------------ */
+
+router.get(
+  '/me',
+  route(async (req) => {
+    const own = await Profile.getOwn(req.user.id);
+    if (!own) throw notFound('No profile for this account');
+    return own;
+  }),
+);
+
+router.patch(
+  '/me',
+  validate({
+    body: z.object({
+      displayName: z.string().trim().min(1).max(80).optional(),
+      // Lower-case letters, digits and underscores: what @mentions can match.
+      handle: z.string().trim().toLowerCase().regex(/^[a-z0-9_]{3,32}$/, 'use 3–32 lowercase letters, digits or _').optional(),
+      bio: z.string().max(2000).nullish(),
+      headline: z.string().max(140).nullish(),
+      avatarAssetId: z.string().uuid().nullish(),
+      links: z.array(z.object({ label: z.string().max(40), url: z.string().url() })).max(5).optional(),
+      locale: z.string().regex(/^[a-z]{2}(-[A-Z]{2})?$/, 'a language code such as en or de-DE').optional(),
+      timeZone: z.string().max(64).refine((zone) => TIME_ZONES.has(zone), 'not a known time zone').optional(),
+    }),
+  }),
+  route(
+    asHttp(async (req) => {
+      const { avatarAssetId, ...patch } = req.body;
+      if (avatarAssetId) await Profile.setAvatar({ userId: req.user.id, assetId: avatarAssetId });
+      const next = await Profile.update({ userId: req.user.id, patch });
+      await recordChange(req, 'profile', avatarAssetId ? { ...patch, avatar: true } : patch);
+      return next;
+    }),
+  ),
+);
+
+/**
+ * Account preferences: appearance, date and time format, how lessons start
+ * for me, and (teachers) my lesson defaults. PATCH takes any section with any
+ * subset of its keys and returns the full set with defaults filled in.
+ */
+router.get(
+  '/me/preferences',
+  route(async (req) => Profile.getPreferences(req.user.id)),
+);
+
+router.patch(
+  '/me/preferences',
+  route(
+    asHttp(async (req) => {
+      const next = await Profile.updatePreferences({ userId: req.user.id, patch: req.body });
+      await recordChange(req, 'preferences', req.body);
+      return next;
+    }),
+  ),
+);
+
+/**
+ * Notification settings (Phase B). The same data as GET/PATCH
+ * /account/notifications, for clients that use the profile paths.
+ */
+router.get(
+  '/me/notifications',
+  route(async (req) => NotificationService.getSettings(req.user.id)),
+);
+
+router.patch(
+  '/me/notifications',
+  route(
+    asHttp(async (req) => {
+      const next = await NotificationService.updateSettings({ userId: req.user.id, patch: req.body ?? {} });
+      await recordChange(req, 'notifications', req.body);
+      return next;
+    }),
+  ),
+);
+
+/**
+ * Who may message me, and what others see. "Receive private messages: off" is
+ * dmPolicy 'nobody'; teachers of the tenant can still reach the person.
+ */
+const privacyBody = z.object({
+  dmPolicy: z.enum(['anyone', 'shared-context', 'shared-only', 'shared', 'nobody']).optional(),
+  visibility: z.enum(['tenant', 'shared-only', 'shared', 'private']).optional(),
+  showPresence: z.boolean().optional(),
+  sendReadReceipts: z.boolean().optional(),
+  readReceipts: z.boolean().optional(),
+});
+
+const updatePrivacy = route(async (req) => {
+  const next = await Profile.updatePrivacy({ userId: req.user.id, patch: req.body });
+  await recordChange(req, 'privacy', req.body);
+  return next;
+});
+router.patch('/me/privacy', validate({ body: privacyBody }), updatePrivacy);
+router.put('/me/privacy', validate({ body: privacyBody }), updatePrivacy);
+
+router.get(
+  '/me/privacy',
+  route(async (req) => (await Profile.getOwn(req.user.id))?.privacy ?? null),
+);
+
+/** Avatar upload goes through the media presign flow like any other asset. */
+router.post(
+  '/me/avatar',
+  validate({
+    body: z.object({
+      filename: z.string().min(1).max(255),
+      contentType: z.enum(['image/jpeg', 'image/png', 'image/webp']),
+      sizeBytes: z.number().int().min(1).max(10 * 1024 * 1024),
+    }),
+  }),
+  route(async (req, res) => {
+    res.status(201);
+    return UploadService.createUpload({
+      ownerId: req.user.id,
+      purpose: 'avatar',
+      fileName: req.body.filename,
+      contentType: req.body.contentType,
+      sizeBytes: req.body.sizeBytes,
+    });
+  }),
+);
+
+router.put(
+  '/me/avatar',
+  validate({ body: z.object({ assetId: z.string().uuid() }) }),
+  route(async (req) => Profile.setAvatar({ userId: req.user.id, assetId: req.body.assetId })),
+);
+
+/* ------------------------------------------------------------------ *
+ * Blocking (account-wide)
+ * ------------------------------------------------------------------ */
+
+router.get(
+  '/me/blocks',
+  validate({ query: z.object({ cursor: z.string().optional(), limit: z.coerce.number().int().min(1).max(100).optional() }) }),
+  route(async (req) =>
+    Profile.listBlocks({ userId: req.user.id, cursor: q(req).cursor ?? null, limit: q(req).limit ?? 25 }),
+  ),
+);
+
+const block = async (req, blockedUserId, reason) => {
+  if (blockedUserId === req.user.id) throw badRequest('You cannot block yourself');
+  // Mutual in effect: neither side can message the other afterwards.
+  return Profile.block({ userId: req.user.id, blockedUserId, reason: reason ?? null });
+};
+
+router.post(
+  '/me/blocks',
+  validate({ body: z.object({ userId: z.string().uuid(), reason: z.string().max(500).optional() }).passthrough() }),
+  route(async (req, res) => {
+    res.status(201);
+    return block(req, req.body.userId, req.body.reason);
+  }),
+);
+
+router.delete(
+  '/me/blocks/:userId',
+  validate({ params: userIdParam }),
+  route(async (req) => {
+    await Profile.unblock({ userId: req.user.id, blockedUserId: req.params.userId });
+    return null;
+  }),
+);
+
+router.put(
+  '/:userId/block',
+  validate({ params: userIdParam, body: z.object({ reason: z.string().max(500).optional() }).default({}) }),
+  route(async (req) => block(req, req.params.userId, req.body?.reason)),
+);
+
+router.delete(
+  '/:userId/block',
+  validate({ params: userIdParam }),
+  route(async (req) => {
+    await Profile.unblock({ userId: req.user.id, blockedUserId: req.params.userId });
+    return null;
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * Other people
+ * ------------------------------------------------------------------ */
+
+/** Mention autocomplete and people search. */
+const searchQuery = z.object({
+  q: z.string().min(2).max(80),
+  scopeId: z.string().uuid().optional(),
+  spaceId: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(25).optional(),
+});
+
+const search = route(async (req) =>
+  Profile.search({
+    q: q(req).q,
+    viewerId: req.user.id,
+    scopeId: q(req).scopeId ?? q(req).spaceId ?? null,
+    limit: q(req).limit ?? 10,
+  }),
+);
+
+router.get('/search', rateLimit({ key: 'profile:search', points: 60, durationSec: 60, by: ['user'] }), validate({ query: searchQuery }), search);
+router.get('/', rateLimit({ key: 'profile:search', points: 60, durationSec: 60, by: ['user'] }), validate({ query: searchQuery }), search);
+
+/**
+ * Someone else's profile, as this viewer may see it. `canMessage` and the
+ * reason are computed by the same rule the send path enforces.
+ */
+router.get(
+  '/:userId',
+  rateLimit({ key: 'profile:read', points: 300, durationSec: 300, by: ['user'] }),
+  validate({ params: userIdParam, query: z.object({ roomId: z.string().uuid().optional() }).passthrough() }),
+  route(async (req) => {
+    const profile = await Profile.getPublic({ userId: req.params.userId, viewerId: req.user.id });
+    if (!profile) throw notFound('No such profile');
+
+    const roomId = q(req).roomId ?? null;
+    const messaging = await ConversationService.canMessage({
+      fromUserId: req.user.id,
+      toUserId: req.params.userId,
+      roomId,
+    });
+
+    // Teachers count as sharing a course with the people they teach, as in
+    // the "View as" preview in Settings.
+    const shares =
+      req.params.userId === req.user.id ||
+      ['teacher', 'owner'].includes(req.user.role) ||
+      (await ConversationService.sharesContext({ userA: req.user.id, userB: req.params.userId, roomId }));
+
+    return {
+      ...Profile.applyVisibility(profile, { sharesContext: shares }),
+      canMessage: messaging.allowed,
+      cannotMessageReason: messaging.allowed ? null : messaging.reason ?? null,
+    };
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * Reporting
+ * ------------------------------------------------------------------ */
+
+router.post(
+  '/:userId/report',
+  rateLimit({ key: 'profile:report', points: 20, durationSec: 3600, by: ['user'] }),
+  validate({
+    params: userIdParam,
+    body: z.object({
+      reason: z.enum(['spam', 'abuse', 'harassment', 'impersonation', 'nsfw', 'other']),
+      note: z.string().max(2000).optional(),
+      messageIds: z.array(z.string().uuid()).max(20).default([]),
+    }),
+  }),
+  route(async (req, res) => {
+    res.status(202);
+    return ChatModerationService.reportUser({
+      reporterId: req.user.id,
+      reportedId: req.params.userId,
+      tenantId: tenantOf(req),
+      ...req.body,
+    });
+  }),
+);
+
+export default router;
+
+=== FILE: server/src/routes/rooms.routes.js (107 lines) ===
+/**
+ * server/src/routes/rooms.routes.js
+ *
+ * Room to SFU node resolution for clients  (F1)
+ *
+ *   GET /rooms/:roomId/node[?avoid=nodeA,nodeB]
+ *     →  { nodeId, wsUrl, expiresAt, region, draining }
+ *
+ * The contract packages/core-client/src/rtc/nodeResolver.ts validates
+ * (SfuNodeSchema). The client asks this before it joins a room; the answer
+ * comes from RoomRegistry, which assigns the least-loaded node on first ask
+ * (SET NX, so two people opening a new lesson at once land on the same node).
+ *
+ * Why this exists next to route-resolve.routes.js: version 7 moves placement
+ * into the room.join acknowledgement and turns the old public route into an
+ * ops-only one under /internal. The client and the signalling handlers in this
+ * codebase still follow the v6 flow — resolve the node, then join on it — so
+ * this route keeps that flow working until both sides move to the v7 join
+ * acknowledgement together. It reveals no addresses beyond what the client
+ * connects to anyway, and only to an authenticated user.
+ *
+ * Node.js 22, ESM.
+ */
+
+import { Router } from 'express';
+
+import { env, isProduction } from '../config/env.js';
+import { resolveNode } from '../classroom/RoomRegistry.js';
+import { logger } from '../observability/logger.js';
+
+const log = logger.child({ component: 'rooms' });
+
+/** Same alphabet PresenceService and the registry accept. */
+const ROOM_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const NODE_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+
+/**
+ * How long a client may cache the answer. Short on purpose: nodeResolver caps
+ * it at five minutes anyway, and a drain must reach clients within that.
+ */
+const ASSIGNMENT_TTL_MS = 5 * 60_000;
+
+const error = (res, status, code, message, traceId) =>
+  res.status(status).json({ error: { code, message, traceId: traceId ?? '' } });
+
+/**
+ * The socket origin the client should use for this node.
+ *
+ * Empty string means "the realtime service you are already configured for"
+ * (VITE_WS_URL, or the page origin when that is empty). That is always right
+ * for the node running inside this process — development runs api, signalling
+ * and SFU in one process, and the browser reaches it through the Vite proxy or
+ * a Codespaces forward, never at the node's own announced address.
+ */
+const wsUrlFor = (node) => {
+  if (!isProduction && node.nodeId === env.SFU_NODE_ID) return '';
+  return typeof node.wsUrl === 'string' ? node.wsUrl : '';
+};
+
+export const roomRoutes = Router();
+
+roomRoutes.get('/:roomId/node', async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return error(res, 401, 'unauthenticated', 'Sign in to join a room.', req.traceId);
+    }
+
+    const { roomId } = req.params;
+    if (!ROOM_ID.test(roomId)) {
+      return error(res, 400, 'validation_failed', 'Invalid room id.', req.traceId);
+    }
+
+    const avoid = String(req.query.avoid ?? '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => NODE_ID.test(id))
+      .slice(0, 10);
+
+    let node;
+    try {
+      node = await resolveNode({ roomId, avoid });
+    } catch (cause) {
+      if (cause?.code === 'sfu_unavailable') {
+        // nodeResolver retries a 503: a node may be registering right now.
+        res.set('Retry-After', '2');
+        return error(res, 503, 'sfu_unavailable', 'No media server is available right now.', req.traceId);
+      }
+      throw cause;
+    }
+
+    const body = {
+      nodeId: node.nodeId,
+      wsUrl: wsUrlFor(node),
+      expiresAt: new Date(Date.now() + ASSIGNMENT_TTL_MS).toISOString(),
+      region: node.region ?? env.MEDIA_REGION ?? env.AWS_REGION ?? null,
+      draining: Boolean(node.draining),
+    };
+
+    log.debug({ roomId, nodeId: body.nodeId, assigned: Boolean(node.assigned) }, 'room node resolved');
+    res.set('Cache-Control', 'no-store');
+    return res.json(body);
+  } catch (cause) {
+    return next(cause);
+  }
+});
+
+export default roomRoutes;
+
+=== FILE: server/src/routes/community.routes.js (282 lines) ===
+/**
+ * community.routes — spaces · threads · posts · feed · notifications (F2)
+ *
+ * Spaces are auto-provisioned when a course is published, so there is no "create space for
+ * course" route: SpaceService does it on the publish event. What is here is the standalone
+ * case and everything a member does inside a space.
+ *
+ * Feeds are cursor-paginated in both directions. A community timeline that uses OFFSET
+ * starts skipping and repeating posts the moment someone writes while you scroll.
+ *
+ * Read paths prefer the read replica; writes never touch it. That routing is
+ * FeedService's job, not this file's — the routes just say which they are.
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+
+import * as SpaceService from '../community/SpaceService.js';
+import * as FeedService from '../community/FeedService.js';
+import * as PresenceService from '../realtime/PresenceService.js';
+import * as ModerationService from '../community/ModerationService.js';
+import * as NotificationService from '../community/NotificationService.js';
+import { route, validate, requireAuth, tenantOf, paging, q, notFound, forbidden } from './_helpers.js';
+
+const router = Router();
+router.use(requireAuth);
+
+const idParam = z.object({ id: z.string().uuid() });
+const pageQuery = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  direction: z.enum(['forward', 'backward']).optional(),
+});
+
+/* ------------------------------------------------------------------ *
+ * Spaces
+ * ------------------------------------------------------------------ */
+
+router.get(
+  '/spaces',
+  validate({ query: pageQuery.extend({ joined: z.coerce.boolean().optional() }) }),
+  route(async (req) =>
+    SpaceService.list({
+      tenantId: tenantOf(req),
+      userId: req.user.id,
+      joinedOnly: q(req).joined === true,
+      ...paging(req),
+    }),
+  ),
+);
+
+router.post(
+  '/spaces',
+  validate({
+    body: z.object({
+      name: z.string().min(1).max(120),
+      description: z.string().max(2000).optional(),
+      visibility: z.enum(['open', 'closed']).default('open'),
+    }),
+  }),
+  route(async (req, res) => {
+    res.status(201);
+    return SpaceService.create({ tenantId: tenantOf(req), createdBy: req.user.id, ...req.body });
+  }),
+);
+
+router.get(
+  '/spaces/:id',
+  validate({ params: idParam }),
+  route(async (req) => {
+    const space = await SpaceService.getForUser(req.params.id, req.user.id);
+    if (!space) throw notFound('No such space');
+    return space;
+  }),
+);
+
+router.post(
+  '/spaces/:id/members',
+  validate({ params: idParam, body: z.object({ userId: z.string().uuid().optional() }).default({}) }),
+  route(async (req, res) => {
+    const targetId = req.body.userId ?? req.user.id;
+    if (targetId !== req.user.id) {
+      const membership = await SpaceService.membershipOf(req.params.id, req.user.id);
+      if (!membership || !['owner', 'moderator'].includes(membership.role)) {
+        throw forbidden('Only a moderator can add someone else');
+      }
+    }
+    res.status(201);
+    return SpaceService.join({ spaceId: req.params.id, userId: targetId, actorId: req.user.id });
+  }),
+);
+
+router.delete(
+  '/spaces/:id/members/:userId',
+  validate({ params: z.object({ id: z.string().uuid(), userId: z.string().uuid() }) }),
+  route(async (req) => {
+    await SpaceService.leave({ spaceId: req.params.id, userId: req.params.userId, actorId: req.user.id });
+    return null;
+  }),
+);
+
+router.get(
+  '/spaces/:id/presence',
+  validate({ params: idParam }),
+  route(async (req) => ({ online: await PresenceService.listForSpace(req.params.id) })),
+);
+
+/* ------------------------------------------------------------------ *
+ * Threads and posts
+ * ------------------------------------------------------------------ */
+
+router.get(
+  '/spaces/:id/threads',
+  validate({ params: idParam, query: pageQuery.extend({ sort: z.enum(['recent', 'active']).optional() }) }),
+  route(async (req) =>
+    FeedService.threadsInSpace({ spaceId: req.params.id, userId: req.user.id, sort: q(req).sort ?? 'active', ...paging(req) }),
+  ),
+);
+
+router.post(
+  '/spaces/:id/threads',
+  validate({
+    params: idParam,
+    body: z.object({
+      title: z.string().min(1).max(200),
+      body: z.string().min(1).max(20_000),
+      attachmentIds: z.array(z.string().uuid()).max(10).default([]),
+    }),
+  }),
+  route(async (req, res) => {
+    res.status(201);
+    return FeedService.createThread({ spaceId: req.params.id, authorId: req.user.id, ...req.body });
+  }),
+);
+
+router.get(
+  '/threads/:id',
+  validate({ params: idParam, query: pageQuery }),
+  route(async (req) => FeedService.getThread({ threadId: req.params.id, userId: req.user.id, ...paging(req) })),
+);
+
+router.post(
+  '/threads/:id/posts',
+  validate({
+    params: idParam,
+    body: z.object({
+      body: z.string().min(1).max(20_000),
+      replyToId: z.string().uuid().nullish(),
+      attachmentIds: z.array(z.string().uuid()).max(10).default([]),
+      clientId: z.string().max(128).optional(),
+    }),
+  }),
+  route(async (req, res) => {
+    res.status(201);
+    return FeedService.createPost({ threadId: req.params.id, authorId: req.user.id, ...req.body });
+  }),
+);
+
+router.patch(
+  '/posts/:id',
+  validate({ params: idParam, body: z.object({ body: z.string().min(1).max(20_000) }) }),
+  route(async (req) => FeedService.editPost({ postId: req.params.id, actorId: req.user.id, body: req.body.body })),
+);
+
+/** Soft delete with an audit record — moderation history must survive the deletion. */
+router.delete(
+  '/posts/:id',
+  validate({ params: idParam }),
+  route(async (req) => {
+    await FeedService.deletePost({ postId: req.params.id, actorId: req.user.id });
+    return null;
+  }),
+);
+
+router.put(
+  '/posts/:id/reactions/:emoji',
+  validate({ params: z.object({ id: z.string().uuid(), emoji: z.string().min(1).max(16) }) }),
+  route(async (req) =>
+    FeedService.react({ postId: req.params.id, userId: req.user.id, emoji: req.params.emoji, on: true }),
+  ),
+);
+
+router.delete(
+  '/posts/:id/reactions/:emoji',
+  validate({ params: z.object({ id: z.string().uuid(), emoji: z.string().min(1).max(16) }) }),
+  route(async (req) => {
+    await FeedService.react({ postId: req.params.id, userId: req.user.id, emoji: req.params.emoji, on: false });
+    return null;
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * Personal feed and notifications
+ * ------------------------------------------------------------------ */
+
+router.get(
+  '/feed',
+  validate({ query: pageQuery }),
+  route(async (req) => FeedService.personalTimeline({ userId: req.user.id, tenantId: tenantOf(req), ...paging(req) })),
+);
+
+router.get(
+  '/notifications',
+  validate({ query: pageQuery.extend({ unreadOnly: z.coerce.boolean().optional() }) }),
+  route(async (req) =>
+    NotificationService.list({ userId: req.user.id, unreadOnly: q(req).unreadOnly === true, ...paging(req) }),
+  ),
+);
+
+router.post(
+  '/notifications/read',
+  validate({
+    body: z.object({ ids: z.array(z.string().uuid()).max(500).optional(), upTo: z.coerce.date().optional() }),
+  }),
+  route(async (req) => ({
+    marked: await NotificationService.markRead({ userId: req.user.id, ids: req.body.ids, upTo: req.body.upTo }),
+  })),
+);
+
+router.get(
+  '/notifications/preferences',
+  route(async (req) => NotificationService.getPreferences(req.user.id)),
+);
+
+router.put(
+  '/notifications/preferences',
+  validate({
+    body: z.object({
+      digest: z.enum(['off', 'daily', 'weekly']).optional(),
+      push: z.record(z.boolean()).optional(),
+      email: z.record(z.boolean()).optional(),
+      quietHours: z.object({ start: z.string(), end: z.string(), timeZone: z.string() }).nullish(),
+    }),
+  }),
+  route(async (req) => NotificationService.setPreferences(req.user.id, req.body)),
+);
+
+/* ------------------------------------------------------------------ *
+ * Moderation
+ * ------------------------------------------------------------------ */
+
+router.post(
+  '/community/reports',
+  validate({
+    body: z.object({
+      targetType: z.enum(['post', 'thread', 'space', 'user']),
+      targetId: z.string().uuid(),
+      reason: z.enum(['spam', 'abuse', 'harassment', 'off-topic', 'other']),
+      note: z.string().max(2000).optional(),
+    }),
+  }),
+  route(async (req, res) => {
+    res.status(202);
+    return ModerationService.report({ reporterId: req.user.id, tenantId: tenantOf(req), ...req.body });
+  }),
+);
+
+router.get(
+  '/community/reports',
+  validate({ query: pageQuery.extend({ status: z.enum(['open', 'resolved']).optional() }) }),
+  route(async (req) => {
+    if (!['owner', 'teacher'].includes(req.user.role)) throw forbidden('Moderators only');
+    return ModerationService.queue({ tenantId: tenantOf(req), status: q(req).status ?? 'open', ...paging(req) });
+  }),
+);
+
+router.post(
+  '/community/reports/:id/resolve',
+  validate({
+    params: idParam,
+    body: z.object({
+      action: z.enum(['dismiss', 'delete', 'mute', 'remove']),
+      note: z.string().max(2000).optional(),
+      muteHours: z.number().int().min(1).max(720).optional(),
+    }),
+  }),
+  route(async (req) => {
+    if (!['owner', 'teacher'].includes(req.user.role)) throw forbidden('Moderators only');
+    return ModerationService.resolve({ reportId: req.params.id, actorId: req.user.id, ...req.body });
+  }),
+);
+
+export default router;
+=== FILE: server/src/routes/account.routes.js (393 lines) ===
+/**
+ * account.routes — notifications · signed-in devices · history  (Settings, Phase B)
+ *
+ * Mounted under /account (app.js). Everything here is about the person asking;
+ * no route takes someone else's id.
+ *
+ *   GET    /notifications                 settings, push and email status
+ *   PATCH  /notifications                 any part of the settings
+ *   POST   /notifications/test            { channel: inApp | push | email }
+ *   PUT    /push-subscriptions            this browser receives push
+ *   POST   /push-subscriptions/remove     this browser stops
+ *   GET    /muted-chats                   every chat muted right now
+ *   POST   /muted-chats/:kind/:id/unmute  ends one mute
+ *   POST   /muted-chats/:kind/:id/mute    mutes again (the undo of unmute)
+ *   GET    /sessions                      signed-in devices, this one marked
+ *   DELETE /sessions/:sessionId           sign one device out
+ *   POST   /sessions/sign-out-others      sign out everywhere else
+ *   GET    /login-history                 sign-ins and failed attempts
+ *   GET    /activity                      recent settings and security changes
+ *
+ * Password, two-step sign-in, passkeys and "your data" are in
+ * accountSecurity.routes.js, under /account/security.
+ *
+ * A test notification is sent from here directly rather than through the
+ * queue, so the answer says what actually happened ("sent to 2 browsers",
+ * "the mail server refused it") and a test works while the worker is down.
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+
+import { pool } from '../db/pool.js';
+import * as NotificationService from '../community/NotificationService.js';
+import * as Rules from '../settings/notifications.js';
+import * as Subscriptions from '../notifications/webPushSubscriptions.js';
+import * as Delivery from '../notifications/delivery.js';
+import { deliveryConfig } from '../notifications/config.js';
+import * as DeviceSessions from '../identity/deviceSessions.js';
+import * as Participant from '../messaging/models/Participant.js';
+import { auditFromRequest } from '../security/auditLog.js';
+import { SIGN_IN_FAILED, SIGN_IN_SUCCEEDED } from '../security/sessionActivity.js';
+import { describeUserAgent } from '../security/userAgent.js';
+import { recordChange } from '../settings/changeLog.js';
+import { pushToUser } from '../realtime/userEvents.js';
+import { rateLimit } from '../middleware/rateLimit.js';
+import { route, validate, requireAuth, q, notFound, badRequest, forbidden } from './_helpers.js';
+
+const router = Router();
+router.use(requireAuth);
+
+/** Errors the services raise with a code, as the HTTP answers clients understand. */
+const asHttp = (fn) => async (req, res) => {
+  try {
+    return await fn(req, res);
+  } catch (error) {
+    switch (error?.code) {
+      case 'validation_failed':
+        throw badRequest(error.message);
+      case 'forbidden':
+        throw forbidden(error.message);
+      case 'not_found':
+        throw notFound(error.message);
+      default:
+        throw error;
+    }
+  }
+};
+
+const iso = (value) => (value ? new Date(value).toISOString() : null);
+
+/* ------------------------------------------------------------------ *
+ * Notifications
+ * ------------------------------------------------------------------ */
+
+const notificationsView = async (userId) => {
+  const context = await NotificationService.getDeliveryContext(userId);
+  if (!context) throw notFound('No account');
+  return {
+    settings: context.settings,
+    timeZone: context.timeZone,
+    quietNow: Rules.isWithinQuietHours(context.settings.quietHours, new Date(), context.timeZone),
+    push: {
+      configured: Delivery.webPushConfigured(),
+      publicKey: Delivery.webPushPublicKey(),
+      devices: await Subscriptions.countForUser(userId),
+    },
+    email: { address: context.email, suppressed: context.emailSuppressed },
+  };
+};
+
+router.get('/notifications', route(async (req) => notificationsView(req.user.id)));
+
+router.patch(
+  '/notifications',
+  route(
+    asHttp(async (req) => {
+      await NotificationService.updateSettings({ userId: req.user.id, patch: req.body ?? {} });
+      await recordChange(req, 'notifications', req.body);
+      return notificationsView(req.user.id);
+    }),
+  ),
+);
+
+const TEST_TEXT = {
+  title: 'Test notification',
+  body: 'If you can read this, notifications reach you here.',
+  url: '/settings/notifications',
+};
+
+router.post(
+  '/notifications/test',
+  rateLimit({ key: 'account:notify-test', points: 10, durationSec: 60, by: ['user'] }),
+  validate({ body: z.object({ channel: z.enum(['inApp', 'push', 'email']) }) }),
+  route(async (req) => {
+    const userId = req.user.id;
+    const { channel } = req.body;
+
+    if (channel === 'inApp') {
+      await NotificationService.createInApp({ userId, kind: 'system.test', ...TEST_TEXT });
+      return { channel, delivered: 1, detail: 'Sent. It appears on screen in every open tab of the app.' };
+    }
+
+    if (channel === 'push') {
+      if (!Delivery.webPushConfigured()) {
+        return { channel, delivered: 0, detail: 'Push is not set up on the server: the web push keys are missing.' };
+      }
+      const result = await Delivery.sendPush({ userId, kind: 'system.test', ...TEST_TEXT });
+      if (result.targets === 0) {
+        return {
+          channel,
+          delivered: 0,
+          detail: 'No browser receives push on this account yet. Turn on push for this browser first.',
+        };
+      }
+      return {
+        channel,
+        delivered: result.delivered,
+        detail:
+          result.failed === 0
+            ? `Sent to ${result.delivered} ${result.delivered === 1 ? 'browser' : 'browsers'}.`
+            : `Sent to ${result.delivered} of ${result.targets}. Browsers that no longer accept push were removed.`,
+      };
+    }
+
+    const context = await NotificationService.getDeliveryContext(userId);
+    if (!context?.email) return { channel, delivered: 0, detail: 'This account has no email address.' };
+    if (context.emailSuppressed) {
+      return { channel, delivered: 0, detail: 'Email to this address is paused because an earlier one bounced.' };
+    }
+    try {
+      const rendered = Delivery.renderEmail({ ...TEST_TEXT, recipientName: context.displayName });
+      const sent = await Delivery.sendEmail({ to: context.email, ...rendered, kind: 'system.test' });
+      const where =
+        sent.transport === 'smtp' && deliveryConfig().smtpPort === 1025
+          ? ' In development it lands in Mailpit (port 8025).'
+          : '';
+      return { channel, delivered: 1, detail: `Sent to ${context.email}.${where}` };
+    } catch (cause) {
+      return {
+        channel,
+        delivered: 0,
+        detail: `The mail server did not accept it (${cause?.code ?? cause?.message ?? 'unknown error'}).`,
+      };
+    }
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * Push registrations (this browser)
+ * ------------------------------------------------------------------ */
+
+const subscriptionBody = z
+  .object({
+    endpoint: z
+      .string()
+      .url()
+      .max(2048)
+      .refine((value) => value.startsWith('https://'), 'push endpoints are https'),
+    keys: z.object({ p256dh: z.string().min(16).max(256), auth: z.string().min(8).max(64) }).passthrough(),
+  })
+  .passthrough();
+
+router.put(
+  '/push-subscriptions',
+  rateLimit({ key: 'account:push-register', points: 20, durationSec: 3600, by: ['user'] }),
+  validate({ body: subscriptionBody }),
+  route(async (req) => {
+    if (!Delivery.webPushConfigured()) throw badRequest('Push is not set up on the server.');
+    await Subscriptions.upsert({
+      userId: req.user.id,
+      sessionId: req.user.sessionId ?? null,
+      endpoint: req.body.endpoint,
+      p256dh: req.body.keys.p256dh,
+      auth: req.body.keys.auth,
+      userAgent: req.get('user-agent'),
+    });
+    return { registered: true, devices: await Subscriptions.countForUser(req.user.id) };
+  }),
+);
+
+router.post(
+  '/push-subscriptions/remove',
+  validate({ body: z.object({ endpoint: z.string().max(2048) }) }),
+  route(async (req) => {
+    await Subscriptions.removeByEndpoint({ userId: req.user.id, endpoint: req.body.endpoint });
+    return { registered: false, devices: await Subscriptions.countForUser(req.user.id) };
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * Muted chats
+ * ------------------------------------------------------------------ */
+
+router.get('/muted-chats', route(async (req) => NotificationService.mutedChats(req.user.id)));
+
+const muteParams = z.object({ kind: z.enum(['conversation', 'channel']), id: z.string().uuid() });
+
+const setChatMute = async ({ userId, kind, id, muted, until = null }) => {
+  if (kind === 'conversation') {
+    if (!(await Participant.isParticipant({ conversationId: id, userId }))) throw notFound('Chat not found');
+    await Participant.setMuted({ conversationId: id, userId, muted, until: muted ? until : null });
+    return;
+  }
+  const { rowCount } = await pool.query(
+    `UPDATE channel_participants SET muted = $3, muted_until = $4
+      WHERE channel_id = $1 AND user_id = $2`,
+    [id, userId, muted, muted ? until : null],
+  );
+  if (rowCount === 0) throw notFound('Chat not found');
+};
+
+router.post(
+  '/muted-chats/:kind/:id/unmute',
+  validate({ params: muteParams }),
+  route(async (req) => {
+    await setChatMute({ userId: req.user.id, kind: req.params.kind, id: req.params.id, muted: false });
+    await pushToUser(req.user.id, 'settings:changed', { section: 'muted', fields: [] });
+    return { muted: false };
+  }),
+);
+
+router.post(
+  '/muted-chats/:kind/:id/mute',
+  validate({
+    params: muteParams,
+    body: z.object({ until: z.string().nullish() }).passthrough().default({}),
+  }),
+  route(async (req) => {
+    const requested = req.body?.until ? new Date(req.body.until) : null;
+    const until = requested && !Number.isNaN(requested.getTime()) && requested > new Date() ? requested.toISOString() : null;
+    await setChatMute({ userId: req.user.id, kind: req.params.kind, id: req.params.id, muted: true, until });
+    await pushToUser(req.user.id, 'settings:changed', { section: 'muted', fields: [] });
+    return { muted: true, mutedUntil: until };
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * Signed-in devices
+ * ------------------------------------------------------------------ */
+
+router.get(
+  '/sessions',
+  route(async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const sessions = await DeviceSessions.list(req.user.id);
+    return {
+      items: sessions.map((session) => ({ ...session, current: session.sessionId === req.user.sessionId })),
+    };
+  }),
+);
+
+router.delete(
+  '/sessions/:sessionId',
+  rateLimit({ key: 'account:sessions', points: 30, durationSec: 300, by: ['user'] }),
+  validate({ params: z.object({ sessionId: z.string().min(8).max(128) }) }),
+  route(async (req) => {
+    if (req.params.sessionId === req.user.sessionId) {
+      throw badRequest('This is the device you are using. Use Sign out instead.');
+    }
+    const result = await DeviceSessions.revoke({ userId: req.user.id, sessionId: req.params.sessionId });
+    if (!result) throw notFound('No such device');
+    await auditFromRequest(req, {
+      action: 'auth.session.revoked',
+      targetType: 'user',
+      targetId: req.user.id,
+      metadata: { device: result.label, count: 1 },
+    });
+    await pushToUser(req.user.id, 'settings:changed', { section: 'sessions', fields: [] });
+    return null;
+  }),
+);
+
+router.post(
+  '/sessions/sign-out-others',
+  rateLimit({ key: 'account:sessions', points: 30, durationSec: 300, by: ['user'] }),
+  route(async (req) => {
+    const { revoked } = await DeviceSessions.revokeOthers({
+      userId: req.user.id,
+      currentSessionId: req.user.sessionId,
+    });
+    if (revoked > 0) {
+      await auditFromRequest(req, {
+        action: 'auth.session.revoked',
+        targetType: 'user',
+        targetId: req.user.id,
+        metadata: { device: null, count: revoked },
+      });
+      await pushToUser(req.user.id, 'settings:changed', { section: 'sessions', fields: [] });
+    }
+    return { revoked };
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * History (audit_log)
+ * ------------------------------------------------------------------ */
+
+const pageQuery = z
+  .object({
+    cursor: z.string().regex(/^\d+$/).optional(),
+    limit: z.coerce.number().int().min(1).max(50).optional(),
+  })
+  .passthrough();
+
+const readHistory = async ({ userId, actions, cursor, limit }) => {
+  const { rows } = await pool.query(
+    `SELECT id, action, metadata, host(ip) AS ip, user_agent, created_at
+       FROM audit_log
+      WHERE actor_id = $1 AND action = ANY($2::text[])
+        AND ($3::bigint IS NULL OR id < $3::bigint)
+      ORDER BY id DESC
+      LIMIT $4`,
+    [userId, actions, cursor ?? null, limit + 1],
+  );
+  const page = rows.slice(0, limit);
+  return {
+    items: page.map((row) => ({
+      id: String(row.id),
+      action: row.action,
+      at: iso(row.created_at),
+      device: describeUserAgent(row.user_agent ?? ''),
+      ip: row.ip ?? null,
+      section: row.metadata?.section ?? null,
+      fields: Array.isArray(row.metadata?.fields) ? row.metadata.fields : [],
+      detail: row.metadata?.device ?? row.metadata?.reason ?? row.metadata?.method ?? null,
+      count: typeof row.metadata?.count === 'number' ? row.metadata.count : null,
+    })),
+    nextCursor: rows.length > limit && page.length ? String(page.at(-1).id) : null,
+  };
+};
+
+router.get(
+  '/login-history',
+  validate({ query: pageQuery }),
+  route(async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    return readHistory({
+      userId: req.user.id,
+      actions: [SIGN_IN_SUCCEEDED, SIGN_IN_FAILED, 'auth.second_factor.failed'],
+      cursor: q(req).cursor,
+      limit: Number(q(req).limit ?? 20),
+    });
+  }),
+);
+
+router.get(
+  '/activity',
+  validate({ query: pageQuery }),
+  route(async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    return readHistory({
+      userId: req.user.id,
+      actions: [
+        'settings.changed',
+        'auth.session.revoked',
+        // Phase C: password, two-step sign-in, passkeys, your data
+        'security.password.changed',
+        'security.totp.enabled',
+        'security.totp.disabled',
+        'security.recovery_codes.regenerated',
+        'security.passkey.added',
+        'security.passkey.removed',
+        'account.exported',
+        'account.deletion.requested',
+        'account.deletion.cancelled',
+      ],
+      cursor: q(req).cursor,
+      limit: Number(q(req).limit ?? 20),
+    });
+  }),
+);
+
+export default router;
+
+=== FILE: apps/web/src/components/Community/NotificationBell.jsx (131 lines) ===
+import { useEffect, useRef, useState } from 'react';
+import { useNotifications } from '@classroom/core-client';
+import './community.css';
+
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+
+function ago(iso) {
+  const secs = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return relative.format(-Math.floor(secs / 60), 'minute');
+  if (secs < 86_400) return relative.format(-Math.floor(secs / 3600), 'hour');
+  return relative.format(-Math.floor(secs / 86_400), 'day');
+}
+
+/**
+ * The in-app half of NotificationService.
+ *
+ * Every notification exists in three places at once — in-app, push and, for
+ * anyone who batches them, the daily digest — and they are the same record, so
+ * reading one here is what stops the other two from arriving. That is why
+ * marking read is a server call and not a local flag.
+ *
+ * Chat gets its own badge on the dock; this bell is for the community and course
+ * events: replies, mentions, a lesson about to start, an assignment graded.
+ */
+export default function NotificationBell({ onNavigate }) {
+  const { items, unread, hasMore, loading, loadMore, markRead, markAllRead, refresh } =
+    useNotifications();
+
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    refresh();
+    const onDocClick = (e) => {
+      if (!wrapRef.current?.contains(e.target)) setOpen(false);
+    };
+    const onKey = (e) => e.key === 'Escape' && setOpen(false);
+    document.addEventListener('pointerdown', onDocClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open, refresh]);
+
+  const activate = (n) => {
+    if (!n.readAt) markRead(n.id);
+    setOpen(false);
+    // The route lives with the notification, so a new notification type does not
+    // need a new branch here.
+    if (n.href) onNavigate?.(n.href, n);
+  };
+
+  return (
+    <div className="cm cm-bell" ref={wrapRef}>
+      <button
+        type="button"
+        className="cm-bell__button"
+        aria-expanded={open}
+        aria-label={unread ? `Notifications, ${unread} unread` : 'Notifications'}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span aria-hidden="true">🔔</span>
+        {unread > 0 ? (
+          <span className="cm-badge cm-bell__count">{unread > 99 ? '99+' : unread}</span>
+        ) : null}
+      </button>
+
+      {open ? (
+        <div className="cm-bell__panel" role="dialog" aria-label="Notifications">
+          <header className="cm-bell__head">
+            <strong style={{ flex: '1 1 auto' }}>Notifications</strong>
+            {unread > 0 ? (
+              <button type="button" className="cm-btn cm-btn--ghost" onClick={markAllRead}>
+                Mark all read
+              </button>
+            ) : null}
+          </header>
+
+          <div className="cm-bell__list">
+            {loading && items.length === 0 ? <p className="cm-empty">Loading…</p> : null}
+
+            {!loading && items.length === 0 ? (
+              <p className="cm-empty">Nothing yet. Replies and mentions land here.</p>
+            ) : null}
+
+            {items.map((n) => (
+              <button
+                key={n.id}
+                type="button"
+                className={`cm-notif${n.readAt ? '' : ' cm-notif--unread'}`}
+                onClick={() => activate(n)}
+              >
+                {n.actor ? (
+                  <img className="cm-notif__avatar" src={n.actor.avatarUrl} alt="" loading="lazy" />
+                ) : (
+                  <span className="cm-notif__avatar" aria-hidden="true" />
+                )}
+
+                <span className="cm-notif__text">
+                  {n.actor ? <strong>{n.actor.displayName}</strong> : null} {n.text}
+                  {n.excerpt ? <span className="cm-notif__time">{n.excerpt}</span> : null}
+                  <span className="cm-notif__time">{ago(n.createdAt)}</span>
+                </span>
+              </button>
+            ))}
+
+            {hasMore ? (
+              <button
+                type="button"
+                className="cm-btn cm-btn--ghost"
+                style={{ width: '100%' }}
+                disabled={loading}
+                onClick={loadMore}
+              >
+                {loading ? 'Loading…' : 'Older'}
+              </button>
+            ) : null}
+          </div>
+
+          <footer className="cm-bell__foot">
+            <p className="cm-note">
+              Quiet hours, email and the daily digest are in notification settings.
+            </p>
+          </footer>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+=== FILE: apps/web/src/components/Community/PostComposer.jsx (250 lines) ===
+import { useCallback, useMemo, useRef, useState } from 'react';
+import { communityApi, useUpload } from '@classroom/core-client';
+import UploadProgressRow from '../Chat/UploadProgressRow.jsx';
+import './community.css';
+
+/**
+ * One composer for both jobs: starting a thread (title + body) and replying to
+ * one (body only).
+ *
+ * Attachments reuse the media domain through useUpload — presign, direct-to-S3
+ * multipart, quarantine, scan — so a file posted in a space inherits the same
+ * quota, scanning and signed delivery as a chat attachment or a course video.
+ * Only assets that report `ready` are submitted.
+ *
+ * Mentions resolve against the space membership, not the whole tenant: a person
+ * who is not in the space cannot be pulled into it by being named. The server
+ * checks the same thing again on save — NotificationService only fans out to
+ * people who can actually read the thread.
+ */
+export default function PostComposer({
+  mode = 'reply',
+  spaceId,
+  threadId,
+  onSubmit,
+  onCancel,
+  placeholder = 'Write a reply',
+  autoFocus = false,
+  disabled = false,
+  disabledReason = '',
+  maxLength = 8000,
+}) {
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [dropping, setDropping] = useState(false);
+  const [mention, setMention] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const inputRef = useRef(null);
+  const { uploads, enqueue, cancel, retry, clear } = useUpload({
+    scope: { type: 'community', spaceId, threadId },
+  });
+
+  const ready = uploads.filter((u) => u.state === 'ready');
+  const uploading = uploads.some(
+    (u) => !['ready', 'failed', 'rejected', 'quota'].includes(u.state),
+  );
+
+  const needsTitle = mode === 'thread';
+  const canPost =
+    !disabled && !busy && !uploading && body.trim().length > 0 && (!needsTitle || title.trim().length > 0);
+
+  const search = useMemo(
+    () => (q) => communityApi.searchMembers({ spaceId, query: q }),
+    [spaceId],
+  );
+
+  const updateMention = useCallback(
+    async (value, caret) => {
+      const match = /(^|\s)@([\p{L}\p{N}_.-]{0,30})$/u.exec(value.slice(0, caret));
+      if (!match) return setMention(null);
+
+      const query = match[2];
+      const at = caret - query.length - 1;
+      setMention((prev) => ({ query, at, results: prev?.results ?? [], index: 0 }));
+      try {
+        const results = await search(query);
+        setMention((prev) => (prev && prev.at === at ? { ...prev, results, index: 0 } : prev));
+      } catch {
+        /* no suggestions is a fine outcome */
+      }
+    },
+    [search],
+  );
+
+  const applyMention = (user) => {
+    const el = inputRef.current;
+    const caret = el?.selectionStart ?? body.length;
+    const before = body.slice(0, mention.at);
+    const inserted = `@${user.handle ?? user.displayName} `;
+    setBody(`${before}${inserted}${body.slice(caret)}`);
+    setMention(null);
+    requestAnimationFrame(() => {
+      const pos = before.length + inserted.length;
+      el?.focus();
+      el?.setSelectionRange(pos, pos);
+    });
+  };
+
+  const submit = async () => {
+    if (!canPost) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onSubmit({
+        title: needsTitle ? title.trim() : undefined,
+        body: body.trim(),
+        attachmentIds: ready.map((u) => u.assetId),
+      });
+      setTitle('');
+      setBody('');
+      clear();
+    } catch {
+      // The draft stays in the box. Losing somebody's paragraph because a
+      // request failed is not an acceptable way to report a failure.
+      setError('That did not post. Your text is still here — try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onKeyDown = (e) => {
+    if (mention?.results.length) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMention((m) => ({
+          ...m,
+          index: (m.index + (e.key === 'ArrowDown' ? 1 : m.results.length - 1)) % m.results.length,
+        }));
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        applyMention(mention.results[mention.index]);
+        return;
+      }
+      if (e.key === 'Escape') return setMention(null);
+    }
+
+    // Enter makes a paragraph here — a post is longer than a chat message, so
+    // posting is the deliberate key combination, not the reflex one.
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submit();
+    }
+  };
+
+  return (
+    <div
+      className={`cm cm-composer${dropping ? ' cm-composer--drop' : ''}`}
+      style={{ position: 'relative' }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDropping(true);
+      }}
+      onDragLeave={() => setDropping(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDropping(false);
+        enqueue(Array.from(e.dataTransfer.files ?? []));
+      }}
+    >
+      {needsTitle ? (
+        <input
+          className="cm-composer__title"
+          value={title}
+          maxLength={160}
+          placeholder="What is this about?"
+          aria-label="Thread title"
+          disabled={disabled}
+          onChange={(e) => setTitle(e.target.value)}
+        />
+      ) : null}
+
+      <textarea
+        ref={inputRef}
+        className="cm-composer__input"
+        value={body}
+        maxLength={maxLength}
+        placeholder={disabled ? disabledReason || 'You cannot post here' : placeholder}
+        aria-label={needsTitle ? 'Post' : 'Reply'}
+        autoFocus={autoFocus}
+        disabled={disabled}
+        onChange={(e) => {
+          setBody(e.target.value);
+          updateMention(e.target.value, e.target.selectionStart);
+        }}
+        onPaste={(e) => {
+          const files = Array.from(e.clipboardData?.files ?? []);
+          if (files.length) {
+            e.preventDefault();
+            enqueue(files);
+          }
+        }}
+        onKeyDown={onKeyDown}
+      />
+
+      {mention?.results.length ? (
+        <div className="cm-mentions" role="listbox" aria-label="Mention someone" style={{ insetBlockEnd: 60 }}>
+          {mention.results.map((u, i) => (
+            <button
+              key={u.id}
+              type="button"
+              role="option"
+              aria-selected={i === mention.index}
+              className="cm-mention"
+              onClick={() => applyMention(u)}
+            >
+              <img src={u.avatarUrl} alt="" />
+              <span>
+                {u.displayName}
+                {u.handle ? <span className="cm-muted"> @{u.handle}</span> : null}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {uploads.length ? (
+        <div style={{ display: 'grid', gap: 6 }}>
+          {uploads.map((u) => (
+            <UploadProgressRow key={u.id} upload={u} onCancel={cancel} onRetry={retry} />
+          ))}
+        </div>
+      ) : null}
+
+      <div className="cm-composer__row">
+        <input
+          id={`cm-files-${threadId ?? spaceId ?? 'new'}`}
+          type="file"
+          multiple
+          hidden
+          onChange={(e) => {
+            enqueue(Array.from(e.target.files ?? []));
+            e.target.value = '';
+          }}
+        />
+        <label htmlFor={`cm-files-${threadId ?? spaceId ?? 'new'}`} className="cm-btn">
+          📎 Attach
+        </label>
+
+        <span className="cm-composer__hint">⌘/Ctrl + Enter to post · @ to mention</span>
+
+        <span className="cm-composer__spacer" />
+
+        {onCancel ? (
+          <button type="button" className="cm-btn" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+        ) : null}
+
+        <button type="button" className="cm-btn cm-btn--primary" disabled={!canPost} onClick={submit}>
+          {busy ? 'Posting…' : uploading ? 'Uploading…' : needsTitle ? 'Post thread' : 'Reply'}
+        </button>
+      </div>
+
+      {error ? <p className="cm-note cm-note--danger">{error}</p> : null}
+      {disabled && disabledReason ? <p className="cm-note">{disabledReason}</p> : null}
+    </div>
+  );
+}
+=== FILE: apps/web/src/components/Community/PresenceAvatars.jsx (79 lines) ===
+import { useState } from 'react';
+import { usePresence } from '@classroom/core-client';
+import UserProfileCard from '../Profile/UserProfileCard.jsx';
+import './community.css';
+
+const ORDER = { 'in-class': 0, online: 1, away: 2, offline: 3 };
+
+/**
+ * Who is around, wherever "around" is: a space, a thread, a course roster.
+ *
+ * Presence is one Redis source of truth shared by the community, chat and the
+ * classroom (PresenceService.js), so a person in a live lesson shows as
+ * in-class here rather than as plainly online — the same state the chat dock
+ * reads. Nothing in this component polls; presenceGateway pushes.
+ *
+ * Clicking a face opens the profile card, which means this is another entry
+ * point into a direct message without knowing anything about messaging.
+ */
+export default function PresenceAvatars({
+  people = [],
+  max = 6,
+  showLabel = true,
+  context = null,
+  className = '',
+}) {
+  const { statusOf } = usePresence();
+  const [openUserId, setOpenUserId] = useState(null);
+
+  const ranked = people
+    .map((p) => ({ ...p, presence: statusOf(p.id) }))
+    .filter((p) => p.presence !== 'offline')
+    .sort(
+      (a, b) => (ORDER[a.presence] ?? 3) - (ORDER[b.presence] ?? 3) ||
+        a.displayName.localeCompare(b.displayName),
+    );
+
+  if (ranked.length === 0) {
+    return showLabel ? <span className={`cm cm-note ${className}`}>Nobody here right now</span> : null;
+  }
+
+  const shown = ranked.slice(0, max);
+  const extra = ranked.length - shown.length;
+
+  return (
+    <span className={`cm cm-presence ${className}`}>
+      {shown.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          className="cm-presence__person"
+          title={`${p.displayName} — ${p.presence === 'in-class' ? 'in a lesson' : p.presence}`}
+          aria-label={`${p.displayName}, ${p.presence}`}
+          onClick={() => setOpenUserId(p.id)}
+        >
+          <img src={p.avatarUrl} alt="" loading="lazy" />
+          <span className="cm-presence__dot" data-presence={p.presence} aria-hidden="true" />
+        </button>
+      ))}
+
+      {extra > 0 ? (
+        <span className="cm-presence__more" title={ranked.slice(max).map((p) => p.displayName).join(', ')}>
+          +{extra}
+        </span>
+      ) : null}
+
+      {showLabel ? (
+        <span className="cm-presence__label">
+          {ranked.length} online
+          {ranked.some((p) => p.presence === 'in-class')
+            ? `, ${ranked.filter((p) => p.presence === 'in-class').length} in a lesson`
+            : ''}
+        </span>
+      ) : null}
+
+      {openUserId ? (
+        <UserProfileCard userId={openUserId} context={context} onClose={() => setOpenUserId(null)} />
+      ) : null}
+    </span>
+  );
+}
+=== FILE: apps/web/src/components/Community/SpaceList.jsx (180 lines) ===
+import { useMemo, useState } from 'react';
+import { useCommunity } from '@classroom/core-client';
+import PresenceAvatars from './PresenceAvatars.jsx';
+import './community.css';
+
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+
+function shortTime(iso) {
+  if (!iso) return '';
+  const secs = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (secs < 60) return 'now';
+  if (secs < 3600) return relative.format(-Math.floor(secs / 60), 'minute');
+  if (secs < 86_400) return relative.format(-Math.floor(secs / 3600), 'hour');
+  return relative.format(-Math.floor(secs / 86_400), 'day');
+}
+
+/**
+ * Spaces, split by where they came from.
+ *
+ * A course-bound space is provisioned automatically when a course is published
+ * (SpaceService.js), so people do not create or name it — it appears, and
+ * leaving it is not offered, because leaving the space of a course you are
+ * enrolled in would just take the discussion away from you. Standalone spaces
+ * are the ones anyone can join or leave.
+ *
+ * Unread counts come from the same fan-out as chat badges, so a space read on
+ * the phone stops being bold on the laptop.
+ */
+export default function SpaceList({ activeSpaceId, onSelect }) {
+  const { spaces, loading, error, joinSpace, leaveSpace, muteSpace, canCreateSpace, createSpace } =
+    useCommunity();
+  const [query, setQuery] = useState('');
+  const [busy, setBusy] = useState(null);
+
+  const groups = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const visible = (spaces ?? []).filter((s) => !q || s.name.toLowerCase().includes(q));
+    return [
+      { key: 'course', label: 'From your courses', items: visible.filter((s) => s.courseId) },
+      { key: 'open', label: 'Spaces', items: visible.filter((s) => !s.courseId && s.joined) },
+      { key: 'discover', label: 'You could join', items: visible.filter((s) => !s.courseId && !s.joined) },
+    ].filter((g) => g.items.length);
+  }, [spaces, query]);
+
+  const act = async (id, fn) => {
+    setBusy(id);
+    try {
+      await fn(id);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (error) {
+    return <p className="cm cm-empty">Spaces could not be loaded. Try again in a moment.</p>;
+  }
+
+  return (
+    <nav className="cm cm-spaces" aria-label="Spaces">
+      <header className="cm-spaces__head">
+        <p className="cm-spaces__title">Community</p>
+        {canCreateSpace ? (
+          <button
+            type="button"
+            className="cm-btn cm-btn--ghost"
+            onClick={async () => {
+              const name = window.prompt('Name for the new space');
+              if (name?.trim()) {
+                const space = await createSpace({ name: name.trim() });
+                onSelect?.(space.id);
+              }
+            }}
+          >
+            New
+          </button>
+        ) : null}
+      </header>
+
+      <input
+        className="cm-composer__input"
+        style={{ minHeight: 0, margin: '10px 12px', width: 'calc(100% - 24px)' }}
+        type="search"
+        value={query}
+        placeholder="Find a space"
+        aria-label="Find a space"
+        onChange={(e) => setQuery(e.target.value)}
+      />
+
+      <div className="cm-spaces__body">
+        {loading && !spaces?.length ? <p className="cm-empty">Loading…</p> : null}
+
+        {groups.map((group) => (
+          <div key={group.key}>
+            <p className="cm-spaces__group">{group.label}</p>
+
+            {group.items.map((space) => (
+              <div key={space.id} style={{ position: 'relative' }}>
+                <button
+                  type="button"
+                  className={`cm-space${space.unread ? ' cm-space--unread' : ''}`}
+                  aria-current={space.id === activeSpaceId}
+                  onClick={() => (space.joined ? onSelect?.(space.id) : act(space.id, joinSpace))}
+                >
+                  <span className="cm-space__mark" aria-hidden="true">
+                    {space.courseId ? '🎓' : '#'}
+                  </span>
+
+                  <span className="cm-space__main">
+                    <span className="cm-space__name">{space.name}</span>
+                    <span className="cm-space__meta">
+                      {space.joined
+                        ? space.lastActivityAt
+                          ? `${space.threadCount ?? 0} threads · active ${shortTime(space.lastActivityAt)}`
+                          : 'Nothing posted yet'
+                        : `${space.memberCount ?? 0} members`}
+                    </span>
+                  </span>
+
+                  {space.joined && space.unread ? (
+                    <span className={`cm-badge${space.muted ? ' cm-badge--muted' : ''}`}>
+                      {space.unread > 99 ? '99+' : space.unread}
+                    </span>
+                  ) : null}
+
+                  {!space.joined ? (
+                    <span className="cm-btn cm-btn--ghost" aria-hidden="true">
+                      {busy === space.id ? '…' : 'Join'}
+                    </span>
+                  ) : null}
+                </button>
+
+                {space.id === activeSpaceId && space.joined ? (
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '0 12px 10px 50px',
+                    }}
+                  >
+                    <PresenceAvatars people={space.onlineMembers ?? []} max={5} showLabel={false} />
+
+                    <span className="cm-composer__spacer" />
+
+                    <button
+                      type="button"
+                      className="cm-btn cm-btn--ghost"
+                      disabled={busy === space.id}
+                      onClick={() => act(space.id, () => muteSpace(space.id, !space.muted))}
+                    >
+                      {space.muted ? 'Unmute' : 'Mute'}
+                    </button>
+
+                    {/* A course space is part of being enrolled, so it is muted,
+                        never left. */}
+                    {space.courseId ? null : (
+                      <button
+                        type="button"
+                        className="cm-btn cm-btn--ghost"
+                        disabled={busy === space.id}
+                        onClick={() => act(space.id, leaveSpace)}
+                      >
+                        Leave
+                      </button>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {!loading && groups.length === 0 ? (
+          <p className="cm-empty">
+            {query ? `Nothing matches “${query}”.` : 'No spaces yet. Publishing a course creates one.'}
+          </p>
+        ) : null}
+      </div>
+    </nav>
+  );
+}
+=== FILE: apps/web/src/components/Community/ThreadView.jsx (263 lines) ===
+import { useEffect, useState } from 'react';
+import { useClassroomUser, useThread } from '@classroom/core-client';
+import AttachmentTile from '../Chat/AttachmentTile.jsx';
+import ReportBlockMenu from '../Chat/ReportBlockMenu.jsx';
+import UserProfileCard from '../Profile/UserProfileCard.jsx';
+import PostComposer from './PostComposer.jsx';
+import PresenceAvatars from './PresenceAvatars.jsx';
+import './community.css';
+
+const REACTIONS = ['👍', '🎉', '🤔', '❤️', '👀'];
+const timeFmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+
+function Post({ post, isOP, canModerate, me, onReact, onRemove, onMarkAnswer, onOpenProfile }) {
+  return (
+    <article className={`cm-post${post.isAnswer ? ' cm-post--answer' : ''}`}>
+      <button
+        type="button"
+        className="cm-post__avatar"
+        aria-label={`Open ${post.author.displayName}'s profile`}
+        onClick={() => onOpenProfile(post.author.id)}
+      >
+        <img src={post.author.avatarUrl} alt="" loading="lazy" style={{ width: '100%', height: '100%', borderRadius: '50%' }} />
+      </button>
+
+      <div>
+        <p className="cm-post__head">
+          <button type="button" className="cm-post__author" onClick={() => onOpenProfile(post.author.id)}>
+            {post.author.displayName}
+          </button>
+
+          {post.author.role && post.author.role !== 'learner' ? (
+            <span className="cm-post__role">{post.author.role}</span>
+          ) : null}
+
+          {isOP ? <span className="cm-post__role">author</span> : null}
+          {post.isAnswer ? <span className="cm-tag cm-tag--pinned">answer</span> : null}
+
+          <time className="cm-post__time" dateTime={post.createdAt}>
+            {timeFmt.format(new Date(post.createdAt))}
+          </time>
+          {post.editedAt ? <span className="cm-post__time">(edited)</span> : null}
+        </p>
+
+        {post.deletedAt ? (
+          <p className="cm-post__body cm-muted">Removed by a moderator.</p>
+        ) : (
+          <p className="cm-post__body">{post.body}</p>
+        )}
+
+        {post.attachments?.map((a) => (
+          <AttachmentTile key={a.id} attachment={a} />
+        ))}
+
+        {post.deletedAt ? null : (
+          <div className="cm-reactions">
+            {REACTIONS.map((emoji) => {
+              const count = post.reactions?.[emoji]?.count ?? 0;
+              const mine = Boolean(post.reactions?.[emoji]?.mine);
+              if (!count && !mine) return null;
+              return (
+                <button
+                  key={emoji}
+                  type="button"
+                  className="cm-reaction"
+                  aria-pressed={mine}
+                  onClick={() => onReact(post.id, emoji)}
+                >
+                  <span aria-hidden="true">{emoji}</span>
+                  {count}
+                </button>
+              );
+            })}
+
+            {/* The add-reaction control stays separate so the counts above read
+                as data rather than as a toolbar. */}
+            <details style={{ display: 'inline-block' }}>
+              <summary className="cm-reaction" style={{ listStyle: 'none' }}>
+                + react
+              </summary>
+              <div className="cm-reactions" style={{ marginTop: 6 }}>
+                {REACTIONS.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    className="cm-reaction"
+                    onClick={() => onReact(post.id, emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            </details>
+          </div>
+        )}
+      </div>
+
+      {post.deletedAt ? null : (
+        <span className="cm-post__tools">
+          {canModerate && !isOP ? (
+            <button type="button" className="cm-btn cm-btn--ghost" onClick={() => onMarkAnswer(post.id)}>
+              {post.isAnswer ? 'Unmark answer' : 'Mark as answer'}
+            </button>
+          ) : null}
+
+          {post.author.id === me.id || canModerate ? (
+            <button
+              type="button"
+              className="cm-btn cm-btn--ghost"
+              onClick={() => {
+                if (window.confirm('Remove this post?')) onRemove(post.id);
+              }}
+            >
+              Remove
+            </button>
+          ) : null}
+
+          <ReportBlockMenu
+            targetUser={post.author}
+            message={{ id: post.id, body: post.body }}
+            canModerate={canModerate}
+            compact
+          />
+        </span>
+      )}
+    </article>
+  );
+}
+
+/**
+ * A thread and everything under it.
+ *
+ * Posts are cursor-paginated the same way the feed is (FeedService), oldest
+ * first, because a discussion is read forwards — unlike chat, where the newest
+ * message is the one you want. That is why this view does not stick to the
+ * bottom and has no unread jump button.
+ *
+ * Moderation is the same server path as chat: soft delete with an audit record,
+ * report into one queue. A removed post leaves a tombstone rather than a gap, so
+ * the replies underneath still make sense.
+ */
+export default function ThreadView({ threadId, onBack }) {
+  const me = useClassroomUser();
+  const {
+    thread,
+    posts,
+    hasMore,
+    loading,
+    error,
+    loadMore,
+    createPost,
+    react,
+    removePost,
+    markAnswer,
+    togglePin,
+    toggleLock,
+    markRead,
+  } = useThread(threadId);
+
+  const [openUserId, setOpenUserId] = useState(null);
+
+  useEffect(() => {
+    if (thread && document.visibilityState === 'visible') markRead();
+  }, [thread, markRead]);
+
+  if (error) {
+    return <p className="cm cm-empty">This thread could not be loaded.</p>;
+  }
+
+  if (!thread) {
+    return <p className="cm cm-empty">Loading…</p>;
+  }
+
+  const canModerate = thread.myRole === 'moderator' || thread.myRole === 'owner';
+  const locked = Boolean(thread.lockedAt);
+
+  return (
+    <section className="cm cm-thread" aria-label={thread.title}>
+      <header className="cm-thread__head">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {onBack ? (
+            <button type="button" className="cm-btn cm-btn--ghost" onClick={onBack} aria-label="Back">
+              ←
+            </button>
+          ) : null}
+          <h1 className="cm-thread__title">{thread.title}</h1>
+        </div>
+
+        <div className="cm-thread__meta">
+          <span>
+            {thread.postCount} {thread.postCount === 1 ? 'reply' : 'replies'}
+          </span>
+          <span aria-hidden="true">·</span>
+          <span>in {thread.spaceName}</span>
+
+          {thread.pinnedAt ? <span className="cm-tag cm-tag--pinned">pinned</span> : null}
+          {locked ? <span className="cm-tag cm-tag--locked">locked</span> : null}
+
+          <span className="cm-composer__spacer" />
+
+          <PresenceAvatars
+            people={thread.participants ?? []}
+            max={5}
+            showLabel={false}
+            context={{ threadId }}
+          />
+
+          {canModerate ? (
+            <>
+              <button type="button" className="cm-btn cm-btn--ghost" onClick={togglePin}>
+                {thread.pinnedAt ? 'Unpin' : 'Pin'}
+              </button>
+              <button type="button" className="cm-btn cm-btn--ghost" onClick={toggleLock}>
+                {locked ? 'Unlock' : 'Lock'}
+              </button>
+            </>
+          ) : null}
+        </div>
+      </header>
+
+      <div className="cm-thread__body">
+        {posts.map((post, i) => (
+          <Post
+            key={post.id}
+            post={post}
+            isOP={i === 0}
+            me={me}
+            canModerate={canModerate}
+            onReact={react}
+            onRemove={removePost}
+            onMarkAnswer={markAnswer}
+            onOpenProfile={setOpenUserId}
+          />
+        ))}
+
+        {hasMore ? (
+          <button type="button" className="cm-btn" disabled={loading} onClick={loadMore}>
+            {loading ? 'Loading…' : 'Show more replies'}
+          </button>
+        ) : null}
+      </div>
+
+      <div className="cm-thread__foot">
+        <PostComposer
+          mode="reply"
+          spaceId={thread.spaceId}
+          threadId={threadId}
+          onSubmit={createPost}
+          disabled={locked && !canModerate}
+          disabledReason={
+            locked ? 'This thread is locked. A moderator closed it to new replies.' : ''
+          }
+        />
+      </div>
+
+      {openUserId ? (
+        <UserProfileCard
+          userId={openUserId}
+          context={{ spaceId: thread.spaceId, threadId }}
+          onClose={() => setOpenUserId(null)}
+        />
+      ) : null}
+    </section>
+  );
+}
+=== FILE: apps/web/src/components/Community/community.css (648 lines) ===
+/**
+ * Community surface.
+ *
+ * Sixth sibling of classroom.css, chat.css, profile.css, billing.css and
+ * builder.css — same ui-tokens custom properties, same fallbacks, `cm-` prefix.
+ *
+ * One rule specific to this folder: a feed is read top to bottom, so measure
+ * runs vertically and nothing competes with the post body for attention.
+ */
+
+.cm {
+  --cm-panel: var(--color-surface-raised, #161b22);
+  --cm-sunken: var(--color-surface-sunken, #0d1117);
+  --cm-line: var(--color-border, #262c36);
+  --cm-text: var(--color-text, #e6edf3);
+  --cm-muted: var(--color-text-muted, #8b949e);
+  --cm-accent: var(--color-accent, #4c8dff);
+  --cm-danger: var(--color-danger, #f0616d);
+  --cm-warn: var(--color-warning, #d29922);
+  --cm-live: var(--color-live, #3fb950);
+  --cm-radius: var(--radius-md, 10px);
+
+  color: var(--cm-text);
+  font-family: var(--font-ui, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.cm-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border: 1px solid var(--cm-line);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.cm-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--cm-text) 8%, transparent);
+}
+
+.cm-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.cm-btn--primary {
+  background: var(--cm-accent);
+  border-color: transparent;
+  color: #06101f;
+  font-weight: 600;
+}
+
+.cm-btn--ghost {
+  border-color: transparent;
+  color: var(--cm-muted);
+}
+
+.cm-btn--danger {
+  color: var(--cm-danger);
+  border-color: color-mix(in srgb, var(--cm-danger) 40%, transparent);
+}
+
+:where(.cm) :focus-visible {
+  outline: 2px solid var(--cm-accent);
+  outline-offset: 2px;
+}
+
+.cm-muted { color: var(--cm-muted); }
+
+.cm-note {
+  margin: 0;
+  color: var(--cm-muted);
+  font-size: 12px;
+}
+
+.cm-note--danger { color: var(--cm-danger); }
+
+.cm-empty {
+  padding: 28px 16px;
+  color: var(--cm-muted);
+  text-align: center;
+}
+
+.cm-badge {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--cm-accent);
+  color: #06101f;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.cm-badge--muted {
+  background: var(--cm-line);
+  color: var(--cm-muted);
+}
+
+/* ---------- space list ---------- */
+
+.cm-spaces {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--cm-line);
+  border-radius: var(--cm-radius);
+  background: var(--cm-panel);
+  overflow: hidden;
+}
+
+.cm-spaces__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--cm-line);
+}
+
+.cm-spaces__title {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.cm-spaces__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.cm-spaces__group {
+  padding: 10px 12px 4px;
+  color: var(--cm-muted);
+  font-size: 12px;
+}
+
+.cm-space {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.cm-space:hover,
+.cm-space:focus-visible {
+  background: color-mix(in srgb, var(--cm-text) 6%, transparent);
+}
+
+.cm-space[aria-current='true'] {
+  background: color-mix(in srgb, var(--cm-accent) 14%, transparent);
+}
+
+.cm-space--unread .cm-space__name { font-weight: 700; }
+
+.cm-space__mark {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: 7px;
+  background: var(--cm-sunken);
+  font-size: 12px;
+}
+
+.cm-space__main { flex: 1 1 auto; min-width: 0; }
+
+.cm-space__name {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cm-space__meta {
+  display: block;
+  color: var(--cm-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- presence avatars ---------- */
+
+.cm-presence {
+  display: inline-flex;
+  align-items: center;
+}
+
+.cm-presence__person {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 2px solid var(--cm-panel);
+  border-radius: 50%;
+  margin-inline-start: -7px;
+  background: var(--cm-sunken);
+  cursor: pointer;
+  overflow: visible;
+}
+
+.cm-presence__person:first-child { margin-inline-start: 0; }
+
+.cm-presence__person:hover,
+.cm-presence__person:focus-visible {
+  z-index: 1;
+  transform: translateY(-1px);
+}
+
+.cm-presence__person img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
+
+.cm-presence__dot {
+  position: absolute;
+  inset-block-end: -1px;
+  inset-inline-end: -1px;
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--cm-panel);
+  border-radius: 50%;
+  background: var(--cm-muted);
+}
+
+.cm-presence__dot[data-presence='online'] { background: var(--cm-live); }
+.cm-presence__dot[data-presence='in-class'] { background: var(--cm-accent); }
+.cm-presence__dot[data-presence='away'] { background: var(--cm-warn); }
+
+.cm-presence__more {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  margin-inline-start: -7px;
+  border: 2px solid var(--cm-panel);
+  border-radius: 50%;
+  background: var(--cm-sunken);
+  color: var(--cm-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.cm-presence__label {
+  margin-inline-start: 8px;
+  color: var(--cm-muted);
+  font-size: 12px;
+}
+
+/* ---------- thread ---------- */
+
+.cm-thread {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--cm-line);
+  border-radius: var(--cm-radius);
+  background: var(--cm-panel);
+  overflow: hidden;
+}
+
+.cm-thread__head {
+  display: grid;
+  gap: 6px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--cm-line);
+}
+
+.cm-thread__title {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.cm-thread__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--cm-muted);
+  font-size: 12px;
+}
+
+.cm-thread__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px 16px;
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.cm-thread__foot {
+  border-top: 1px solid var(--cm-line);
+  padding: 12px 16px;
+}
+
+.cm-tag {
+  padding: 1px 8px;
+  border: 1px solid var(--cm-line);
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.cm-tag--pinned {
+  color: var(--cm-accent);
+  border-color: color-mix(in srgb, var(--cm-accent) 45%, transparent);
+}
+
+.cm-tag--locked {
+  color: var(--cm-warn);
+  border-color: color-mix(in srgb, var(--cm-warn) 45%, transparent);
+}
+
+/* ---------- post ---------- */
+
+.cm-post {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 10px;
+  position: relative;
+}
+
+.cm-post--answer {
+  padding: 10px;
+  margin-inline-start: -10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--cm-live) 10%, transparent);
+}
+
+.cm-post__avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--cm-sunken);
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.cm-post__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 2px;
+}
+
+.cm-post__author {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cm-post__author:hover { text-decoration: underline; }
+
+.cm-post__role {
+  padding: 0 6px;
+  border: 1px solid var(--cm-line);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--cm-muted);
+}
+
+.cm-post__time {
+  color: var(--cm-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cm-post__body {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.cm-post__tools {
+  position: absolute;
+  inset-inline-end: 0;
+  inset-block-start: 0;
+  display: none;
+  gap: 4px;
+}
+
+.cm-post:hover .cm-post__tools,
+.cm-post:focus-within .cm-post__tools {
+  display: flex;
+}
+
+.cm-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.cm-reaction {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border: 1px solid var(--cm-line);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.cm-reaction[aria-pressed='true'] {
+  border-color: var(--cm-accent);
+  background: color-mix(in srgb, var(--cm-accent) 16%, transparent);
+}
+
+/* ---------- composer ---------- */
+
+.cm-composer {
+  display: grid;
+  gap: 8px;
+}
+
+.cm-composer--drop {
+  outline: 2px dashed var(--cm-accent);
+  outline-offset: 6px;
+  border-radius: 8px;
+}
+
+.cm-composer__title,
+.cm-composer__input {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--cm-line);
+  border-radius: 8px;
+  background: var(--cm-sunken);
+  color: inherit;
+  font: inherit;
+}
+
+.cm-composer__title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.cm-composer__input {
+  min-height: 86px;
+  max-height: 320px;
+  resize: vertical;
+}
+
+.cm-composer__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cm-composer__spacer { flex: 1 1 auto; }
+
+.cm-composer__hint {
+  color: var(--cm-muted);
+  font-size: 11px;
+}
+
+.cm-mentions {
+  position: absolute;
+  z-index: 2;
+  max-height: 210px;
+  min-width: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--cm-line);
+  border-radius: 8px;
+  background: var(--cm-panel);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.4);
+}
+
+.cm-mention {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.cm-mention[aria-selected='true'],
+.cm-mention:hover {
+  background: color-mix(in srgb, var(--cm-text) 8%, transparent);
+}
+
+.cm-mention img {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/* ---------- notifications ---------- */
+
+.cm-bell {
+  position: relative;
+  display: inline-block;
+}
+
+.cm-bell__button {
+  position: relative;
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.cm-bell__button:hover {
+  background: color-mix(in srgb, var(--cm-text) 8%, transparent);
+}
+
+.cm-bell__count {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+  translate: 30% -30%;
+}
+
+.cm-bell__panel {
+  position: absolute;
+  inset-inline-end: 0;
+  inset-block-start: calc(100% + 6px);
+  z-index: 40;
+  width: min(380px, calc(100vw - 24px));
+  max-height: min(70vh, 560px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--cm-line);
+  border-radius: var(--cm-radius);
+  background: var(--cm-panel);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 0.45);
+  overflow: hidden;
+}
+
+.cm-bell__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--cm-line);
+}
+
+.cm-bell__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.cm-notif {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 9px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--cm-line);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.cm-notif:last-child { border-bottom: 0; }
+
+.cm-notif:hover {
+  background: color-mix(in srgb, var(--cm-text) 6%, transparent);
+}
+
+.cm-notif--unread {
+  background: color-mix(in srgb, var(--cm-accent) 9%, transparent);
+}
+
+.cm-notif__avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--cm-sunken);
+}
+
+.cm-notif__text { overflow-wrap: anywhere; }
+
+.cm-notif__time {
+  display: block;
+  color: var(--cm-muted);
+  font-size: 11px;
+}
+
+.cm-bell__foot {
+  padding: 8px 12px;
+  border-top: 1px solid var(--cm-line);
+}
+
+@media (max-width: 620px) {
+  .cm-bell__panel {
+    position: fixed;
+    inset: auto 0 0 0;
+    width: 100vw;
+    max-height: 80dvh;
+    border-radius: var(--cm-radius) var(--cm-radius) 0 0;
+  }
+}
+=== FILE: packages/core-client/src/api/communityApi.ts (275 lines) ===
+/**
+ * Community API  (F2)
+ *
+ * Spaces, threads, posts, reactions and the notification bell.
+ *
+ * The feed is the one call worth thinking about. It is cursor paginated and it
+ * is read on almost every screen, so it takes an `AbortSignal` everywhere and
+ * never assumes a component is still mounted when it resolves. Reactions are
+ * the opposite: tiny, frequent, and the caller updates optimistically, so a
+ * failure here has to be cheap to undo.
+ */
+
+import { Community } from '@classroom/contracts';
+import type { z } from 'zod';
+import type { HttpClient } from '../http/httpClient.js';
+
+type FeedQuery = Partial<z.infer<typeof Community.FeedQuerySchema>>;
+type SearchQuery = Partial<z.infer<typeof Community.CommunitySearchQuerySchema>> & { q: string };
+
+export interface CommunityApi {
+  listSpaces(
+    query?: { cursor?: string; limit?: number; joined?: boolean },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof Community.SpaceListSchema>>;
+  getSpace(spaceId: string, signal?: AbortSignal): Promise<z.infer<typeof Community.SpaceSchema>>;
+  createSpace(
+    input: z.infer<typeof Community.CreateSpaceSchema>,
+  ): Promise<z.infer<typeof Community.SpaceSchema>>;
+  updateSpace(
+    spaceId: string,
+    input: z.infer<typeof Community.UpdateSpaceSchema>,
+  ): Promise<z.infer<typeof Community.SpaceSchema>>;
+  joinSpace(spaceId: string): Promise<z.infer<typeof Community.MembershipSchema>>;
+  leaveSpace(spaceId: string): Promise<void>;
+  muteSpace(spaceId: string, muted: boolean): Promise<void>;
+
+  listMembers(
+    spaceId: string,
+    query?: { cursor?: string; limit?: number },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof Community.MembershipListSchema>>;
+  updateMembership(
+    spaceId: string,
+    userId: string,
+    input: z.infer<typeof Community.UpdateMembershipSchema>,
+  ): Promise<z.infer<typeof Community.MembershipSchema>>;
+
+  getFeed(query?: FeedQuery, signal?: AbortSignal): Promise<z.infer<typeof Community.FeedSchema>>;
+  getThread(
+    threadId: string,
+    query?: { cursor?: string; limit?: number },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof Community.ThreadDetailSchema>>;
+  createThread(
+    input: z.infer<typeof Community.CreateThreadSchema>,
+  ): Promise<z.infer<typeof Community.ThreadSchema>>;
+  updateThread(
+    threadId: string,
+    input: z.infer<typeof Community.UpdateThreadSchema>,
+  ): Promise<z.infer<typeof Community.ThreadSchema>>;
+  deleteThread(threadId: string): Promise<void>;
+  followThread(threadId: string, following: boolean): Promise<void>;
+
+  listPosts(
+    threadId: string,
+    query?: { cursor?: string; limit?: number },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof Community.PostListSchema>>;
+  createPost(
+    threadId: string,
+    input: z.infer<typeof Community.CreatePostSchema>,
+    idempotencyKey?: string,
+  ): Promise<z.infer<typeof Community.PostSchema>>;
+  updatePost(threadId: string, postId: string, body: string): Promise<z.infer<typeof Community.PostSchema>>;
+  deletePost(threadId: string, postId: string): Promise<void>;
+  acceptAnswer(threadId: string, postId: string): Promise<z.infer<typeof Community.ThreadSchema>>;
+
+  react(
+    target: { type: 'thread' | 'post'; id: string },
+    input: z.infer<typeof Community.ReactSchema>,
+  ): Promise<void>;
+
+  moderateThread(
+    threadId: string,
+    input: z.infer<typeof Community.ModerateThreadSchema>,
+  ): Promise<void>;
+  report(input: z.infer<typeof Community.ReportContentSchema>): Promise<void>;
+
+  search(
+    query: SearchQuery,
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof Community.CommunitySearchResultSchema>>;
+
+  listNotifications(
+    query?: { cursor?: string; limit?: number; unreadOnly?: boolean },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof Community.NotificationListSchema>>;
+  getUnreadCount(signal?: AbortSignal): Promise<z.infer<typeof Community.NotificationCountSchema>>;
+  markNotificationsRead(notificationIds?: string[]): Promise<void>;
+}
+
+export const createCommunityApi = (http: HttpClient): CommunityApi => ({
+  listSpaces: (query = {}, signal) =>
+    http.get('/community/spaces', {
+      schema: Community.SpaceListSchema,
+      query: { cursor: query.cursor, limit: query.limit, joined: query.joined },
+      signal,
+    }),
+
+  getSpace: (spaceId, signal) =>
+    http.get(`/community/spaces/${encodeURIComponent(spaceId)}`, {
+      schema: Community.SpaceSchema,
+      signal,
+    }),
+
+  createSpace: (input) =>
+    http.post('/community/spaces', input, { schema: Community.SpaceSchema }),
+
+  updateSpace: (spaceId, input) =>
+    http.patch(`/community/spaces/${encodeURIComponent(spaceId)}`, input, {
+      schema: Community.SpaceSchema,
+    }),
+
+  joinSpace: (spaceId) =>
+    http.post(`/community/spaces/${encodeURIComponent(spaceId)}/members`, undefined, {
+      schema: Community.MembershipSchema,
+    }),
+
+  leaveSpace: async (spaceId) => {
+    await http.delete(`/community/spaces/${encodeURIComponent(spaceId)}/members/me`);
+  },
+
+  muteSpace: async (spaceId, muted) => {
+    await http.patch(`/community/spaces/${encodeURIComponent(spaceId)}/members/me`, { muted });
+  },
+
+  listMembers: (spaceId, query = {}, signal) =>
+    http.get(`/community/spaces/${encodeURIComponent(spaceId)}/members`, {
+      schema: Community.MembershipListSchema,
+      query: { cursor: query.cursor, limit: query.limit },
+      signal,
+    }),
+
+  updateMembership: (spaceId, userId, input) =>
+    http.patch(
+      `/community/spaces/${encodeURIComponent(spaceId)}/members/${encodeURIComponent(userId)}`,
+      input,
+      { schema: Community.MembershipSchema },
+    ),
+
+  /** Without a spaceId this is the cross-space feed of what the viewer follows. */
+  getFeed: (query = {}, signal) =>
+    http.get('/community/feed', {
+      schema: Community.FeedSchema,
+      query: {
+        cursor: query.cursor,
+        limit: query.limit,
+        spaceId: query.spaceId,
+        sort: query.sort,
+        kind: query.kind,
+        tag: query.tag,
+        authorId: query.authorId,
+        following: query.following,
+      },
+      signal,
+    }),
+
+  getThread: (threadId, query = {}, signal) =>
+    http.get(`/community/threads/${encodeURIComponent(threadId)}`, {
+      schema: Community.ThreadDetailSchema,
+      query: { cursor: query.cursor, limit: query.limit },
+      signal,
+    }),
+
+  createThread: (input) =>
+    http.post('/community/threads', input, { schema: Community.ThreadSchema }),
+
+  updateThread: (threadId, input) =>
+    http.patch(`/community/threads/${encodeURIComponent(threadId)}`, input, {
+      schema: Community.ThreadSchema,
+    }),
+
+  deleteThread: async (threadId) => {
+    await http.delete(`/community/threads/${encodeURIComponent(threadId)}`);
+  },
+
+  followThread: async (threadId, following) => {
+    await http.put(`/community/threads/${encodeURIComponent(threadId)}/follow`, { following });
+  },
+
+  listPosts: (threadId, query = {}, signal) =>
+    http.get(`/community/threads/${encodeURIComponent(threadId)}/posts`, {
+      schema: Community.PostListSchema,
+      query: { cursor: query.cursor, limit: query.limit },
+      signal,
+    }),
+
+  /**
+   * Takes an idempotency key so a retry after a dropped connection updates the
+   * original reply instead of posting it twice — the failure mode people
+   * notice most in a forum.
+   */
+  createPost: (threadId, input, idempotencyKey) =>
+    http.post(`/community/threads/${encodeURIComponent(threadId)}/posts`, input, {
+      schema: Community.PostSchema,
+      idempotencyKey,
+    }),
+
+  updatePost: (threadId, postId, body) =>
+    http.patch(
+      `/community/threads/${encodeURIComponent(threadId)}/posts/${encodeURIComponent(postId)}`,
+      { body },
+      { schema: Community.PostSchema },
+    ),
+
+  deletePost: async (threadId, postId) => {
+    await http.delete(
+      `/community/threads/${encodeURIComponent(threadId)}/posts/${encodeURIComponent(postId)}`,
+    );
+  },
+
+  acceptAnswer: (threadId, postId) =>
+    http.post(
+      `/community/threads/${encodeURIComponent(threadId)}/accept`,
+      { postId },
+      { schema: Community.ThreadSchema },
+    ),
+
+  /** One route for both targets; the caller updates optimistically. */
+  react: async (target, input) => {
+    const base =
+      target.type === 'thread'
+        ? `/community/threads/${encodeURIComponent(target.id)}`
+        : `/community/posts/${encodeURIComponent(target.id)}`;
+    await http.post(`${base}/reactions`, input, { retry: { attempts: 1 } });
+  },
+
+  moderateThread: async (threadId, input) => {
+    await http.post(`/community/threads/${encodeURIComponent(threadId)}/moderate`, input);
+  },
+
+  report: async (input) => {
+    await http.post('/community/reports', input);
+  },
+
+  search: (query, signal) =>
+    http.get('/community/search', {
+      schema: Community.CommunitySearchResultSchema,
+      query: {
+        q: query.q,
+        cursor: query.cursor,
+        limit: query.limit,
+        spaceId: query.spaceId,
+        kind: query.kind,
+      },
+      signal,
+    }),
+
+  listNotifications: (query = {}, signal) =>
+    http.get('/community/notifications', {
+      schema: Community.NotificationListSchema,
+      query: { cursor: query.cursor, limit: query.limit, unreadOnly: query.unreadOnly },
+      signal,
+    }),
+
+  getUnreadCount: (signal) =>
+    http.get('/community/notifications/count', {
+      schema: Community.NotificationCountSchema,
+      signal,
+    }),
+
+  /** No ids means mark everything read. */
+  markNotificationsRead: async (notificationIds) => {
+    await http.post('/community/notifications/read', { notificationIds });
+  },
+});
