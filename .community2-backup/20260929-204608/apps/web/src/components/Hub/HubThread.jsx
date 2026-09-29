@@ -11,66 +11,7 @@ import { relativeTime } from '../Settings/notificationsModel.js';
  * accepted answer is marked and shown first below the question, "me too"
  * counts who shares it (never who), and the asker or a moderator can mark
  * any reply as the answer. Text is shown as text — never as HTML.
- *
- * Part 2: a reply can be posted as a hidden solution — others see it folded
- * and open it deliberately, after trying themselves. Moderators can save any
- * reply as a knowledge card for the space.
  */
-
-function Folded({ children }) {
-  const [open, setOpen] = useState(false);
-  if (open) return children;
-  return (
-    <div className="hb-folded">
-      <div className="hb-folded__veil" aria-hidden="true">
-        {children}
-      </div>
-      <div className="hb-folded__cover">
-        <p className="hb-label">Solution hidden</p>
-        <p className="hb-muted">Try it yourself first. Open it when you are ready.</p>
-        <button type="button" className="btn btn--tiny" onClick={() => setOpen(true)}>
-          Show solution
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function SaveCard({ hub, thread, post, onSaved }) {
-  const [open, setOpen] = useState(false);
-  const [title, setTitle] = useState(thread.title);
-  const [state, setState] = useState('idle');
-  if (state === 'saved') return <span className="hb-muted">Saved as a knowledge card.</span>;
-  if (!open) {
-    return (
-      <button type="button" className="hb-link" onClick={() => setOpen(true)}>
-        Save as knowledge card
-      </button>
-    );
-  }
-  const save = async () => {
-    setState('saving');
-    try {
-      await hub.createCard(thread.space.spaceId, { title: title.trim(), body: post.body, postId: post.postId });
-      setState('saved');
-      onSaved?.();
-    } catch {
-      setState('error');
-    }
-  };
-  return (
-    <span className="hb-savecard">
-      <input className="hb-input hb-input--small" value={title} maxLength={160} onChange={(event) => setTitle(event.target.value)} aria-label="Card title" />
-      <button type="button" className="btn btn--primary btn--tiny" disabled={state === 'saving' || title.trim().length < 3} onClick={save}>
-        Save
-      </button>
-      <button type="button" className="hb-link" onClick={() => setOpen(false)}>
-        Cancel
-      </button>
-      {state === 'error' ? <span className="hb-error">Not saved.</span> : null}
-    </span>
-  );
-}
 
 function Body({ text }) {
   return (
@@ -101,7 +42,6 @@ export default function HubThread({ hub, threadId, bump }) {
   const [thread, setThread] = useState(null);
   const [error, setError] = useState(null);
   const [reply, setReply] = useState('');
-  const [hiddenSolution, setHiddenSolution] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -133,10 +73,9 @@ export default function HubThread({ hub, threadId, bump }) {
   const send = async (event) => {
     event.preventDefault();
     if (!reply.trim()) return;
-    const next = await run(() => hub.reply(thread.threadId, reply.trim(), null, question && hiddenSolution));
+    const next = await run(() => hub.reply(thread.threadId, reply.trim()));
     if (next) {
       setReply('');
-      setHiddenSolution(false);
       bump();
     }
   };
@@ -152,15 +91,8 @@ export default function HubThread({ hub, threadId, bump }) {
         <Author author={post.author} />
         <span className="hb-muted">{relativeTime(post.createdAt) || 'just now'}</span>
         {highlight ? <span className="hb-badge hb-badge--done">Answer</span> : null}
-        {post.hiddenSolution && !post.folded ? <span className="hb-badge hb-badge--pin">Hidden solution</span> : null}
       </header>
-      {post.folded ? (
-        <Folded>
-          <Body text={post.body} />
-        </Folded>
-      ) : (
-        <Body text={post.body} />
-      )}
+      <Body text={post.body} />
       <footer className="hb-post__foot">
         {thread.me.canMarkAnswer && !post.first ? (
           <button type="button" className="hb-link" disabled={busy} onClick={() => run(() => hub.markAnswer(thread.threadId, post.answer ? null : post.postId))}>
@@ -172,7 +104,6 @@ export default function HubThread({ hub, threadId, bump }) {
             Remove
           </button>
         ) : null}
-        {thread.me.canSaveCard && !post.first ? <SaveCard hub={hub} thread={thread} post={post} /> : null}
         {!post.author.you && !post.first ? <ReportButton hub={hub} spaceId={thread.space.spaceId} targetType="post" targetId={post.postId} /> : null}
       </footer>
     </article>
@@ -261,15 +192,6 @@ export default function HubThread({ hub, threadId, bump }) {
             {question && !thread.answered ? 'Your answer' : 'Your reply'}
           </label>
           <textarea id="hb-reply" className="hb-input" rows={4} maxLength={10000} value={reply} onChange={(event) => setReply(event.target.value)} placeholder={question ? 'Explain it the way you would have wanted it explained.' : 'Write a reply'} />
-          {question ? (
-            <label className="hb-check">
-              <input type="checkbox" checked={hiddenSolution} onChange={(event) => setHiddenSolution(event.target.checked)} />
-              <span>
-                <span className="hb-label">Hide as a solution</span>
-                <span className="hb-muted">Others see it folded and open it when they are ready — so they can try first.</span>
-              </span>
-            </label>
-          ) : null}
           <div className="hb-inline">
             <button type="submit" className="btn btn--primary" disabled={busy || !reply.trim()}>
               {busy ? 'Sending…' : 'Reply'}

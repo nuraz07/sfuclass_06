@@ -586,7 +586,7 @@ export const getThread = async ({ viewer, threadId }) => {
   const moderator = Rules.isModerator(membership);
   const { rows: summaryRows } = await pool.query(`${THREAD_SELECT} WHERE t.id = $2`, [viewer.userId, threadId]);
   const { rows: posts } = await pool.query(
-    `SELECT p.id, p.author_id, p.body, p.reply_to_id, p.created_at, p.edited_at, p.hidden_solution, u.display_name
+    `SELECT p.id, p.author_id, p.body, p.reply_to_id, p.created_at, p.edited_at, u.display_name
        FROM posts p JOIN users u ON u.id = p.author_id
       WHERE p.thread_id = $1 AND p.deleted_at IS NULL AND ${NOT_BLOCKED('p.author_id', '$2')}
       ORDER BY p.created_at, p.id
@@ -620,9 +620,6 @@ export const getThread = async ({ viewer, threadId }) => {
       }),
       answer: post.id === thread.answered_post_id,
       canRemove: Rules.canRemove({ authorId: post.author_id, viewerId: viewer.userId, membership }) && index > 0,
-      // Part 2: a solution others open deliberately.
-      hiddenSolution: Boolean(post.hidden_solution),
-      folded: Rules.solutionFolded({ hiddenSolution: post.hidden_solution, authorId: post.author_id, viewerId: viewer.userId }),
     })),
     me: {
       moderator,
@@ -635,7 +632,6 @@ export const getThread = async ({ viewer, threadId }) => {
       }),
       canRemoveThread: Rules.canRemove({ authorId: thread.author_id, viewerId: viewer.userId, membership }),
       canMetoo: thread.kind === 'question' && thread.author_id !== viewer.userId && Boolean(membership),
-      canSaveCard: Rules.canCurate(membership),
     },
   };
 };
@@ -652,7 +648,6 @@ export const reply = async ({ viewer, threadId, input }) => {
       author_id: viewer.userId,
       body: input.body,
       reply_to_id: input.replyToId ?? null,
-      hidden_solution: Boolean(input.hiddenSolution),
     });
     await client.query(`UPDATE threads SET post_count = post_count + 1, last_post_at = now(), updated_at = now() WHERE id = $1`, [threadId]);
   });
@@ -776,9 +771,7 @@ export const home = async ({ viewer }) => {
       [viewer.userId],
     ),
   ]);
-  const { liveInMySpaces } = await import('./HubExtras.js');
   return {
-    live: await liveInMySpaces({ viewer }).catch(() => []),
     spaces: spaces.items.slice(0, 12),
     recent: recent.rows.map((row) => toThreadSummary(row, viewer)),
     myThreads: mine.rows.map((row) => toThreadSummary(row, viewer)),
@@ -877,9 +870,6 @@ export const resolveReport = async ({ viewer, spaceId, reportId, action }) => {
   );
   return { resolved: true };
 };
-
-/** Shared with HubExtras.js (part 2); not part of the route surface. */
-export const internals = { loadSpace, insertRow, notify, inTransaction, notBlocked: NOT_BLOCKED, iso, membershipOf, fail };
 
 export default {
   viewerOf, listSpaces, getSpace, createSpace, updateSpace, archiveSpace, join, leave, listRequests, decideRequest,

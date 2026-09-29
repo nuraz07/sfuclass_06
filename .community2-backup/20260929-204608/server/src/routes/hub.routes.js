@@ -32,26 +32,12 @@
  *   POST   /spaces/:id/reports                  report a thread, reply or person
  *   GET    /spaces/:id/reports                                      moderators
  *   POST   /spaces/:id/reports/:reportId  { action: remove|dismiss } moderators
- *
- * Part 2 (hub/HubExtras.js):
- *   GET    /spaces/:id/cards?q=              knowledge cards
- *   POST   /spaces/:id/cards                 { title, body, postId? }       moderators
- *   PATCH  /cards/:id  DELETE /cards/:id                                    moderators
- *   GET    /spaces/:id/materials             links, pinned first
- *   POST   /spaces/:id/materials             { title, url, note?, pinned? } moderators
- *   PATCH  /materials/:id { pinned }  DELETE /materials/:id                 moderators
- *   GET    /spaces/:id/chat?after=           newest messages, or those after a moment
- *   POST   /spaces/:id/chat                  { body }
- *   DELETE /chat/:id                                                         author, moderators
- *   GET    /spaces/:id/rooms                 the space's upcoming and running rooms
- *   POST   /spaces/:id/rooms/drop-in         open a drop-in room now (or the one already open)
  */
 
 import { Router } from 'express';
 import { z } from 'zod';
 
 import * as Hub from '../hub/HubService.js';
-import * as Extras from '../hub/HubExtras.js';
 import * as Rules from '../hub/hubRules.js';
 import { rateLimit } from '../middleware/rateLimit.js';
 import { route, validate, requireAuth, notFound, badRequest, forbidden, conflict } from './_helpers.js';
@@ -249,83 +235,6 @@ router.post(
   '/spaces/:id/reports/:reportId',
   validate({ params: z.object({ id, reportId: id }), body: z.object({ action: z.enum(['remove', 'dismiss']) }) }),
   handle((req, res, viewer) => Hub.resolveReport({ viewer, spaceId: req.params.id, reportId: req.params.reportId, action: req.body.action })),
-);
-
-/* ---------------------------------------------------------------- part 2 */
-
-router.get(
-  '/spaces/:id/cards',
-  validate({ params: spaceParam, query: z.object({ q: z.string().trim().max(80).optional() }).passthrough() }),
-  handle((req, res, viewer) => Extras.listCards({ viewer, spaceId: req.params.id, q: req.query.q || null })),
-);
-
-router.post(
-  '/spaces/:id/cards',
-  writeLimit,
-  validate({ params: spaceParam }),
-  handle(async (req, res, viewer) => {
-    res.status(201);
-    return Extras.createCard({ viewer, spaceId: req.params.id, input: parse(Rules.CardSchema, req.body) });
-  }),
-);
-
-router.patch(
-  '/cards/:id',
-  validate({ params: spaceParam }),
-  handle((req, res, viewer) => Extras.updateCard({ viewer, cardId: req.params.id, patch: parse(Rules.UpdateCardSchema, req.body) })),
-);
-
-router.delete('/cards/:id', validate({ params: spaceParam }), handle((req, res, viewer) => Extras.removeCard({ viewer, cardId: req.params.id })));
-
-router.get('/spaces/:id/materials', validate({ params: spaceParam }), handle((req, res, viewer) => Extras.listMaterials({ viewer, spaceId: req.params.id })));
-
-router.post(
-  '/spaces/:id/materials',
-  writeLimit,
-  validate({ params: spaceParam }),
-  handle(async (req, res, viewer) => {
-    res.status(201);
-    return Extras.addMaterial({ viewer, spaceId: req.params.id, input: parse(Rules.MaterialSchema, req.body) });
-  }),
-);
-
-router.patch(
-  '/materials/:id',
-  validate({ params: spaceParam, body: z.object({ pinned: z.boolean() }) }),
-  handle((req, res, viewer) => Extras.pinMaterial({ viewer, materialId: req.params.id, pinned: req.body.pinned })),
-);
-
-router.delete('/materials/:id', validate({ params: spaceParam }), handle((req, res, viewer) => Extras.removeMaterial({ viewer, materialId: req.params.id })));
-
-router.get(
-  '/spaces/:id/chat',
-  validate({ params: spaceParam, query: z.object({ after: z.string().datetime({ offset: true }).optional() }).passthrough() }),
-  handle((req, res, viewer) => Extras.listMessages({ viewer, spaceId: req.params.id, after: req.query.after ?? null })),
-);
-
-router.post(
-  '/spaces/:id/chat',
-  rateLimit({ key: 'hub:chat', points: 30, durationSec: 60, by: ['user'] }),
-  validate({ params: spaceParam }),
-  handle(async (req, res, viewer) => {
-    res.status(201);
-    return Extras.sendMessage({ viewer, spaceId: req.params.id, input: parse(Rules.ChatMessageSchema, req.body) });
-  }),
-);
-
-router.delete('/chat/:id', validate({ params: spaceParam }), handle((req, res, viewer) => Extras.removeMessage({ viewer, messageId: req.params.id })));
-
-router.get('/spaces/:id/rooms', validate({ params: spaceParam }), handle((req, res, viewer) => Extras.listRooms({ viewer, spaceId: req.params.id })));
-
-router.post(
-  '/spaces/:id/rooms/drop-in',
-  rateLimit({ key: 'hub:drop-in', points: 6, durationSec: 3600, by: ['user'] }),
-  validate({ params: spaceParam }),
-  handle(async (req, res, viewer) => {
-    const result = await Extras.startDropIn({ viewer, spaceId: req.params.id });
-    res.status(result.started ? 201 : 200);
-    return result;
-  }),
 );
 
 export default router;

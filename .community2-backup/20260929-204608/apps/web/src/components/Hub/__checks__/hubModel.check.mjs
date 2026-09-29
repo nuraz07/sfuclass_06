@@ -49,22 +49,3 @@ test('wording helpers', () => {
   assert.deepEqual(paragraphs('one\n\n\ntwo\nlines\n\n'), ['one', 'two\nlines']);
   assert.deepEqual(validateThreadForm({ title: 'Hi', body: ' ' }).title !== undefined, true);
 });
-
-import { dayLabel, groupMessages, normalizeUrl } from '../hubModel.js';
-
-test('chat messages group by person within five minutes', () => {
-  const m = (id, user, minute) => ({ messageId: id, author: { userId: user }, createdAt: new Date(Date.UTC(2026, 2, 1, 10, minute)).toISOString() });
-  const groups = groupMessages([m('1', 'a', 0), m('2', 'a', 3), m('3', 'b', 4), m('4', 'b', 20), m('5', 'a', 21)]);
-  assert.deepEqual(groups.map((g) => g.items.map((i) => i.messageId)), [['1', '2'], ['3'], ['4'], ['5']]);
-});
-
-test('day labels and safe links', () => {
-  const now = new Date(2026, 2, 10, 12);
-  assert.equal(dayLabel(new Date(2026, 2, 10, 8), now), 'Today');
-  assert.equal(dayLabel(new Date(2026, 2, 9, 23), now), 'Yesterday');
-  assert.equal(normalizeUrl('example.com/sheet.pdf'), 'https://example.com/sheet.pdf');
-  assert.equal(normalizeUrl('https://example.com'), 'https://example.com/');
-  assert.equal(normalizeUrl('javascript:alert(1)'), null);
-  assert.equal(normalizeUrl('localhost'), null);
-  assert.equal(normalizeUrl(''), null);
-});

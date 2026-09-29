@@ -66,7 +66,7 @@ const COLUMNS = `
   s.id, s.tenant_id, s.series_id, s.host_id, s.room_id, s.room_code, s.title, s.description,
   s.starts_at, s.ends_at, s.time_zone, s.status, s.sequence, s.recurrence,
   s.early_entry_min, s.late_join_min, s.capacity, s.access, s.approval,
-  s.cohost_ids, s.room_settings, s.created_at, s.cancelled_at, s.cancel_reason, s.space_id
+  s.cohost_ids, s.room_settings, s.created_at, s.cancelled_at, s.cancel_reason
 `;
 
 const toRoom = (row) =>
@@ -94,7 +94,6 @@ const toRoom = (row) =>
     createdAt: iso(row.created_at),
     cancelledAt: iso(row.cancelled_at),
     cancelReason: row.cancel_reason ?? null,
-    spaceId: row.space_id ?? null,
   };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -136,14 +135,7 @@ export const relationFor = async (room, { userId, tenantId = null }) => {
   const tenant = tenantId ?? (await tenantOfUser(userId));
   const sameTenant = tenant === room.tenantId;
   if (!sameTenant) return null;
-  const relation = Rules.relationOf(room, { userId, invited: await isInvited(room.id, userId), sameTenant });
-  if (relation || !room.spaceId) return relation;
-  // A drop-in room of a community space (Community, part 2): its members may come in.
-  const { rows } = await pool.query(
-    `SELECT 1 FROM space_memberships WHERE space_id = $1 AND user_id = $2`,
-    [room.spaceId, userId],
-  );
-  return rows.length > 0 ? 'guest' : null;
+  return Rules.relationOf(room, { userId, invited: await isInvited(room.id, userId), sameTenant });
 };
 
 /** Seats for learners: the room's own limit, never above the platform maximum. */

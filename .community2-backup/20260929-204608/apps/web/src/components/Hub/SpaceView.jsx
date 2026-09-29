@@ -2,10 +2,6 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import ThreadRow from './ThreadRow.jsx';
 import ReportButton from './ReportButton.jsx';
-import SpaceChat from './SpaceChat.jsx';
-import KnowledgeCards from './KnowledgeCards.jsx';
-import SpaceMaterials from './SpaceMaterials.jsx';
-import SpaceRooms from './SpaceRooms.jsx';
 import { ACCESS, KIND_LABEL, ROLE_LABEL, TIMEOUTS, endsLabel, spaceMark, tabFrom, validateThreadForm } from './hubModel.js';
 import { relativeTime } from '../Settings/notificationsModel.js';
 
@@ -13,10 +9,6 @@ import { relativeTime } from '../Settings/notificationsModel.js';
  * One space  (Community, part 1)
  *
  *   threads   discussions and questions; start one, filter to open questions
- *   chat      quick messages                                   (part 2)
- *   knowledge saved answers, searchable                        (part 2)
- *   materials links the space keeps at hand                    (part 2)
- *   rooms     drop-in and planned rooms; "Live now" above      (part 2)
  *   members   names and roles — or only the moderators, if the space says so
  *   requests  people asking to join                       moderators
  *   reports   what members reported                       moderators
@@ -453,23 +445,6 @@ export default function SpaceView({ hub, spaceId, version, bump }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [answer, setAnswer] = useState('');
-  const [live, setLive] = useState([]);
-
-  // What is live in this space right now, for the banner under the header.
-  useEffect(() => {
-    const controller = new AbortController();
-    const load = () =>
-      hub
-        .rooms(spaceId, controller.signal)
-        .then((result) => setLive(result.items.filter((room) => room.phase === 'live' || room.phase === 'doors-open')))
-        .catch(() => undefined);
-    load();
-    const timer = window.setInterval(load, 30_000);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
-  }, [hub, spaceId, version]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -488,12 +463,9 @@ export default function SpaceView({ hub, spaceId, version, bump }) {
 
   const moderator = space.me?.moderator;
   const member = Boolean(space.me?.role);
-  const tabs = ['threads', 'chat', 'knowledge', 'materials', 'rooms', 'members', 'about', ...(moderator ? ['requests', 'reports'] : [])];
+  const tabs = ['threads', 'members', 'about', ...(moderator ? ['requests', 'reports'] : [])];
   const tab = space.view === 'preview' ? 'about' : tabFrom(location.search, tabs, 'threads');
-  const labels = {
-    threads: 'Threads', chat: 'Chat', knowledge: 'Knowledge', materials: 'Materials', rooms: 'Rooms',
-    members: 'Members', about: 'About', requests: 'Requests', reports: 'Reports',
-  };
+  const labels = { threads: 'Threads', members: 'Members', about: 'About', requests: 'Requests', reports: 'Reports' };
   const ends = endsLabel(space.endsAt);
 
   const join = async () => {
@@ -548,18 +520,6 @@ export default function SpaceView({ hub, spaceId, version, bump }) {
         </div>
       ) : null}
 
-      {space.view === 'full' && live.length > 0 ? (
-        <div className="hb-livebar" role="status">
-          <span className="hb-livedot" aria-hidden="true" />
-          <span>
-            <strong>Live now:</strong> {live[0].title}, {live[0].here} {live[0].here === 1 ? 'person' : 'people'} inside
-          </span>
-          <Link className="btn btn--primary btn--tiny" to={`/rooms/${live[0].code}/lobby`}>
-            Join
-          </Link>
-        </div>
-      ) : null}
-
       {space.view === 'full' ? (
         <nav className="hb-tabs" aria-label="In this space">
           {tabs.map((name) => (
@@ -572,10 +532,6 @@ export default function SpaceView({ hub, spaceId, version, bump }) {
 
       <div className="hb-panel" key={tab}>
         {tab === 'threads' ? <Threads hub={hub} space={space} version={version} bump={bump} /> : null}
-        {tab === 'chat' ? <SpaceChat hub={hub} space={space} /> : null}
-        {tab === 'knowledge' ? <KnowledgeCards hub={hub} space={space} /> : null}
-        {tab === 'materials' ? <SpaceMaterials hub={hub} space={space} /> : null}
-        {tab === 'rooms' ? <SpaceRooms hub={hub} space={space} onChanged={bump} /> : null}
         {tab === 'members' ? <Members hub={hub} space={space} version={version} bump={bump} /> : null}
         {tab === 'requests' ? <Requests hub={hub} space={space} bump={bump} /> : null}
         {tab === 'reports' ? <Reports hub={hub} space={space} /> : null}

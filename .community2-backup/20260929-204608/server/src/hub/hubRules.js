@@ -12,10 +12,6 @@
  *            invite   invisible to everyone who is not a member
  *   roles    owner · moderator · member
  *
- * Part 2 adds knowledge cards (a good answer, saved), hidden solutions
- * (replies that show only when opened), a chat per space, materials (links),
- * and drop-in rooms that the space's members may enter.
- *
  * Privacy, unlike a messenger group: members never see each other's email or
  * phone. Names and roles only — and a space can hide its member list from
  * everyone but moderators. A question can be asked anonymously: other members
@@ -93,55 +89,8 @@ export const ReplySchema = z
   .object({
     body: z.string().trim().min(1).max(10000),
     replyToId: z.string().uuid().nullish(),
-    hiddenSolution: z.boolean().default(false),
   })
   .strict();
-
-export const CardSchema = z
-  .object({
-    title: z.string().trim().min(3).max(160),
-    body: z.string().trim().min(1).max(10000),
-    postId: z.string().uuid().nullish(),
-  })
-  .strict();
-
-export const UpdateCardSchema = z
-  .object({ title: z.string().trim().min(3).max(160), body: z.string().trim().min(1).max(10000) })
-  .partial()
-  .strict();
-
-/** Only http(s) links: no javascript:, data: or file: addresses end up clickable. */
-export const safeUrl = (value) => {
-  try {
-    const url = new URL(String(value ?? '').trim());
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : null;
-  } catch {
-    return null;
-  }
-};
-
-export const MaterialSchema = z
-  .object({
-    title: z.string().trim().min(1).max(120),
-    url: z.string().trim().max(2000).refine((value) => safeUrl(value) !== null, 'a web address starting with https://'),
-    note: z.string().trim().max(300).nullish(),
-    pinned: z.boolean().default(false),
-  })
-  .strict();
-
-export const ChatMessageSchema = z.object({ body: z.string().trim().min(1).max(2000) }).strict();
-
-/** How long a drop-in room stays open, and how many can start at once in one space. */
-export const DROP_IN_MINUTES = 60;
-
-/** Members start drop-in rooms; cards and materials are curated by moderators. */
-export const canCurate = (membership) => isModerator(membership);
-
-/** Who may remove a chat message: its author, or a moderator. */
-export const canRemoveMessage = ({ authorId, viewerId, membership }) => authorId === viewerId || isModerator(membership);
-
-/** A hidden solution is shown folded to everyone but its author. */
-export const solutionFolded = ({ hiddenSolution, authorId, viewerId }) => Boolean(hiddenSolution) && authorId !== viewerId;
 
 export const ReportSchema = z
   .object({
@@ -226,7 +175,6 @@ export const excerpt = (text, length = 180) => {
 
 export default {
   KINDS, ACCESS, ROLES, CreateSpaceSchema, UpdateSpaceSchema, CreateThreadSchema, ReplySchema, ReportSchema,
-  CardSchema, UpdateCardSchema, MaterialSchema, ChatMessageSchema, safeUrl, canCurate, canRemoveMessage, solutionFolded,
   isModerator, hasEnded, viewOf, postingBlockedBecause, canCreateKind, memberListVisible, authorView,
   canMarkAnswer, canRemove, roomForMember, excerpt,
 };

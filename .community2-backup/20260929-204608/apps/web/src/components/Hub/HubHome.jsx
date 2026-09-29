@@ -46,22 +46,6 @@ export default function HubHome({ home, displayName }) {
         </p>
       </header>
 
-      {home.live?.length ? (
-        <section className="hb-block hb-block--live" aria-label="Live now">
-          {home.live.map((room) => (
-            <div key={room.code} className="hb-livebar">
-              <span className="hb-livedot" aria-hidden="true" />
-              <span>
-                <strong>Live in {room.spaceName}:</strong> {room.title}, {room.here} {room.here === 1 ? 'person' : 'people'} inside
-              </span>
-              <Link className="btn btn--primary btn--tiny" to={`/rooms/${room.code}/lobby`}>
-                Join
-              </Link>
-            </div>
-          ))}
-        </section>
-      ) : null}
-
       <div className="hb-tiles">
         {home.spaces.slice(0, 6).map((space) => (
           <Link key={space.spaceId} to={`/community/spaces/${space.spaceId}`} className="hb-tile">

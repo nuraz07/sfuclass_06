@@ -1,9 +1,7 @@
 /**
  * Community API  (Community, part 1)
  *
- * Spaces, membership, threads, questions and reports — and, since part 2,
- * knowledge cards, materials, a chat per space and the space's rooms.
- * Paths are the server's
+ * Spaces, membership, threads, questions and reports. Paths are the server's
  * (server/src/routes/hub.routes.js, mounted under /hub). Responses are
  * validated loosely (passthrough): the server shapes every view, including
  * who is shown as "Anonymous".
@@ -96,8 +94,6 @@ export const HubThreadSchema = HubThreadSummarySchema.extend({
         author: Author,
         answer: z.boolean().default(false),
         canRemove: z.boolean().default(false),
-        hiddenSolution: z.boolean().default(false),
-        folded: z.boolean().default(false),
       })
       .passthrough(),
   ),
@@ -109,7 +105,6 @@ export const HubThreadSchema = HubThreadSummarySchema.extend({
       canMarkAnswer: z.boolean(),
       canRemoveThread: z.boolean(),
       canMetoo: z.boolean(),
-      canSaveCard: z.boolean().default(false),
     })
     .passthrough(),
 }).passthrough();
@@ -137,74 +132,8 @@ const MembersSchema = z
   .passthrough();
 export type HubMembers = z.infer<typeof MembersSchema>;
 
-export const HubRoomSchema = z
-  .object({
-    code: z.string(),
-    title: z.string(),
-    hostName: z.string().nullable().default(null),
-    startsAt: z.string(),
-    endsAt: z.string(),
-    phase: z.string(),
-    dropIn: z.boolean().default(false),
-    here: z.number().default(0),
-    spaceId: z.string(),
-    spaceName: z.string().optional(),
-  })
-  .passthrough();
-export type HubRoom = z.infer<typeof HubRoomSchema>;
-
-export const HubCardSchema = z
-  .object({
-    cardId: z.string(),
-    spaceId: z.string(),
-    threadId: z.string().nullable().default(null),
-    postId: z.string().nullable().default(null),
-    title: z.string(),
-    body: z.string(),
-    createdBy: z.string().nullable().default(null),
-    createdAt: z.string().nullable(),
-    updatedAt: z.string().nullable(),
-  })
-  .passthrough();
-export type HubCard = z.infer<typeof HubCardSchema>;
-
-export const HubMaterialSchema = z
-  .object({
-    materialId: z.string(),
-    title: z.string(),
-    url: z.string(),
-    host: z.string().nullable().default(null),
-    note: z.string().nullable().default(null),
-    pinned: z.boolean().default(false),
-    addedBy: z.string().nullable().default(null),
-    createdAt: z.string().nullable(),
-  })
-  .passthrough();
-export type HubMaterial = z.infer<typeof HubMaterialSchema>;
-
-export const HubMessageSchema = z
-  .object({
-    messageId: z.string(),
-    body: z.string(),
-    author: z.object({ userId: z.string(), displayName: z.string(), you: z.boolean().default(false) }).passthrough(),
-    createdAt: z.string().nullable(),
-    cursor: z.string(),
-    canRemove: z.boolean().default(false),
-  })
-  .passthrough();
-export type HubMessage = z.infer<typeof HubMessageSchema>;
-
-const ChatPageSchema = z
-  .object({
-    items: z.array(HubMessageSchema),
-    nextCursor: z.string().nullable().default(null),
-    postingBlocked: z.string().nullable().default(null),
-  })
-  .passthrough();
-
 const HomeSchema = z
   .object({
-    live: z.array(HubRoomSchema).default([]),
     spaces: z.array(HubSpaceSchema),
     recent: z.array(HubThreadSummarySchema),
     myThreads: z.array(HubThreadSummarySchema),
@@ -263,7 +192,7 @@ export interface HubApi {
   threads(spaceId: string, filter?: 'all' | 'questions' | 'unanswered', signal?: AbortSignal): Promise<{ items: HubThreadSummary[] }>;
   createThread(spaceId: string, input: { title: string; body: string; kind: 'discussion' | 'question'; anonymous?: boolean }): Promise<HubThread>;
   thread(threadId: string, signal?: AbortSignal): Promise<HubThread>;
-  reply(threadId: string, body: string, replyToId?: string | null, hiddenSolution?: boolean): Promise<HubThread>;
+  reply(threadId: string, body: string, replyToId?: string | null): Promise<HubThread>;
   markAnswer(threadId: string, postId: string | null): Promise<HubThread>;
   metoo(threadId: string): Promise<HubThread>;
   moderateThread(threadId: string, patch: { pinned?: boolean; locked?: boolean }): Promise<HubThread>;
@@ -272,20 +201,6 @@ export interface HubApi {
   report(spaceId: string, input: { targetType: 'thread' | 'post' | 'user'; targetId: string; reason: string; note?: string | null }): Promise<unknown>;
   reports(spaceId: string, signal?: AbortSignal): Promise<{ items: HubReport[] }>;
   resolveReport(spaceId: string, reportId: string, action: 'remove' | 'dismiss'): Promise<unknown>;
-  // Part 2
-  cards(spaceId: string, q?: string, signal?: AbortSignal): Promise<{ items: HubCard[]; canCurate: boolean }>;
-  createCard(spaceId: string, input: { title: string; body: string; postId?: string | null }): Promise<HubCard>;
-  updateCard(cardId: string, patch: { title?: string; body?: string }): Promise<HubCard>;
-  removeCard(cardId: string): Promise<unknown>;
-  materials(spaceId: string, signal?: AbortSignal): Promise<{ items: HubMaterial[]; canCurate: boolean }>;
-  addMaterial(spaceId: string, input: { title: string; url: string; note?: string | null; pinned?: boolean }): Promise<HubMaterial>;
-  pinMaterial(materialId: string, pinned: boolean): Promise<HubMaterial>;
-  removeMaterial(materialId: string): Promise<unknown>;
-  chat(spaceId: string, after?: string | null, signal?: AbortSignal): Promise<z.infer<typeof ChatPageSchema>>;
-  sendChat(spaceId: string, body: string): Promise<HubMessage>;
-  removeChat(messageId: string): Promise<unknown>;
-  rooms(spaceId: string, signal?: AbortSignal): Promise<{ items: HubRoom[] }>;
-  dropIn(spaceId: string): Promise<{ room: HubRoom; started: boolean }>;
 }
 
 const enc = encodeURIComponent;
@@ -312,8 +227,8 @@ export const createHubApi = (http: HttpClient): HubApi => ({
     http.get(`/hub/spaces/${enc(spaceId)}/threads`, { schema: Items(HubThreadSummarySchema), query: { filter }, signal }),
   createThread: (spaceId, input) => http.post(`/hub/spaces/${enc(spaceId)}/threads`, input, { schema: HubThreadSchema, ...once }),
   thread: (threadId, signal) => http.get(`/hub/threads/${enc(threadId)}`, { schema: HubThreadSchema, signal }),
-  reply: (threadId, body, replyToId = null, hiddenSolution = false) =>
-    http.post(`/hub/threads/${enc(threadId)}/replies`, { body, replyToId, hiddenSolution }, { schema: HubThreadSchema, ...once }),
+  reply: (threadId, body, replyToId = null) =>
+    http.post(`/hub/threads/${enc(threadId)}/replies`, { body, replyToId }, { schema: HubThreadSchema, ...once }),
   markAnswer: (threadId, postId) => http.post(`/hub/threads/${enc(threadId)}/answer`, { postId }, { schema: HubThreadSchema }),
   metoo: (threadId) => http.post(`/hub/threads/${enc(threadId)}/metoo`, {}, { schema: HubThreadSchema }),
   moderateThread: (threadId, patch) => http.patch(`/hub/threads/${enc(threadId)}`, patch, { schema: HubThreadSchema }),
@@ -323,32 +238,4 @@ export const createHubApi = (http: HttpClient): HubApi => ({
   report: (spaceId, input) => http.post(`/hub/spaces/${enc(spaceId)}/reports`, input, once),
   reports: (spaceId, signal) => http.get(`/hub/spaces/${enc(spaceId)}/reports`, { schema: Items(ReportSchema), signal }),
   resolveReport: (spaceId, reportId, action) => http.post(`/hub/spaces/${enc(spaceId)}/reports/${enc(reportId)}`, { action }, once),
-
-  cards: (spaceId, q = '', signal) =>
-    http.get(`/hub/spaces/${enc(spaceId)}/cards`, {
-      schema: z.object({ items: z.array(HubCardSchema), canCurate: z.boolean().default(false) }).passthrough(),
-      query: q ? { q } : undefined,
-      signal,
-    }),
-  createCard: (spaceId, input) => http.post(`/hub/spaces/${enc(spaceId)}/cards`, input, { schema: HubCardSchema, ...once }),
-  updateCard: (cardId, patch) => http.patch(`/hub/cards/${enc(cardId)}`, patch, { schema: HubCardSchema }),
-  removeCard: (cardId) => http.delete(`/hub/cards/${enc(cardId)}`),
-  materials: (spaceId, signal) =>
-    http.get(`/hub/spaces/${enc(spaceId)}/materials`, {
-      schema: z.object({ items: z.array(HubMaterialSchema), canCurate: z.boolean().default(false) }).passthrough(),
-      signal,
-    }),
-  addMaterial: (spaceId, input) => http.post(`/hub/spaces/${enc(spaceId)}/materials`, input, { schema: HubMaterialSchema, ...once }),
-  pinMaterial: (materialId, pinned) => http.patch(`/hub/materials/${enc(materialId)}`, { pinned }, { schema: HubMaterialSchema }),
-  removeMaterial: (materialId) => http.delete(`/hub/materials/${enc(materialId)}`),
-  chat: (spaceId, after = null, signal) =>
-    http.get(`/hub/spaces/${enc(spaceId)}/chat`, { schema: ChatPageSchema, query: after ? { after } : undefined, signal, retry: { attempts: 1 } }),
-  sendChat: (spaceId, body) => http.post(`/hub/spaces/${enc(spaceId)}/chat`, { body }, { schema: HubMessageSchema, ...once }),
-  removeChat: (messageId) => http.delete(`/hub/chat/${enc(messageId)}`),
-  rooms: (spaceId, signal) => http.get(`/hub/spaces/${enc(spaceId)}/rooms`, { schema: Items(HubRoomSchema), signal }),
-  dropIn: (spaceId) =>
-    http.post(`/hub/spaces/${enc(spaceId)}/rooms/drop-in`, {}, {
-      schema: z.object({ room: HubRoomSchema, started: z.boolean() }).passthrough(),
-      ...once,
-    }),
 });

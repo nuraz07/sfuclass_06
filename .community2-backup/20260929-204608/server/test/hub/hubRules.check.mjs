@@ -87,28 +87,3 @@ test('excerpts are short and clean', () => {
   assert.equal(excerpt('# Title\n\nSome **bold** text'), 'Title Some bold text');
   assert.equal(excerpt('a'.repeat(300)).length, 180);
 });
-
-import { CardSchema, MaterialSchema, ReplySchema, canCurate, canRemoveMessage, safeUrl, solutionFolded } from '../../src/hub/hubRules.js';
-
-test('part 2: materials only link to web addresses', () => {
-  assert.equal(safeUrl('https://example.com/a?b=1'), 'https://example.com/a?b=1');
-  assert.equal(safeUrl('javascript:alert(1)'), null);
-  assert.equal(safeUrl('data:text/html,hi'), null);
-  assert.equal(safeUrl('not a url'), null);
-  assert.equal(MaterialSchema.safeParse({ title: 'Slides', url: 'https://example.com/s.pdf' }).success, true);
-  assert.equal(MaterialSchema.safeParse({ title: 'Evil', url: 'javascript:alert(1)' }).success, false);
-});
-
-test('part 2: cards, hidden solutions, chat removal', () => {
-  assert.equal(CardSchema.safeParse({ title: 'Adding fractions', body: 'Same bottoms first.' }).success, true);
-  assert.equal(CardSchema.safeParse({ title: 'x', body: 'y' }).success, false);
-  assert.equal(ReplySchema.parse({ body: 'answer' }).hiddenSolution, false);
-  assert.equal(solutionFolded({ hiddenSolution: true, authorId: 'a', viewerId: 'b' }), true);
-  assert.equal(solutionFolded({ hiddenSolution: true, authorId: 'a', viewerId: 'a' }), false);
-  assert.equal(solutionFolded({ hiddenSolution: false, authorId: 'a', viewerId: 'b' }), false);
-  assert.equal(canCurate({ role: 'moderator' }), true);
-  assert.equal(canCurate({ role: 'member' }), false);
-  assert.equal(canRemoveMessage({ authorId: 'a', viewerId: 'a', membership: { role: 'member' } }), true);
-  assert.equal(canRemoveMessage({ authorId: 'a', viewerId: 'b', membership: { role: 'member' } }), false);
-  assert.equal(canRemoveMessage({ authorId: 'a', viewerId: 'b', membership: { role: 'owner' } }), true);
-});
