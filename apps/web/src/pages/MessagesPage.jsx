@@ -1,23 +1,115 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { createChatApi, useConversations, useCore } from '@classroom/core-client';
+import { createChatApi, createProfileApi, useConversations, useCore } from '@classroom/core-client';
 import ChatRooms from '../components/Chat/ChatRooms.jsx';
 import '../components/Chat/chatRooms.css';
+import '../components/Chat/messages.css';
 
 /**
- * Messages  (F6)
+ * Messages  (F6 · Design)
  *
- * The same Rooms list as inside a lesson — the default chatroom and every
- * private chat — for reading and answering outside a lesson. /messages/:id
- * opens one chat directly, so a link to a conversation works.
+ * Your conversations with people — only the ones that are really yours: chats
+ * someone wrote in, and the one you have open. A chat that was opened by
+ * accident and never used does not clutter the list. "New message" finds a
+ * person in your organisation (people who blocked you, or whom you blocked,
+ * never appear) and opens the chat with them; whether you may write to them
+ * follows their privacy settings, as everywhere.
  *
- * Blocking for a lesson is not offered here: it belongs to a running lesson.
- * New private chats start from a person in a lesson.
+ * The everyone-chat ("General") is not here: it belongs to live rooms, where
+ * it is shown during the session.
+ *
+ * The page has a fixed height and the conversation scrolls inside it, so the
+ * back button and the ⋯ menu stay in view however long a chat gets.
  */
+
+function NewMessage({ onOpen, onClose }) {
+  const { http } = useCore();
+  const profiles = useMemo(() => createProfileApi(http), [http]);
+  const [q, setQ] = useState('');
+  const [results, setResults] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    const onKey = (event) => event.key === 'Escape' && onClose();
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  useEffect(() => {
+    if (q.trim().length < 2) {
+      setResults([]);
+      return undefined;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const { items } = await profiles.search({ q: q.trim(), limit: 8 }, controller.signal);
+        setResults(items);
+      } catch {
+        if (!controller.signal.aborted) setResults([]);
+      }
+    }, 200);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [q, profiles]);
+
+  const open = async (person) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onOpen(person);
+    } catch (cause) {
+      setError(cause?.detail ?? `You cannot write to ${person.displayName} right now.`);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="msg-new" role="dialog" aria-label="New message">
+      <div className="msg-new__head">
+        <p className="msg-new__title">New message</p>
+        <button type="button" className="msg-iconbtn" aria-label="Close" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      <input
+        ref={inputRef}
+        className="msg-new__search"
+        type="search"
+        placeholder="Search for a person by name"
+        value={q}
+        onChange={(event) => setQ(event.target.value)}
+        aria-label="Search for a person"
+      />
+      {q.trim().length >= 2 && results.length === 0 ? <p className="msg-new__hint">Nobody found.</p> : null}
+      {q.trim().length < 2 ? <p className="msg-new__hint">Type at least two letters.</p> : null}
+      <ul className="msg-new__results">
+        {results.map((person) => (
+          <li key={person.userId}>
+            <button type="button" disabled={busy} onClick={() => open(person)}>
+              <span className="msg-new__avatar" aria-hidden="true">
+                {person.avatarUrl ? <img src={person.avatarUrl} alt="" /> : person.displayName.charAt(0).toUpperCase()}
+              </span>
+              <span>{person.displayName}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+      {error ? <p className="msg-new__error" role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
 export default function MessagesPage() {
   const { http, chatSocket, session } = useCore();
   const { conversationId } = useParams();
   const navigate = useNavigate();
+  const [composing, setComposing] = useState(false);
 
   const api = useMemo(() => createChatApi(http), [http]);
   const self = useMemo(
@@ -43,15 +135,40 @@ export default function MessagesPage() {
   }, [conversationId]);
 
   const onViewChange = (next) => {
+    // The everyone-chat lives in rooms, not here.
+    if (next.type === 'lobby') return;
     setView(next);
     if (next.type === 'conversation') navigate(`/messages/${next.id}`);
     else if (conversationId) navigate('/messages');
   };
 
+  const openWith = async (person) => {
+    const conversation = await api.openDirect(person.userId);
+    await rooms.refresh?.();
+    setComposing(false);
+    onViewChange({ type: 'conversation', id: conversation.conversationId });
+  };
+
+  // Unread from your conversations only — not from the everyone-chat.
+  const unread = rooms.conversations.reduce((sum, item) => sum + (item.unreadCount || 0), 0);
+  const inChat = view.type === 'conversation';
+
   return (
-    <section className="page messages-page">
-      <h1>Messages {rooms.unreadTotal > 0 ? <span className="rooms-badge">{rooms.unreadTotal}</span> : null}</h1>
-      <ChatRooms rooms={rooms} view={view} onViewChange={onViewChange} api={api} socket={chatSocket} self={self} />
+    <section className={`page messages-page${inChat ? ' is-chat' : ''}`}>
+      <header className="messages-page__head">
+        <h1>
+          Messages {unread > 0 ? <span className="rooms-badge">{unread}</span> : null}
+        </h1>
+        {!inChat ? (
+          <button type="button" className="btn btn--primary" onClick={() => setComposing((value) => !value)} aria-expanded={composing}>
+            New message
+          </button>
+        ) : null}
+      </header>
+      {composing && !inChat ? <NewMessage onOpen={openWith} onClose={() => setComposing(false)} /> : null}
+      <div className="messages-page__panel">
+        <ChatRooms rooms={rooms} view={view} onViewChange={onViewChange} api={api} socket={chatSocket} self={self} showLobby={false} hideEmpty />
+      </div>
     </section>
   );
 }

@@ -246,12 +246,7 @@ export function ChatThread({ api, socket, self, target, placeholder, emptyText, 
  * The list and the open chat
  * ------------------------------------------------------------------ */
 
-/**
- * showLobby  the everyone-chat ("General") at the top — inside a room only;
- *            the Messages page turns it off.
- * hideEmpty  leave out chats nobody has written in (except the open one).
- */
-export default function ChatRooms({ rooms, view, onViewChange, api, socket, self, roomId = null, sessionBlocks = null, showLobby = true, hideEmpty = false }) {
+export default function ChatRooms({ rooms, view, onViewChange, api, socket, self, roomId = null, sessionBlocks = null }) {
   const [status, setStatus] = useState(null);
 
   const openId = view.type === 'lobby' ? 'lobby' : view.type === 'conversation' ? view.id : null;
@@ -387,10 +382,6 @@ export default function ChatRooms({ rooms, view, onViewChange, api, socket, self
 
   /* ---- the list ---- */
 
-  const visibleConversations = hideEmpty
-    ? rooms.conversations.filter((c) => c.lastMessageAt || c.unreadCount > 0 || c.conversationId === openId)
-    : rooms.conversations;
-
   return (
     <div className="rooms">
       {rooms.error && !rooms.lobby && rooms.conversations.length === 0 ? (
@@ -405,7 +396,7 @@ export default function ChatRooms({ rooms, view, onViewChange, api, socket, self
       {rooms.loading && !rooms.lobby ? <p className="rooms-notice">Loading…</p> : null}
 
       <div className="rooms-list" role="list">
-        {rooms.lobby && showLobby ? (
+        {rooms.lobby ? (
           <button
             type="button"
             role="listitem"
@@ -426,19 +417,17 @@ export default function ChatRooms({ rooms, view, onViewChange, api, socket, self
           </button>
         ) : null}
 
-        {showLobby ? <p className="rooms-list__group">Private chats</p> : null}
+        <p className="rooms-list__group">Private chats</p>
 
-        {visibleConversations.length === 0 && !rooms.loading ? (
+        {rooms.conversations.length === 0 && !rooms.loading ? (
           <p className="rooms-notice">
             {roomId
               ? 'No private chats yet. Click a person under People to start one.'
-              : hideEmpty
-                ? 'No conversations yet. Start one with “New message”.'
-                : 'No private chats yet. Open a lesson and click a person to start one.'}
+              : 'No private chats yet. Open a lesson and click a person to start one.'}
           </p>
         ) : null}
 
-        {visibleConversations.map((conversation) => {
+        {rooms.conversations.map((conversation) => {
           const title = titleOf(conversation, self.userId);
           const preview = conversation.lastMessagePreview;
           const muted = isMutedNow(conversation);
