@@ -23,28 +23,9 @@ export const STRENGTH_WORDS = ['', 'Too short', 'Good', 'Strong', 'Very strong']
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/**
- * The server's username rules (server/src/identity/usernameRules.js), for an
- * early answer while typing. The server decides; reserved names it knows.
- */
-export const usernameProblem = (value) => {
-  const name = String(value ?? '').trim().toLowerCase();
-  if (name.length < 3) return 'At least 3 characters.';
-  if (name.length > 30) return 'At most 30 characters.';
-  if (name.includes('@')) return 'A username cannot contain "@".';
-  if (!/^[a-z0-9._-]+$/.test(name)) return 'Only letters a–z, digits, dot, hyphen and underscore.';
-  if (!/^[a-z0-9]/.test(name) || !/[a-z0-9]$/.test(name)) return 'Start and end with a letter or a digit.';
-  if (/[._-]{2}/.test(name)) return 'No two dots, hyphens or underscores in a row.';
-  return null;
-};
-
-/** Problems with the sign-up form, keyed by field; empty when it can be sent. The username is optional. */
-export const validateSignup = ({ displayName, email, password, username = '' }) => {
+/** Problems with the sign-up form, keyed by field; empty when it can be sent. */
+export const validateSignup = ({ displayName, email, password }) => {
   const errors = {};
-  if (String(username ?? '').trim()) {
-    const problem = usernameProblem(username);
-    if (problem) errors.username = problem;
-  }
   if (!String(displayName ?? '').trim()) errors.displayName = 'Tell us what to call you.';
   else if (String(displayName).trim().length > 80) errors.displayName = 'At most 80 characters.';
   if (!EMAIL.test(String(email ?? '').trim())) errors.email = 'Enter an email address like name@example.com.';

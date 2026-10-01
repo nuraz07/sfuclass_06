@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useState } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
-import { createUsernameApi, useCore } from '@classroom/core-client';
+import { useCore } from '@classroom/core-client';
 import AuthShell from '../components/Auth/AuthShell.jsx';
-import { STRENGTH_WORDS, destinationOf, passwordStrength, usernameProblem, validateSignup, withNext } from '../components/Auth/authModel.js';
+import { STRENGTH_WORDS, destinationOf, passwordStrength, validateSignup, withNext } from '../components/Auth/authModel.js';
 
 /**
  * Create an account  (Landing)
@@ -12,38 +12,13 @@ import { STRENGTH_WORDS, destinationOf, passwordStrength, usernameProblem, valid
  * browser — both can be changed in Settings. After that it continues to
  * ?next= (for example the room editor from "Create this room" on the
  * homepage), or to the dashboard.
- *
- * A username is optional: with one, people can sign in with it instead of
- * their email. Whether it is free is checked while typing.
  */
 export default function SignupPage() {
-  const { signUp, status, http } = useCore();
-  const usernames = useMemo(() => createUsernameApi(http), [http]);
+  const { signUp, status } = useCore();
   const navigate = useNavigate();
   const location = useLocation();
 
-  const [form, setForm] = useState({ displayName: '', username: '', email: '', password: '' });
-  const [nameCheck, setNameCheck] = useState(null); // null · checking · { available, problem }
-
-  useEffect(() => {
-    const name = form.username.trim();
-    if (!name || usernameProblem(name)) {
-      setNameCheck(null);
-      return undefined;
-    }
-    setNameCheck('checking');
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => {
-      usernames
-        .available(name, controller.signal)
-        .then(setNameCheck)
-        .catch(() => !controller.signal.aborted && setNameCheck(null));
-    }, 350);
-    return () => {
-      controller.abort();
-      window.clearTimeout(timer);
-    };
-  }, [form.username, usernames]);
+  const [form, setForm] = useState({ displayName: '', email: '', password: '' });
   const [reveal, setReveal] = useState(false);
   const [touched, setTouched] = useState(false);
   const [error, setError] = useState(null);
@@ -65,14 +40,12 @@ export default function SignupPage() {
     event.preventDefault();
     setTouched(true);
     if (Object.keys(errors).length > 0) return;
-    if (nameCheck && nameCheck !== 'checking' && !nameCheck.available) return;
     setBusy(true);
     setError(null);
     setExists(false);
     try {
       await signUp({
         displayName: form.displayName.trim(),
-        username: form.username.trim() || null,
         email: form.email.trim(),
         password: form.password,
       });
@@ -113,35 +86,6 @@ export default function SignupPage() {
             autoFocus
           />
           {shown.displayName ? <span className="au-hint">{shown.displayName}</span> : <span className="au-hint">How others see you in lessons and chats.</span>}
-        </label>
-
-        <label className="au-field">
-          <span className="au-label">
-            Username <span className="au-optional">optional</span>
-          </span>
-          <input
-            className="au-input"
-            autoComplete="username"
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            maxLength={30}
-            value={form.username}
-            onChange={set('username')}
-            aria-invalid={Boolean(shown.username || (nameCheck && nameCheck !== 'checking' && !nameCheck.available))}
-            placeholder="e.g. anna.b"
-          />
-          <span className="au-hint" aria-live="polite">
-            {shown.username ??
-              (form.username.trim() && usernameProblem(form.username)) ??
-              (nameCheck === 'checking'
-                ? 'Checking…'
-                : nameCheck
-                  ? nameCheck.available
-                    ? `✓ ${form.username.trim().toLowerCase()} is free`
-                    : nameCheck.problem
-                  : 'Sign in with it instead of your email.')}
-          </span>
         </label>
 
         <label className="au-field">

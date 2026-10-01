@@ -251,7 +251,7 @@ export function ChatThread({ api, socket, self, target, placeholder, emptyText, 
  *            the Messages page turns it off.
  * hideEmpty  leave out chats nobody has written in (except the open one).
  */
-export default function ChatRooms({ rooms, view, onViewChange, api, socket, self, roomId = null, sessionBlocks = null, showLobby = true, hideEmpty = false, activeId = null }) {
+export default function ChatRooms({ rooms, view, onViewChange, api, socket, self, roomId = null, sessionBlocks = null, showLobby = true, hideEmpty = false }) {
   const [status, setStatus] = useState(null);
 
   const openId = view.type === 'lobby' ? 'lobby' : view.type === 'conversation' ? view.id : null;
@@ -388,7 +388,7 @@ export default function ChatRooms({ rooms, view, onViewChange, api, socket, self
   /* ---- the list ---- */
 
   const visibleConversations = hideEmpty
-    ? rooms.conversations.filter((c) => c.lastMessageAt || c.unreadCount > 0 || c.conversationId === openId || c.conversationId === activeId)
+    ? rooms.conversations.filter((c) => c.lastMessageAt || c.unreadCount > 0 || c.conversationId === openId)
     : rooms.conversations;
 
   return (
@@ -447,8 +447,7 @@ export default function ChatRooms({ rooms, view, onViewChange, api, socket, self
               key={conversation.conversationId}
               type="button"
               role="listitem"
-              className={`rooms-row${conversation.unreadCount ? ' rooms-row--unread' : ''}${conversation.conversationId === activeId ? ' rooms-row--active' : ''}`}
-              aria-current={conversation.conversationId === activeId ? 'true' : undefined}
+              className={`rooms-row${conversation.unreadCount ? ' rooms-row--unread' : ''}`}
               onClick={() => onViewChange({ type: 'conversation', id: conversation.conversationId })}
             >
               <span className="rooms-row__avatar" aria-hidden="true">{title.charAt(0).toUpperCase()}</span>

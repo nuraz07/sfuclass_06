@@ -20,24 +20,7 @@ import '../components/Chat/messages.css';
  *
  * The page has a fixed height and the conversation scrolls inside it, so the
  * back button and the ⋯ menu stay in view however long a chat gets.
- *
- * Wide screens show the list and the open conversation side by side, like a
- * messenger on the web; narrow screens show one at a time, with a back button.
  */
-
-const WIDE = '(min-width: 960px)';
-
-function useWide() {
-  const [wide, setWide] = useState(() => typeof window !== 'undefined' && window.matchMedia?.(WIDE).matches);
-  useEffect(() => {
-    const query = window.matchMedia?.(WIDE);
-    if (!query) return undefined;
-    const onChange = () => setWide(query.matches);
-    query.addEventListener('change', onChange);
-    return () => query.removeEventListener('change', onChange);
-  }, []);
-  return Boolean(wide);
-}
 
 function NewMessage({ onOpen, onClose }) {
   const { http } = useCore();
@@ -127,7 +110,6 @@ export default function MessagesPage() {
   const { conversationId } = useParams();
   const navigate = useNavigate();
   const [composing, setComposing] = useState(false);
-  const wide = useWide();
 
   const api = useMemo(() => createChatApi(http), [http]);
   const self = useMemo(
@@ -170,44 +152,23 @@ export default function MessagesPage() {
   // Unread from your conversations only — not from the everyone-chat.
   const unread = rooms.conversations.reduce((sum, item) => sum + (item.unreadCount || 0), 0);
   const inChat = view.type === 'conversation';
-  const shared = { rooms, api, socket: chatSocket, self, showLobby: false, hideEmpty: true };
 
   return (
-    <section className={`page messages-page${inChat ? ' is-chat' : ''}${wide ? ' is-wide' : ''}`}>
+    <section className={`page messages-page${inChat ? ' is-chat' : ''}`}>
       <header className="messages-page__head">
         <h1>
           Messages {unread > 0 ? <span className="rooms-badge">{unread}</span> : null}
         </h1>
-        {!inChat || wide ? (
+        {!inChat ? (
           <button type="button" className="btn btn--primary" onClick={() => setComposing((value) => !value)} aria-expanded={composing}>
             New message
           </button>
         ) : null}
       </header>
-      {composing && (!inChat || wide) ? <NewMessage onOpen={openWith} onClose={() => setComposing(false)} /> : null}
-      {wide ? (
-        <div className="messages-split">
-          {/* The list first: of the two, the open chat must be the last to tell `rooms` what is open. */}
-          <div className="messages-page__panel messages-split__list">
-            <ChatRooms {...shared} view={{ type: 'list' }} onViewChange={onViewChange} activeId={inChat ? view.id : null} />
-          </div>
-          <div className="messages-page__panel messages-split__chat">
-            {inChat ? (
-              <ChatRooms {...shared} view={view} onViewChange={onViewChange} />
-            ) : (
-              <div className="messages-split__empty">
-                <span aria-hidden="true">💬</span>
-                <p className="messages-split__title">Choose a conversation</p>
-                <p className="muted">Or start one with “New message”.</p>
-              </div>
-            )}
-          </div>
-        </div>
-      ) : (
-        <div className="messages-page__panel">
-          <ChatRooms {...shared} view={view} onViewChange={onViewChange} />
-        </div>
-      )}
+      {composing && !inChat ? <NewMessage onOpen={openWith} onClose={() => setComposing(false)} /> : null}
+      <div className="messages-page__panel">
+        <ChatRooms rooms={rooms} view={view} onViewChange={onViewChange} api={api} socket={chatSocket} self={self} showLobby={false} hideEmpty />
+      </div>
     </section>
   );
 }

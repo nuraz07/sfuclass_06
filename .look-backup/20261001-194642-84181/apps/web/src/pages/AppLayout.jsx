@@ -5,7 +5,6 @@ import ErrorBoundary from '../components/system/ErrorBoundary.jsx';
 import NotificationToasts from '../components/system/NotificationToasts.jsx';
 import DeletionBanner from '../components/system/DeletionBanner.jsx';
 import AppHeader from '../components/system/AppHeader.jsx';
-import { consumeSignOutIntent } from '../lib/signOutIntent.js';
 import '../styles/theme.css';
 import { cacheLocale, cachePreferences } from '../lib/preferences.js';
 import { onServiceWorkerMessage, resyncPush } from '../lib/pushClient.js';
@@ -110,8 +109,7 @@ function SessionWatch() {
 
   useEffect(() => {
     if (previous.current === 'authenticated' && SIGNED_OUT.has(status)) {
-      if (consumeSignOutIntent()) navigate('/', { replace: true });
-      else navigate('/login', { replace: true, state: { reason: 'signed-out' } });
+      navigate('/login', { replace: true, state: { reason: 'signed-out' } });
     }
     previous.current = status;
   }, [status, navigate]);

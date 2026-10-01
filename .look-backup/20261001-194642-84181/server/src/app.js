@@ -50,7 +50,6 @@ import roomRoutes from './routes/rooms.routes.js';
 import billingRoutes from './routes/billing.routes.js';
 import classroomRoutes from './routes/classroom.routes.js';
 import scheduledRoomsRoutes from './routes/scheduledRooms.routes.js';
-import usernameRoutes from './routes/username.routes.js';
 import filesRoutes from './routes/files.routes.js';
 import hubRoutes from './routes/hub.routes.js';
 import publicRoutes from './routes/public.routes.js';
@@ -147,7 +146,6 @@ export const createApp = () => {
   app.use('/internal', routeResolveRoutes);
   app.use('/classroom', classroomRoutes);
   app.use('/scheduled-rooms', scheduledRoomsRoutes); // Rooms
-  app.use('/account/username', usernameRoutes); // Sign in with a username
   app.use('/files', filesRoutes); // Files and Media
   app.use('/hub', hubRoutes); // Community
   app.use('/public', publicRoutes); // Landing: contact form

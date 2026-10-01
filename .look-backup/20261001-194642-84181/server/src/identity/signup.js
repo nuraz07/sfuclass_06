@@ -20,7 +20,6 @@
 import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
 import * as Users from './User.js';
-import * as Usernames from './Usernames.js';
 
 const log = logger.child({ component: 'signup' });
 
@@ -51,7 +50,7 @@ const TIME_ZONES = new Set(Intl.supportedValuesOf('timeZone'));
 /**
  * @returns the same as AuthService.login: { user, accessToken, refreshToken, sessionId, … }
  */
-export const registerOpen = async ({ displayName, email, password, username = null, timeZone = null, locale = null, device }) => {
+export const registerOpen = async ({ displayName, email, password, timeZone = null, locale = null, device }) => {
   if (signupMode() === 'closed') {
     fail('forbidden', 'New accounts cannot be created here. Ask your school or organisation for an invitation.');
   }
@@ -59,13 +58,6 @@ export const registerOpen = async ({ displayName, email, password, username = nu
   const address = String(email).trim();
   if (await Users.findCredentials(address)) {
     fail('conflict', 'An account with this email already exists.');
-  }
-
-  // An optional username, checked before the account exists so a taken name
-  // never leaves a half-made account behind.
-  if (username) {
-    const { available, problem } = await Usernames.check({ name: username });
-    if (!available) fail(problem === 'This username is taken.' ? 'conflict' : 'validation_failed', problem);
   }
 
   const tenantId = await resolveSignupTenant();
@@ -82,11 +74,6 @@ export const registerOpen = async ({ displayName, email, password, username = nu
     timeZone: timeZone && TIME_ZONES.has(timeZone) ? timeZone : 'UTC',
     device,
   });
-  if (username && result.user?.userId) {
-    await Usernames.setMine({ userId: result.user.userId, name: username }).catch((cause) =>
-      log.warn({ err: cause }, 'username not saved at sign-up; it can be chosen later'),
-    );
-  }
   log.info({ userId: result.user?.userId, tenantId }, 'account created from the homepage');
   return result;
 };

@@ -42,7 +42,6 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import * as AuthService from '../identity/AuthService.js';
-import { resolveLoginIdentifier } from '../identity/Usernames.js';
 import * as DeviceRegistry from '../identity/DeviceRegistry.js';
 import { env } from '../config/env.js';
 import { rateLimit } from '../middleware/rateLimit.js';
@@ -146,8 +145,7 @@ router.post(
   rateLimit({ key: 'auth:login', points: 10, durationSec: 300, by: ['ip', 'body.email'] }),
   validate({
     body: z.object({
-      // An email address, or a username (identity/Usernames.js resolves it).
-      email: z.string().trim().min(1).max(254),
+      email: z.string().email(),
       password: z.string().min(1).max(512),
       device: deviceSchema.optional(),
       // Mobile cannot use a cookie; it gets the refresh token in the body.
@@ -156,7 +154,7 @@ router.post(
   }),
   route(async (req, res) => {
     const tokens = await AuthService.login({
-      email: await resolveLoginIdentifier(req.body.email),
+      email: req.body.email,
       password: req.body.password,
       device: req.body.device ?? { platform: 'web' },
       ip: req.ip,
@@ -310,7 +308,7 @@ router.post(
 router.post(
   '/refresh',
   rateLimit({ key: 'auth:refresh', points: 60, durationSec: 300, by: ['ip'] }),
-  validate({ body: z.object({ refreshToken: z.string().min(1).optional(), sessionId: z.string().uuid().optional() }).default({}) }),
+  validate({ body: z.object({ refreshToken: z.string().min(1).optional() }).default({}) }),
   route(async (req, res) => {
     const presented = req.body.refreshToken ?? req.signedCookies?.[REFRESH_COOKIE];
     if (!presented) throw unauthorised('No refresh token presented');
@@ -431,7 +429,6 @@ router.post(
     body: z.object({
       displayName: z.string().trim().min(1).max(80),
       email: z.string().trim().email().max(254),
-      username: z.string().trim().max(30).optional(),
       password: z.string().min(1).max(512),
       timeZone: z.string().max(64).optional(),
       locale: z.string().max(12).optional(),
@@ -447,7 +444,6 @@ router.post(
       tokens = await registerOpen({
         displayName: req.body.displayName,
         email: req.body.email,
-        username: req.body.username || null,
         password: req.body.password,
         timeZone: req.body.timeZone ?? null,
         locale: req.body.locale ?? null,

@@ -1,34 +1,41 @@
-/* The app behind sign-in: "evening" theme  (Design)
+/* The app behind sign-in: the "daylight" theme  (Design)
  *
- * Calmer and lighter than before — a soft slate-teal instead of near-black,
- * gentle light from two corners, rounder surfaces, one warm accent — so the
- * app feels like a quiet room rather than a control panel.
+ * Light and calm, in the family of the homepage: a cool paper background,
+ * white surfaces, slate text, one blue for actions and the highlighter yellow
+ * for what is yours and what is current. The dark green of the earlier theme
+ * is gone.
  *
- * Only presentation, and only inside .app (AppLayout): the classroom, room
- * lobbies, sign-in and the homepage are not affected. It works by redefining
- * the same colour variables app.css and every page already use, so no
- * component changes and nothing about chat, calls or data is touched.
+ * Only presentation, and only inside .app (AppLayout). The classroom with its
+ * video stays dark on purpose — video reads better on dark — and so do room
+ * lobbies, sign-in and the homepage keep their own look.
  *
- * Still a dark-leaning theme on purpose: some pages (chat, community, media)
- * set light text of their own, and must stay readable.
+ * It works by setting the colour variables every stylesheet of the app
+ * already reads (app.css, media.css, profile.css, billing.css, builder.css,
+ * viewer.css, rooms.css, chat): no component changes, nothing about chat,
+ * calls or data is touched.
  */
 
 @import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,500..800&display=swap');
 
 .app {
-  --color-bg: #20363c;
-  --color-surface: #27434a;
-  --color-surface-2: #2f4f57;
-  --color-border: rgba(214, 232, 227, 0.13);
-  --color-text: #eef4f2;
-  --color-muted: #a8bcb9;
-  --color-accent: #5a7bf2;
-  --color-danger: #e5484d;
+  --color-bg: #f3f6f5;
+  --color-surface: #ffffff;
+  --color-surface-2: #f1f5f4;
+  --color-surface-raised: #ffffff;
+  --color-surface-sunken: #eaf0ee;
+  --color-border: #dbe4e1;
+  --color-text: #15272c;
+  --color-muted: #5d6f73;
+  --color-text-muted: #5d6f73;
+  --color-accent: #2f63d6;
+  --color-danger: #c93636;
+  --color-live: #1e9a77;
   --app-sun: #ffd54a;
+  --app-sun-soft: #fff3c4;
   --app-sun-ink: #2a2206;
   --app-ease: cubic-bezier(0.16, 1, 0.3, 1);
   --app-radius: 16px;
-  --app-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), 0 18px 40px -28px rgba(0, 0, 0, 0.55);
+  --app-shadow: 0 1px 2px rgba(20, 38, 43, 0.05), 0 10px 30px -18px rgba(20, 38, 43, 0.22);
   --font-sans: 'Atkinson Hyperlegible', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
 
   position: relative;
@@ -36,55 +43,81 @@
   color: var(--color-text);
   font-family: var(--font-sans);
   background:
-    radial-gradient(1100px 620px at 92% -8%, rgba(140, 200, 255, 0.11), transparent 62%),
-    radial-gradient(900px 520px at -8% 108%, rgba(255, 213, 74, 0.075), transparent 60%),
+    radial-gradient(1100px 600px at 95% -10%, rgba(47, 99, 214, 0.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(255, 213, 74, 0.1), transparent 60%),
     var(--color-bg);
   background-attachment: fixed;
+  color-scheme: light;
   -webkit-font-smoothing: antialiased;
 }
 
 .app ::selection { background: var(--app-sun); color: var(--app-sun-ink); }
-.app :focus-visible { outline: 3px solid var(--app-sun); outline-offset: 2px; border-radius: 8px; }
+.app :focus-visible { outline: 3px solid rgba(47, 99, 214, 0.45); outline-offset: 2px; border-radius: 8px; }
 
 /* ------------------------------------------------------------ top bar */
 
 .app .app__bar {
   position: sticky;
   top: 0;
-  z-index: 30;
+  z-index: 40;
   display: flex;
   align-items: center;
   gap: 18px;
   padding: 10px max(20px, calc((100% - 1280px) / 2));
   border-bottom: 1px solid var(--color-border);
-  background: rgba(32, 54, 60, 0.74);
-  backdrop-filter: blur(16px) saturate(1.4);
-  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(16px) saturate(1.5);
+  -webkit-backdrop-filter: blur(16px) saturate(1.5);
 }
 .app .app__brand { display: inline-flex; align-items: center; gap: 9px; color: var(--color-text); text-decoration: none; font: 780 19px/1 'Bricolage Grotesque', var(--font-sans); letter-spacing: -0.02em; }
 .app .app__mark { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; }
 .app .app__mark circle { fill: var(--app-sun); stroke: none; }
 
-.app .app__nav { display: flex; gap: 4px; margin: 0 auto; padding: 4px; border-radius: 999px; background: rgba(238, 242, 238, 0.05); font-size: 14.5px; }
+.app .app__nav { display: flex; gap: 4px; margin: 0 auto; padding: 4px; border-radius: 999px; background: var(--color-surface-2); font-size: 14.5px; }
 .app .app__nav a {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 8px 14px; border-radius: 999px;
   color: var(--color-muted); text-decoration: none;
-  transition: background-color 0.35s var(--app-ease), color 0.25s ease;
+  transition: background-color 0.35s var(--app-ease), color 0.25s ease, box-shadow 0.35s var(--app-ease);
 }
-.app .app__nav a:hover { color: var(--color-text); background: rgba(238, 242, 238, 0.06); }
-.app .app__nav a.active { color: var(--color-text); background: rgba(238, 242, 238, 0.12); box-shadow: inset 0 0 0 1px rgba(238, 242, 238, 0.08); }
+.app .app__nav a:hover { color: var(--color-text); background: rgba(20, 38, 43, 0.05); }
+.app .app__nav a.active { color: var(--color-text); background: #fff; box-shadow: 0 1px 2px rgba(20, 38, 43, 0.08), 0 4px 12px -6px rgba(20, 38, 43, 0.25); font-weight: 700; }
 .app .app__icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.app .app__nav a.active .app__icon { stroke: var(--app-sun); }
+.app .app__nav a.active .app__icon { stroke: var(--color-accent); }
 
-.app .app__me { display: inline-flex; align-items: center; gap: 10px; padding: 4px 12px 4px 4px; border-radius: 999px; color: var(--color-text); text-decoration: none; transition: background-color 0.3s var(--app-ease); }
-.app .app__me:hover { background: rgba(238, 242, 238, 0.07); }
-.app .app__avatar { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: linear-gradient(135deg, #ffd54a, #f2a93b); color: var(--app-sun-ink); font-weight: 700; font-size: 14px; }
+/* The profile button and its menu */
+.app .app__me-wrap { position: relative; }
+.app .app__me { display: inline-flex; align-items: center; gap: 10px; padding: 4px 12px 4px 4px; border: 1px solid transparent; border-radius: 999px; background: transparent; color: var(--color-text); font: inherit; cursor: pointer; transition: background-color 0.3s var(--app-ease), border-color 0.3s var(--app-ease); }
+.app .app__me:hover, .app .app__me[aria-expanded='true'] { background: var(--color-surface); border-color: var(--color-border); }
+.app .app__avatar { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; overflow: hidden; background: linear-gradient(135deg, #ffd54a, #f2a93b); color: var(--app-sun-ink); font-weight: 700; font-size: 14px; flex: 0 0 auto; }
+.app .app__avatar img { width: 100%; height: 100%; object-fit: cover; }
 .app .app__me-name { max-width: 14ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14.5px; }
+.app .app__caret { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; opacity: 0.6; transition: transform 0.35s var(--app-ease); }
+.app .app__me[aria-expanded='true'] .app__caret { transform: rotate(180deg); }
+
+.app .app__menu {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 60; min-width: 250px;
+  padding: 6px; border-radius: 16px; border: 1px solid var(--color-border);
+  background: #fff; box-shadow: 0 2px 6px rgba(20, 38, 43, 0.06), 0 24px 48px -20px rgba(20, 38, 43, 0.35);
+  transform-origin: top right; animation: app-menu 0.28s var(--app-ease) both;
+}
+@keyframes app-menu { from { opacity: 0; transform: translateY(-6px) scale(0.97); } to { opacity: 1; transform: none; } }
+.app .app__menu-head { display: flex; align-items: center; gap: 10px; padding: 10px 10px 12px; border-bottom: 1px solid var(--color-border); margin-bottom: 6px; }
+.app .app__menu-head strong { display: block; font-size: 15px; }
+.app .app__menu-head div span { display: block; font-size: 13px; color: var(--color-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px; }
+.app .app__menu a, .app .app__menu button.app__menu-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; border-radius: 10px;
+  background: none; color: var(--color-text); font: inherit; font-size: 14.5px; text-align: left; text-decoration: none; cursor: pointer;
+}
+.app .app__menu a:hover, .app .app__menu a:focus-visible, .app .app__menu button.app__menu-item:hover, .app .app__menu button.app__menu-item:focus-visible { background: var(--color-surface-2); outline: none; }
+.app .app__menu .app__icon { width: 17px; height: 17px; color: var(--color-muted); }
+.app .app__menu hr { border: 0; border-top: 1px solid var(--color-border); margin: 6px 4px; }
+.app .app__menu .app__menu-item--danger { color: var(--color-danger); }
+.app .app__menu .app__menu-item--danger .app__icon { color: var(--color-danger); }
 
 @media (max-width: 980px) {
-  .app .app__me-name { display: none; }
-  .app .app__me { padding-right: 4px; }
+  .app .app__me-name, .app .app__caret { display: none; }
+  .app .app__me { padding: 4px; }
 }
 @media (max-width: 760px) {
   .app .app__bar { gap: 10px; padding: 8px 12px; }
@@ -103,53 +136,74 @@
 .app .app__content h1 { font-family: 'Bricolage Grotesque', var(--font-sans); font-weight: 780; letter-spacing: -0.025em; }
 .app .app__content h2 { font-family: 'Bricolage Grotesque', var(--font-sans); letter-spacing: -0.015em; }
 
-.app .card {
-  border-radius: var(--app-radius);
-  background: linear-gradient(180deg, rgba(238, 242, 238, 0.03), transparent 40%), var(--color-surface);
-  box-shadow: var(--app-shadow);
-}
-
+.app .card { border-radius: var(--app-radius); background: var(--color-surface); border: 1px solid var(--color-border); box-shadow: var(--app-shadow); }
 .app .muted { color: var(--color-muted); }
 
-/* Buttons: same classes, softer surfaces and a lift on hover. */
+/* Buttons: the same classes, light surfaces and a lift on hover. */
 .app .btn {
-  background: var(--color-surface-2);
-  border-color: var(--color-border);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
   transition: background-color 0.25s ease, border-color 0.25s ease, transform 0.3s var(--app-ease), box-shadow 0.3s var(--app-ease);
 }
-.app .btn:hover:not(:disabled) { background: #37595f; border-color: rgba(214, 232, 227, 0.22); }
-.app a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; color: inherit; }
-
-/* The variants keep their colours over the base rule above. */
-.app .btn--primary, .app .btn--active { background: var(--color-accent); border-color: var(--color-accent); }
-.app .btn--danger { background: var(--color-danger); border-color: var(--color-danger); }
-.app .btn--off { background: #3a2f10; border-color: #574615; color: #fbbf24; }
+.app .btn:hover:not(:disabled) { background: var(--color-surface-2); border-color: #c8d4d0; }
 .app .btn:active:not(:disabled) { transform: scale(0.98); }
-.app .btn--primary, .app a.btn--primary { color: #fff; box-shadow: 0 8px 20px -12px rgba(90, 123, 242, 0.9); }
-.app .btn--primary:hover:not(:disabled) { background: #6a89f6; border-color: #6a89f6; transform: translateY(-1px); }
-.app .btn--danger { color: #fff; }
-.app .btn--danger:hover:not(:disabled) { background: #ec5c61; border-color: #ec5c61; }
+.app a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; color: inherit; }
+.app .btn--primary, .app .btn--active { background: var(--color-accent); border-color: var(--color-accent); color: #fff; }
+.app .btn--primary, .app a.btn--primary { color: #fff; box-shadow: 0 8px 20px -12px rgba(47, 99, 214, 0.9); }
+.app .btn--primary:hover:not(:disabled) { background: #2553bd; border-color: #2553bd; transform: translateY(-1px); }
+.app .btn--danger { background: var(--color-danger); border-color: var(--color-danger); color: #fff; }
+.app .btn--danger:hover:not(:disabled) { background: #b02d2d; border-color: #b02d2d; }
+.app .btn--off { background: #fff4d6; border-color: #f2d27a; color: #7a5600; }
 
-/* Fields everywhere inside the app get the same calm focus. */
+/* Fields everywhere inside the app. */
+.app input:not([type='checkbox']):not([type='radio']):not([type='range']),
+.app textarea,
+.app select {
+  background: #fff;
+  color: var(--color-text);
+  border-color: var(--color-border);
+}
 .app input:not([type='checkbox']):not([type='radio']):not([type='range']):focus,
 .app textarea:focus,
 .app select:focus {
   outline: none;
-  border-color: rgba(255, 213, 74, 0.7);
-  box-shadow: 0 0 0 3px rgba(255, 213, 74, 0.22);
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(47, 99, 214, 0.18);
 }
+.app ::placeholder { color: #8a9a9d; }
 
 .app .banner { border-radius: 12px; }
 
-/* Chat surfaces that use the shared classes: rounder, softer. */
-.app .bubble { border-radius: 14px; }
-.app .bubble--mine { color: #fff; }
+/* Shared chat bubbles (lesson chat, Messages). */
+.app .bubble { border-radius: 14px; background: var(--color-surface-2); color: var(--color-text); }
+.app .bubble--mine { background: var(--color-accent); color: #fff; }
 .app .thread__composer input { border-radius: 999px; }
 
-/* Quiet scrollbars. */
-.app * { scrollbar-width: thin; scrollbar-color: rgba(214, 232, 227, 0.22) transparent; }
+.app * { scrollbar-width: thin; scrollbar-color: #c4d0cc transparent; }
 
 @media (prefers-reduced-motion: reduce) {
-  .app .page { animation: none; }
-  .app .app__nav a, .app .btn, .app .app__me { transition: none; }
+  .app .page, .app .app__menu { animation: none; }
+  .app .app__nav a, .app .btn, .app .app__me, .app .app__caret { transition: none; }
 }
+
+/* The last hard-coded dark colours in app.css, in daylight. */
+.app .badge--joined { background: #dcf5e8; color: #13734f; }
+.app .badge--reconnecting { background: #fff3c4; color: #7a5600; }
+.app .badge--closed { background: #fde3e3; color: #a12a2a; }
+.app .banner--warn { background: #fff3c4; color: #6b4c00; }
+.app .bubble--failed { background: #fde3e3; color: var(--color-text); }
+
+/* Dialogs opened from the top bar (choose a username). */
+.app .app-dialog { border: 0; border-radius: 20px; padding: 0; width: min(440px, 92vw); color: var(--color-text); background: #fff; box-shadow: 0 30px 80px -30px rgba(20, 38, 43, 0.5); }
+.app .app-dialog::backdrop { background: rgba(20, 38, 43, 0.35); backdrop-filter: blur(3px); }
+.app .app-dialog[open] { animation: app-menu 0.3s var(--app-ease) both; }
+.app .app-dialog__body { display: grid; gap: 12px; padding: 22px; }
+.app .app-dialog__body h2 { margin: 0; font: 760 22px/1.2 'Bricolage Grotesque', var(--font-sans); }
+.app .app-dialog__body p { margin: 0; }
+.app .app-dialog__field { display: grid; gap: 6px; font-weight: 700; font-size: 14.5px; }
+.app .app-dialog__field input { padding: 11px 14px; border-radius: 12px; border: 1px solid var(--color-border); font: inherit; font-weight: 400; font-size: 15.5px; }
+.app .app-dialog__hint { min-height: 1.3em; font-size: 13.5px; color: var(--color-muted); }
+.app .app-dialog__error { font-size: 14px; color: var(--color-danger); }
+.app .app-dialog__actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
+.app .app__menu-head div span + span { margin-top: 1px; }

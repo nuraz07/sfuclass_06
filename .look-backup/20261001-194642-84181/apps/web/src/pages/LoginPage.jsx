@@ -19,9 +19,6 @@ import { passkeysSupported, signWithPasskey } from '../lib/webauthn.js';
  *
  * Afterwards it returns to ?next=, to where the visitor was sent from, or to
  * the dashboard — only ever to a path inside the app.
- *
- * The first field takes an email address or a username; the server tells
- * them apart by the "@" (identity/Usernames.js).
  */
 export default function LoginPage() {
   const { signIn, completeSignIn, passkeyOptions, signInWithPasskey, status } = useCore();
@@ -70,7 +67,7 @@ export default function LoginPage() {
           return;
         }
         // The server deliberately does not say which half was wrong.
-        setError(cause?.detail ?? 'The email, username or password is not right.');
+        setError(cause?.detail ?? 'Email or password is incorrect.');
       }
     });
   };
@@ -192,14 +189,10 @@ export default function LoginPage() {
         ) : null}
 
         <label className="au-field">
-          <span className="au-label">Email or username</span>
+          <span className="au-label">Email</span>
           <input
             className="au-input"
-            type="text"
-            inputMode="email"
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
+            type="email"
             autoComplete="username webauthn"
             value={email}
             onChange={(event) => setEmail(event.target.value)}

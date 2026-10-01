@@ -30,14 +30,3 @@ test('destinations after signing in never leave the app', () => {
   assert.equal(withNext('/signup', '/rooms/new'), '/signup?next=%2Frooms%2Fnew');
   assert.equal(withNext('/signup', '/'), '/signup');
 });
-
-import { usernameProblem } from '../authModel.js';
-
-test('usernames: the same rules as the server, and optional at sign-up', () => {
-  assert.equal(usernameProblem('anna.b'), null);
-  assert.match(usernameProblem('ab'), /At least 3/);
-  assert.match(usernameProblem('anna@x'), /"@"/);
-  assert.match(usernameProblem('an..na'), /two dots/);
-  assert.deepEqual(validateSignup({ displayName: 'Anna', email: 'anna@example.com', password: 'twelve chars!', username: '' }), {});
-  assert.ok(validateSignup({ displayName: 'Anna', email: 'anna@example.com', password: 'twelve chars!', username: '.x' }).username);
-});

@@ -11,7 +11,7 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-width: 1280px;
+  max-width: 820px;
   margin: 0 auto;
   height: calc(100dvh - 150px);
   min-height: 420px;
@@ -102,17 +102,3 @@
   .messages-page .bubble { max-width: 85%; }
 }
 @media (prefers-reduced-motion: reduce) { .msg-new { animation: none; } }
-
-/* Wide screens: the list and the conversation side by side. */
-.messages-split { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 14px; }
-.messages-split > .messages-page__panel { min-height: 0; }
-.messages-split__list .rooms-list { padding: 8px; }
-/* Beside the list, "back to the list" has nowhere to go. */
-.messages-split__chat .rooms-head > .btn:first-child { display: none; }
-.messages-split__chat .rooms-head { padding-left: 18px; }
-.messages-page .rooms-row--active { background: rgba(90, 123, 242, 0.14); box-shadow: inset 3px 0 0 var(--color-accent, #5a7bf2); }
-.messages-page .rooms-row--active:hover { background: rgba(90, 123, 242, 0.18); }
-.messages-split__empty { flex: 1; display: grid; place-content: center; justify-items: center; gap: 6px; padding: 24px; text-align: center; }
-.messages-split__empty span { font-size: 40px; }
-.messages-split__empty p { margin: 0; }
-.messages-split__title { font-weight: 700; font-size: 17px; }

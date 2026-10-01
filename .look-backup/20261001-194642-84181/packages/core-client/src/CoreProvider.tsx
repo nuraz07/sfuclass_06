@@ -140,7 +140,7 @@ export interface CoreContextValue {
   signIn(credentials: { email: string; password: string }): Promise<Session>;
   /** The second step with a code from the authenticator app or a recovery code. */
   /** Creates an account and signs it in (Landing). */
-  signUp(input: { displayName: string; email: string; password: string; username?: string | null }): Promise<Session>;
+  signUp(input: { displayName: string; email: string; password: string }): Promise<Session>;
   completeSignIn(input: { challengeId: string; code: string }): Promise<Session>;
   /** Options for a passkey: the second step (with a challengeId) or a sign-in on its own. */
   passkeyOptions(input?: { challengeId?: string | null }): Promise<PasskeyOptions>;
@@ -193,9 +193,10 @@ export function CoreProvider({
   const sessionIdRef = useRef<string | null>(null);
 
   const [session, setSession] = useState<Session | null>(null);
-  // The refresh cookie (httpOnly, set by the server at sign-in and renewed with
-  // every refresh) survives a reload: start in 'restoring' and ask once.
-  const [status, setStatus] = useState<AuthStatus>('restoring');
+  // Nothing persists across a reload, so there is no session to restore and no
+  // reason to start in 'restoring' and make everyone wait for a call that
+  // cannot succeed.
+  const [status, setStatus] = useState<AuthStatus>('anonymous');
 
   const sessionExpiredRef = useRef(onSessionExpired);
   sessionExpiredRef.current = onSessionExpired;
@@ -203,23 +204,6 @@ export function CoreProvider({
   // -------------------------------------------------------------------------
   // HTTP
   // -------------------------------------------------------------------------
-
-  /**
-   * One renewal through the refresh cookie. A Web Lock serialises renewals
-   * across tabs: the token rotates on every use, and two tabs presenting the
-   * same one at once would look like theft and end the session everywhere.
-   * Rejects when this browser has no valid session.
-   */
-  const renewViaCookie = async () => {
-    const run = async () => {
-      // A plain client: the main one would recurse, its 401 handling calls refresh().
-      const bare = createHttpClient({ baseUrl: apiUrl, credentials: 'include' });
-      return bare.post('/auth/refresh', {}, { anonymous: true, headers: await csrfHeaders(bare) });
-    };
-    const locks = (globalThis as { navigator?: { locks?: { request: (name: string, fn: () => Promise<unknown>) => Promise<unknown> } } })
-      .navigator?.locks;
-    return locks ? locks.request('classroom:session-refresh', run) : run();
-  };
 
   const http = useMemo<HttpClient>(() => {
     const auth: AuthProvider = {
@@ -233,13 +217,29 @@ export function CoreProvider({
        * whole session family.
        */
       async refresh() {
-        // Through the httpOnly cookie only. The token used to be sent from
-        // memory, but the route dropped its session id, so every renewal
-        // failed and people were signed out when the first access token ran out.
+        // No token in memory means there is nothing to refresh. Saying so here
+        // is better than asking the server to tell us the same thing with a
+        // 401 that then looks like a failure.
+        if (!refreshTokenRef.current || !sessionIdRef.current) return null;
+
         try {
-          const result = (await renewViaCookie()) as TokenResponse;
+          // A plain client, because using the outer one would recurse: its own
+          // 401 handling would call this method again.
+          const bare = createHttpClient({ baseUrl: apiUrl, credentials: 'include' });
+
+          const result = (await bare.post(
+            '/auth/refresh',
+            {
+              refreshToken: refreshTokenRef.current,
+              sessionId: sessionIdRef.current,
+            },
+            { anonymous: true, headers: await csrfHeaders(bare) },
+          )) as TokenResponse;
+
           accessTokenRef.current = result.accessToken;
-          refreshTokenRef.current = null;
+          // Rotation: the old token is spent, and presenting it again would
+          // look like theft.
+          if (result.refreshToken) refreshTokenRef.current = result.refreshToken;
           if (result.sessionId) sessionIdRef.current = result.sessionId;
 
           setSession(result.user);
@@ -273,28 +273,6 @@ export function CoreProvider({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiUrl, release]);
-
-  // On load: resume the session from the refresh cookie, once. A failure only
-  // means nobody is signed in on this browser.
-  useEffect(() => {
-    let cancelled = false;
-    renewViaCookie()
-      .then((result) => {
-        if (cancelled) return;
-        const tokens = result as TokenResponse;
-        accessTokenRef.current = tokens.accessToken;
-        if (tokens.sessionId) sessionIdRef.current = tokens.sessionId;
-        setSession(tokens.user);
-        setStatus('authenticated');
-      })
-      .catch(() => {
-        if (!cancelled) setStatus((current) => (current === 'restoring' ? 'anonymous' : current));
-      });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiUrl]);
 
   /**
    * Ensures a CSRF token exists and returns it as a header pair.
@@ -402,7 +380,7 @@ export function CoreProvider({
   );
 
   const signUp = useCallback<CoreContextValue['signUp']>(
-    async ({ displayName, email, password, username = null }) => {
+    async ({ displayName, email, password }) => {
       const headers = await csrfHeaders();
       let timeZone: string | undefined;
       try {
@@ -417,7 +395,6 @@ export function CoreProvider({
           displayName,
           email,
           password,
-          username: username || undefined,
           timeZone,
           locale: language ? language.slice(0, 2).toLowerCase() : undefined,
           device: { platform: 'web' },
@@ -476,7 +453,7 @@ export function CoreProvider({
       const headers = await csrfHeaders();
       await http.post(
         '/auth/logout',
-        {},
+        { refreshToken: refreshTokenRef.current, sessionId: sessionIdRef.current },
         { headers },
       );
     } catch (cause) {
