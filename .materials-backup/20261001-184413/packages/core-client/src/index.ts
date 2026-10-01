@@ -33,7 +33,6 @@ export * from './api/mediaApi.js';
 export * from './api/chatApi.js';
 export * from './api/profileApi.js';
 export * from './api/hubApi.js';
-export * from './api/filesApi.js';
 export * from './api/roomsApi.js';
 export * from './api/accountApi.js';
 export * from './api/accountSecurityApi.js';

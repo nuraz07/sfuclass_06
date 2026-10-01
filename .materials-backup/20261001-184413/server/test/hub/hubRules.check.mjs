@@ -112,18 +112,3 @@ test('part 2: cards, hidden solutions, chat removal', () => {
   assert.equal(canRemoveMessage({ authorId: 'a', viewerId: 'b', membership: { role: 'member' } }), false);
   assert.equal(canRemoveMessage({ authorId: 'a', viewerId: 'b', membership: { role: 'owner' } }), true);
 });
-
-import { canRemoveMaterial, MaterialSchema as Materials } from '../../src/hub/hubRules.js';
-
-test('materials: a link or a file, never both, never neither', () => {
-  const fileId = '00000000-0000-4000-8000-000000000001';
-  assert.equal(Materials.safeParse({ title: 'Docs', url: 'https://any-website.example/path?q=1' }).success, true);
-  assert.equal(Materials.safeParse({ fileId }).success, true);
-  assert.equal(Materials.safeParse({ title: 'Both', url: 'https://a.example', fileId }).success, false);
-  assert.equal(Materials.safeParse({ title: 'Neither' }).success, false);
-  assert.equal(Materials.safeParse({ url: 'https://a.example' }).success, false, 'a link needs a title');
-  assert.equal(Materials.safeParse({ title: 'x', url: 'ftp://a.example' }).success, false);
-  assert.equal(canRemoveMaterial({ addedBy: 'a', viewerId: 'a', membership: { role: 'member' } }), true);
-  assert.equal(canRemoveMaterial({ addedBy: 'a', viewerId: 'b', membership: { role: 'member' } }), false);
-  assert.equal(canRemoveMaterial({ addedBy: 'a', viewerId: 'b', membership: { role: 'moderator' } }), true);
-});

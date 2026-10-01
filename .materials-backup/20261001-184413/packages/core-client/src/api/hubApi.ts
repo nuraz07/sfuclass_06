@@ -180,28 +180,13 @@ export type HubCard = z.infer<typeof HubCardSchema>;
 export const HubMaterialSchema = z
   .object({
     materialId: z.string(),
-    type: z.enum(['link', 'file']).default('link'),
     title: z.string(),
-    url: z.string().nullable().default(null),
+    url: z.string(),
     host: z.string().nullable().default(null),
-    file: z
-      .object({
-        fileId: z.string(),
-        name: z.string().nullable(),
-        ext: z.string().nullable(),
-        kind: z.string().nullable(),
-        sizeBytes: z.number().nullable(),
-        available: z.boolean(),
-        openUrl: z.string().nullable(),
-      })
-      .passthrough()
-      .nullable()
-      .default(null),
     note: z.string().nullable().default(null),
     pinned: z.boolean().default(false),
     addedBy: z.string().nullable().default(null),
     createdAt: z.string().nullable(),
-    canRemove: z.boolean().default(false),
   })
   .passthrough();
 export type HubMaterial = z.infer<typeof HubMaterialSchema>;
@@ -363,12 +348,8 @@ export interface HubApi {
   createCard(spaceId: string, input: { title: string; body: string; postId?: string | null }): Promise<HubCard>;
   updateCard(cardId: string, patch: { title?: string; body?: string }): Promise<HubCard>;
   removeCard(cardId: string): Promise<unknown>;
-  materials(spaceId: string, signal?: AbortSignal): Promise<{ items: HubMaterial[]; canCurate: boolean; canAdd: boolean }>;
-  /** A link to any website ({ title, url }) or a file from your Media library ({ fileId }). */
-  addMaterial(
-    spaceId: string,
-    input: { title?: string | null; url?: string | null; fileId?: string | null; note?: string | null; pinned?: boolean },
-  ): Promise<HubMaterial>;
+  materials(spaceId: string, signal?: AbortSignal): Promise<{ items: HubMaterial[]; canCurate: boolean }>;
+  addMaterial(spaceId: string, input: { title: string; url: string; note?: string | null; pinned?: boolean }): Promise<HubMaterial>;
   pinMaterial(materialId: string, pinned: boolean): Promise<HubMaterial>;
   removeMaterial(materialId: string): Promise<unknown>;
   chat(spaceId: string, after?: string | null, signal?: AbortSignal): Promise<z.infer<typeof ChatPageSchema>>;
@@ -441,7 +422,7 @@ export const createHubApi = (http: HttpClient): HubApi => ({
   removeCard: (cardId) => http.delete(`/hub/cards/${enc(cardId)}`),
   materials: (spaceId, signal) =>
     http.get(`/hub/spaces/${enc(spaceId)}/materials`, {
-      schema: z.object({ items: z.array(HubMaterialSchema), canCurate: z.boolean().default(false), canAdd: z.boolean().default(false) }).passthrough(),
+      schema: z.object({ items: z.array(HubMaterialSchema), canCurate: z.boolean().default(false) }).passthrough(),
       signal,
     }),
   addMaterial: (spaceId, input) => http.post(`/hub/spaces/${enc(spaceId)}/materials`, input, { schema: HubMaterialSchema, ...once }),

@@ -120,24 +120,14 @@ export const safeUrl = (value) => {
   }
 };
 
-/**
- * A material is a link to any website, or a file from the person's Media
- * library (Files) — exactly one of the two. A file's title defaults to its name.
- */
 export const MaterialSchema = z
   .object({
-    title: z.string().trim().max(120).nullish(),
-    url: z.string().trim().max(2000).refine((value) => safeUrl(value) !== null, 'a web address starting with https://').nullish(),
-    fileId: z.string().uuid().nullish(),
+    title: z.string().trim().min(1).max(120),
+    url: z.string().trim().max(2000).refine((value) => safeUrl(value) !== null, 'a web address starting with https://'),
     note: z.string().trim().max(300).nullish(),
     pinned: z.boolean().default(false),
   })
-  .strict()
-  .refine((value) => Boolean(value.url) !== Boolean(value.fileId), { message: 'Either a link or a file.', path: ['url'] })
-  .refine((value) => Boolean(value.fileId) || Boolean(value.title), { message: 'Give the link a title.', path: ['title'] });
-
-/** Every member adds materials; whoever added one, or a moderator, removes it. */
-export const canRemoveMaterial = ({ addedBy, viewerId, membership }) => addedBy === viewerId || isModerator(membership);
+  .strict();
 
 export const ChatMessageSchema = z.object({ body: z.string().trim().min(1).max(2000) }).strict();
 
@@ -236,7 +226,7 @@ export const excerpt = (text, length = 180) => {
 
 export default {
   KINDS, ACCESS, ROLES, CreateSpaceSchema, UpdateSpaceSchema, CreateThreadSchema, ReplySchema, ReportSchema,
-  CardSchema, UpdateCardSchema, MaterialSchema, ChatMessageSchema, safeUrl, canCurate, canRemoveMessage, solutionFolded, canRemoveMaterial,
+  CardSchema, UpdateCardSchema, MaterialSchema, ChatMessageSchema, safeUrl, canCurate, canRemoveMessage, solutionFolded,
   isModerator, hasEnded, viewOf, postingBlockedBecause, canCreateKind, memberListVisible, authorView,
   canMarkAnswer, canRemove, roomForMember, excerpt,
 };

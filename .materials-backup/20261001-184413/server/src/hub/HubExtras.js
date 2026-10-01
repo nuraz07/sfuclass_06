@@ -4,8 +4,7 @@
  *
  *   knowledge cards   moderators save a good answer as a card; everyone in the
  *                     space can search the cards later
- *   materials         links to any website and files from members' Media
- *                     libraries, pinned ones first; files open in a new tab
+ *   materials         links the space keeps at hand, pinned ones first
  *   chat              quick messages in a space, next to the threads
  *   rooms             drop-in rooms that belong to the space: any member can
  *                     start one; they use the rooms feature (doors, seats,
@@ -113,122 +112,65 @@ export const removeCard = async ({ viewer, cardId }) => {
 // Materials
 // ---------------------------------------------------------------------------
 
-const toMaterial = (row, { viewer = null, membership = null, openPath = null } = {}) => {
+const toMaterial = (row) => {
   let host = null;
-  if (row.url) {
-    try {
-      host = new URL(row.url).hostname.replace(/^www\./, '');
-    } catch {
-      host = null;
-    }
+  try {
+    host = new URL(row.url).hostname.replace(/^www\./, '');
+  } catch {
+    host = null;
   }
-  const isFile = Boolean(row.file_id);
-  const fileReady = isFile && row.file_status === 'ready' && !row.file_deleted_at;
   return {
     materialId: row.id,
-    type: isFile ? 'file' : 'link',
-    title: row.title || row.file_name || 'File',
-    url: row.url ?? null,
+    title: row.title,
+    url: row.url,
     host,
-    file: isFile
-      ? {
-          fileId: row.file_id,
-          name: row.file_name ?? null,
-          ext: row.file_ext ?? null,
-          kind: row.file_kind ?? null,
-          sizeBytes: row.file_size !== undefined && row.file_size !== null ? Number(row.file_size) : null,
-          available: fileReady,
-          openUrl: fileReady && openPath ? openPath(row.file_id) : null,
-        }
-      : null,
     note: row.note ?? null,
     pinned: Boolean(row.pinned),
-    addedBy: row.author_name ?? row.added_by_name ?? null,
+    addedBy: row.author_name ?? null,
     createdAt: iso(row.created_at),
-    canRemove: viewer ? Rules.canRemoveMaterial({ addedBy: row.added_by, viewerId: viewer.userId, membership }) : false,
   };
 };
-
-const MATERIAL_SELECT = `
-  SELECT m.*, u.display_name AS author_name,
-         f.name AS file_name, f.ext AS file_ext, f.kind AS file_kind, f.size_bytes AS file_size,
-         f.status AS file_status, f.deleted_at AS file_deleted_at
-    FROM space_materials m
-    LEFT JOIN users u ON u.id = m.added_by
-    LEFT JOIN files f ON f.id = m.file_id`;
-
-const filesModule = () => import('../files/FileService.js');
 
 export const listMaterials = async ({ viewer, spaceId }) => {
-  const { space, membership } = await requireFullView(viewer, spaceId);
+  const { membership } = await requireFullView(viewer, spaceId);
   const { rows } = await pool.query(
-    `${MATERIAL_SELECT} WHERE m.space_id = $1 AND m.deleted_at IS NULL ORDER BY m.pinned DESC, m.created_at DESC LIMIT 200`,
+    `SELECT m.*, u.display_name AS author_name FROM space_materials m LEFT JOIN users u ON u.id = m.added_by
+      WHERE m.space_id = $1 AND m.deleted_at IS NULL ORDER BY m.pinned DESC, m.created_at DESC LIMIT 200`,
     [spaceId],
   );
-  const { openPath } = await filesModule();
-  return {
-    items: rows.map((row) => toMaterial(row, { viewer, membership, openPath })),
-    canCurate: Rules.canCurate(membership),
-    canAdd: Boolean(membership) && !Rules.postingBlockedBecause(space, membership),
-  };
+  return { items: rows.map(toMaterial), canCurate: Rules.canCurate(membership) };
 };
 
-/** Any member adds a link to any website, or a file from their own Media library. */
 export const addMaterial = async ({ viewer, spaceId, input }) => {
-  const { space, membership } = await requireFullView(viewer, spaceId);
-  const blocked = Rules.postingBlockedBecause(space, membership);
-  if (blocked) fail('forbidden', blocked);
-  let url = null;
-  let title = input.title ?? null;
-  let fileId = null;
-  if (input.fileId) {
-    const { rows } = await pool.query(
-      `SELECT id, name FROM files WHERE id = $1 AND owner_id = $2 AND status = 'ready' AND deleted_at IS NULL`,
-      [input.fileId, viewer.userId],
-    );
-    if (!rows[0]) fail('not_found', 'That file is not among your uploads.');
-    fileId = rows[0].id;
-    title = title || rows[0].name;
-  } else {
-    url = Rules.safeUrl(input.url);
-    if (!url) fail('validation_failed', 'A web address starting with https:// is needed.');
-  }
-  const pinned = Boolean(input.pinned) && Rules.isModerator(membership);
+  const { membership } = await requireFullView(viewer, spaceId);
+  if (!Rules.canCurate(membership)) fail('forbidden', 'Only moderators add materials.');
+  const url = Rules.safeUrl(input.url);
+  if (!url) fail('validation_failed', 'A web address starting with https:// is needed.');
   const { rows } = await pool.query(
-    `INSERT INTO space_materials (space_id, title, url, file_id, note, pinned, added_by, added_by_name)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-    [spaceId, title, url, fileId, input.note ?? null, pinned, viewer.userId, viewer.displayName],
+    `INSERT INTO space_materials (space_id, title, url, note, pinned, added_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [spaceId, input.title, url, input.note ?? null, Boolean(input.pinned), viewer.userId],
   );
-  const { rows: full } = await pool.query(`${MATERIAL_SELECT} WHERE m.id = $1`, [rows[0].id]);
-  const { openPath } = await filesModule();
-  return toMaterial(full[0], { viewer, membership, openPath });
+  return toMaterial({ ...rows[0], author_name: viewer.displayName });
 };
 
 const loadMaterial = async (viewer, materialId) => {
   const { rows } = await pool.query(`SELECT * FROM space_materials WHERE id = $1 AND deleted_at IS NULL`, [materialId]);
   if (!rows[0]) fail('not_found', 'No such material');
   const { membership } = await requireFullView(viewer, rows[0].space_id);
-  return { material: rows[0], membership };
+  if (!Rules.canCurate(membership)) fail('forbidden', 'Only moderators change materials.');
+  return rows[0];
 };
 
 export const pinMaterial = async ({ viewer, materialId, pinned }) => {
-  const { material, membership } = await loadMaterial(viewer, materialId);
-  if (!Rules.canCurate(membership)) fail('forbidden', 'Only moderators pin materials.');
-  await pool.query(`UPDATE space_materials SET pinned = $2 WHERE id = $1`, [material.id, Boolean(pinned)]);
-  const { rows } = await pool.query(`${MATERIAL_SELECT} WHERE m.id = $1`, [material.id]);
-  const { openPath } = await filesModule();
-  return toMaterial(rows[0], { viewer, membership, openPath });
+  const material = await loadMaterial(viewer, materialId);
+  const { rows } = await pool.query(`UPDATE space_materials SET pinned = $2 WHERE id = $1 RETURNING *`, [material.id, Boolean(pinned)]);
+  return toMaterial(rows[0]);
 };
 
 export const removeMaterial = async ({ viewer, materialId }) => {
-  const { material, membership } = await loadMaterial(viewer, materialId);
-  if (!Rules.canRemoveMaterial({ addedBy: material.added_by, viewerId: viewer.userId, membership })) {
-    fail('forbidden', 'Only the person who added it, or a moderator, removes a material.');
-  }
+  const material = await loadMaterial(viewer, materialId);
   await pool.query(`UPDATE space_materials SET deleted_at = now() WHERE id = $1`, [material.id]);
-  if (material.added_by !== viewer.userId) {
-    await logAction(material.space_id, viewer.userId, 'material.remove', { detail: { title: material.title } });
-  }
+  await logAction(material.space_id, viewer.userId, 'material.remove', { detail: { title: material.title } });
   return { removed: true };
 };
 

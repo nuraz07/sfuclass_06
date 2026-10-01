@@ -347,22 +347,3 @@ textarea.hb-input { resize: vertical; line-height: 1.5; }
 @media (prefers-reduced-motion: reduce) { .hb-nudge { animation: none; } .hb-slot { transition: none; } }
 .hb-member__name .hb-muted { font-weight: 400; }
 .hb-partners .hb-block + .hb-profile-line, .hb-partners .hb-block + .hb-fieldset { margin-top: 22px; }
-
-/* ================================================================ materials: links and files */
-
-.hb-matadd { display: grid; gap: 12px; padding: 16px; margin-bottom: 16px; border-radius: 18px; background: var(--color-surface, #27434a); border: 1px solid var(--color-border, rgba(214, 232, 227, 0.13)); }
-.hb-matadd .hb-segment { justify-self: start; }
-.hb-matadd__form { display: grid; gap: 10px; animation: hb-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) both; }
-.hb-pick { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 260px; overflow-y: auto; }
-.hb-pick button { width: 100%; display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 10px; border: 0; border-radius: 10px; background: transparent; color: inherit; font: inherit; font-size: 14.5px; text-align: left; cursor: pointer; }
-.hb-pick button:hover, .hb-pick button:focus-visible { background: rgba(238, 242, 238, 0.07); }
-.hb-pick__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
-.hb-material__open { margin-left: auto; color: var(--color-muted, #a8bcb9); font-size: 16px; transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
-.hb-material__link:hover .hb-material__open { transform: translate(2px, -2px); }
-.hb-material__icon--document { background: rgba(140, 170, 255, 0.16); }
-.hb-material__icon--image { background: rgba(127, 214, 180, 0.16); }
-.hb-material__icon--video { background: rgba(190, 150, 255, 0.16); }
-.hb-material__icon--audio { background: rgba(255, 213, 74, 0.16); }
-.hb-material__icon--text { background: rgba(127, 214, 180, 0.12); }
-.hb-material__link.is-missing { opacity: 0.65; cursor: default; }
-@media (prefers-reduced-motion: reduce) { .hb-matadd__form { animation: none; } .hb-material__open { transition: none; } }

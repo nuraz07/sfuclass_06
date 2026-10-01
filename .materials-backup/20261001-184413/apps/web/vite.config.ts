@@ -140,17 +140,6 @@ export default defineConfig(({ mode }) => {
           ws: true,
           changeOrigin: true,
         },
-        /**
-         * Files: signed upload URLs point at local MinIO (localhost:9000), which a
-         * browser outside this machine cannot reach. The page sends them here
-         * instead; the Host header is rewritten to MinIO's, so the signature holds.
-         * Set VITE_DEV_S3_TARGET to the same address as S3_ENDPOINT.
-         */
-        '/s3': {
-          target: env.VITE_DEV_S3_TARGET || 'http://localhost:9000',
-          changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/s3(?=\/|$)/, '') || '/',
-        },
       },
     },
 
