@@ -2,9 +2,7 @@
  * Community API  (Community, part 1)
  *
  * Spaces, membership, threads, questions and reports — and, since part 2,
- * knowledge cards, materials, a chat per space and the space's rooms — and,
- * since part 3, study partners, posts that wait until morning, calm mode,
- * per-space notification modes and the moderators' log.
+ * knowledge cards, materials, a chat per space and the space's rooms.
  * Paths are the server's
  * (server/src/routes/hub.routes.js, mounted under /hub). Responses are
  * validated loosely (passthrough): the server shapes every view, including
@@ -13,8 +11,6 @@
 
 import { z } from 'zod';
 import type { HttpClient } from '../http/httpClient.js';
-
-const Badge = z.object({ level: z.string(), label: z.string() }).nullable().default(null);
 
 const Author = z
   .object({
@@ -40,7 +36,6 @@ export const HubSpaceSchema = z
     endsAt: z.string().nullable().default(null),
     emoji: z.string().nullable().default(null),
     tags: z.array(z.string()).default([]),
-    chatSlowSeconds: z.number().default(0),
     courseId: z.string().nullable().default(null),
     memberCount: z.number().default(0),
     newActivity: z.number().default(0),
@@ -57,7 +52,6 @@ export const HubSpaceSchema = z
         postingBlocked: z.string().nullable(),
         timeoutUntil: z.string().nullable().default(null),
         request: z.string().nullable().default(null),
-        notifyMode: z.string().nullable().default(null),
       })
       .passthrough()
       .optional(),
@@ -90,7 +84,6 @@ export type HubThreadSummary = z.infer<typeof HubThreadSummarySchema>;
 export const HubThreadSchema = HubThreadSummarySchema.extend({
   space: z.object({ spaceId: z.string(), name: z.string(), emoji: z.string().nullable(), kind: z.string() }).passthrough(),
   answeredPostId: z.string().nullable().default(null),
-  calm: z.object({ slowSeconds: z.number().default(0), waitSeconds: z.number().default(0) }).passthrough().default({ slowSeconds: 0, waitSeconds: 0 }),
   posts: z.array(
     z
       .object({
@@ -105,7 +98,6 @@ export const HubThreadSchema = HubThreadSummarySchema.extend({
         canRemove: z.boolean().default(false),
         hiddenSolution: z.boolean().default(false),
         folded: z.boolean().default(false),
-        badge: Badge,
       })
       .passthrough(),
   ),
@@ -138,7 +130,6 @@ const MembersSchema = z
           joinedAt: z.string().nullable(),
           you: z.boolean().default(false),
           timeoutUntil: z.string().nullable().optional(),
-          badge: Badge,
         })
         .passthrough(),
     ),
@@ -208,70 +199,8 @@ const ChatPageSchema = z
     items: z.array(HubMessageSchema),
     nextCursor: z.string().nullable().default(null),
     postingBlocked: z.string().nullable().default(null),
-    calmSeconds: z.number().default(0),
-    canModerate: z.boolean().default(false),
   })
   .passthrough();
-
-export const StudyProfileSchema = z
-  .object({
-    exists: z.boolean(),
-    active: z.boolean(),
-    subjects: z.array(z.string()),
-    availability: z.array(z.string()),
-    note: z.string().nullable().default(null),
-  })
-  .passthrough();
-export type StudyProfile = z.infer<typeof StudyProfileSchema>;
-
-const SuggestionsSchema = z
-  .object({
-    needsProfile: z.boolean(),
-    items: z.array(
-      z
-        .object({ userId: z.string(), displayName: z.string(), note: z.string().nullable().default(null), reasons: z.array(z.string()) })
-        .passthrough(),
-    ),
-  })
-  .passthrough();
-
-const PartnersSchema = z
-  .object({
-    partners: z.array(z.object({ userId: z.string(), displayName: z.string(), since: z.string().nullable(), sharedTimes: z.array(z.string()) }).passthrough()),
-    incoming: z.array(z.object({ userId: z.string(), displayName: z.string(), message: z.string().nullable().default(null), at: z.string().nullable() }).passthrough()),
-    outgoing: z.array(z.object({ userId: z.string(), displayName: z.string(), at: z.string().nullable() }).passthrough()),
-  })
-  .passthrough();
-export type PartnersPage = z.infer<typeof PartnersSchema>;
-
-export const ScheduledSchema = z
-  .object({ scheduledId: z.string(), kind: z.string(), sendAt: z.string(), preview: z.string(), targetId: z.string().optional() })
-  .passthrough();
-export type ScheduledPost = z.infer<typeof ScheduledSchema>;
-
-const LogSchema = z
-  .object({
-    items: z.array(
-      z
-        .object({
-          entryId: z.string(),
-          action: z.string(),
-          label: z.string(),
-          actorName: z.string(),
-          targetName: z.string().nullable().default(null),
-          detail: z.record(z.string(), z.unknown()).default({}),
-          at: z.string().nullable(),
-        })
-        .passthrough(),
-    ),
-  })
-  .passthrough();
-export type HubLog = z.infer<typeof LogSchema>;
-
-export type ScheduleInput =
-  | { kind: 'reply'; targetId: string; body: string; hiddenSolution?: boolean }
-  | { kind: 'thread'; targetId: string; title: string; body: string; threadKind?: 'discussion' | 'question'; anonymous?: boolean }
-  | { kind: 'chat'; targetId: string; body: string };
 
 const HomeSchema = z
   .object({
@@ -357,22 +286,6 @@ export interface HubApi {
   removeChat(messageId: string): Promise<unknown>;
   rooms(spaceId: string, signal?: AbortSignal): Promise<{ items: HubRoom[] }>;
   dropIn(spaceId: string): Promise<{ room: HubRoom; started: boolean }>;
-  // Part 3
-  studyProfile(signal?: AbortSignal): Promise<StudyProfile>;
-  saveStudyProfile(input: { active: boolean; subjects: string[]; availability: string[]; note?: string | null }): Promise<StudyProfile>;
-  studySuggestions(signal?: AbortSignal): Promise<z.infer<typeof SuggestionsSchema>>;
-  partners(signal?: AbortSignal): Promise<PartnersPage>;
-  requestPartner(userId: string, message?: string | null): Promise<unknown>;
-  respondPartner(userId: string, accept: boolean): Promise<unknown>;
-  endPartner(userId: string): Promise<unknown>;
-  studyNow(userId: string): Promise<{ code: string }>;
-  scheduled(signal?: AbortSignal): Promise<{ items: ScheduledPost[] }>;
-  schedule(input: ScheduleInput): Promise<ScheduledPost>;
-  cancelScheduled(scheduledId: string): Promise<unknown>;
-  setThreadCalm(threadId: string, seconds: number): Promise<HubThread>;
-  setChatCalm(spaceId: string, seconds: number): Promise<unknown>;
-  setNotifyMode(spaceId: string, mode: 'each' | 'daily' | 'off'): Promise<unknown>;
-  log(spaceId: string, signal?: AbortSignal): Promise<HubLog>;
 }
 
 const enc = encodeURIComponent;
@@ -438,20 +351,4 @@ export const createHubApi = (http: HttpClient): HubApi => ({
       schema: z.object({ room: HubRoomSchema, started: z.boolean() }).passthrough(),
       ...once,
     }),
-
-  studyProfile: (signal) => http.get('/hub/study/profile', { schema: StudyProfileSchema, signal }),
-  saveStudyProfile: (input) => http.put('/hub/study/profile', input, { schema: StudyProfileSchema }),
-  studySuggestions: (signal) => http.get('/hub/study/suggestions', { schema: SuggestionsSchema, signal }),
-  partners: (signal) => http.get('/hub/study/partners', { schema: PartnersSchema, signal }),
-  requestPartner: (userId, message = null) => http.post(`/hub/study/requests/${enc(userId)}`, { message }, once),
-  respondPartner: (userId, accept) => http.post(`/hub/study/requests/${enc(userId)}/respond`, { accept }, once),
-  endPartner: (userId) => http.delete(`/hub/study/partners/${enc(userId)}`),
-  studyNow: (userId) => http.post(`/hub/study/partners/${enc(userId)}/room`, {}, { schema: z.object({ code: z.string() }).passthrough(), ...once }),
-  scheduled: (signal) => http.get('/hub/scheduled', { schema: Items(ScheduledSchema), signal }),
-  schedule: (input) => http.post('/hub/scheduled', input, { schema: ScheduledSchema, ...once }),
-  cancelScheduled: (scheduledId) => http.delete(`/hub/scheduled/${enc(scheduledId)}`),
-  setThreadCalm: (threadId, seconds) => http.patch(`/hub/threads/${enc(threadId)}/calm`, { seconds }, { schema: HubThreadSchema }),
-  setChatCalm: (spaceId, seconds) => http.patch(`/hub/spaces/${enc(spaceId)}/chat/calm`, { seconds }),
-  setNotifyMode: (spaceId, mode) => http.patch(`/hub/spaces/${enc(spaceId)}/notify`, { mode }),
-  log: (spaceId, signal) => http.get(`/hub/spaces/${enc(spaceId)}/log`, { schema: LogSchema, signal }),
 });

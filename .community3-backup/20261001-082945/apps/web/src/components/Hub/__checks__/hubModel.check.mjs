@@ -68,25 +68,3 @@ test('day labels and safe links', () => {
   assert.equal(normalizeUrl('localhost'), null);
   assert.equal(normalizeUrl(''), null);
 });
-
-import { calmLabel, isLateNight, logLine, morningLabel, parseSubjects, toggleSlot, waitLabel } from '../hubModel.js';
-
-test('part 3: late at night, morning labels', () => {
-  assert.equal(isLateNight(new Date(2026, 2, 10, 23, 15)), true);
-  assert.equal(isLateNight(new Date(2026, 2, 10, 6, 0)), true);
-  assert.equal(isLateNight(new Date(2026, 2, 10, 14, 0)), false);
-  const now = new Date(2026, 2, 10, 23, 0);
-  assert.match(morningLabel(new Date(2026, 2, 11, 8, 0), now, 'en-GB'), /^tomorrow at 08:00$/);
-  assert.match(morningLabel(new Date(2026, 2, 10, 8, 0), new Date(2026, 2, 10, 6, 0), 'en-GB'), /^today at 08:00$/);
-});
-
-test('part 3: calm mode, subjects, slots, log lines', () => {
-  assert.equal(calmLabel(0), null);
-  assert.match(calmLabel(300), /every 5 minutes/);
-  assert.equal(waitLabel(61), 'You can write again in 2 minutes.');
-  assert.deepEqual(parseSubjects('Maths, physics,maths'), ['maths', 'physics']);
-  assert.deepEqual(toggleSlot(['tue-evening'], 'tue-evening'), []);
-  assert.deepEqual(toggleSlot([], 'sat-morning'), ['sat-morning']);
-  assert.equal(logLine({ actorName: 'Ms Okafor', label: 'paused posting', action: 'member.pause', targetName: 'Anna', detail: { minutes: 60 } }), 'Ms Okafor paused posting (Anna) for 1 h');
-  assert.equal(logLine({ actorName: 'Ms Okafor', label: 'changed calm mode', action: 'thread.calm', detail: { seconds: 300, title: 'Phones' } }), 'Ms Okafor changed calm mode: “Phones” to 5 min');
-});

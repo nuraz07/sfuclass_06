@@ -20,35 +20,8 @@ import { randomUUID } from 'node:crypto';
 import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
 import * as Rules from './hubRules.js';
-import * as Part3 from './partRules.js';
 
 const log = logger.child({ component: 'community-hub' });
-
-/** Part 3: what moderators did, for the space's log. Never blocks the action itself. */
-const logAction = (spaceId, actorId, action, { targetType = null, targetId = null, detail = {} } = {}) =>
-  pool
-    .query(
-      `INSERT INTO space_log (space_id, actor_id, action, target_type, target_id, detail) VALUES ($1, $2, $3, $4, $5, $6)`,
-      [spaceId, actorId, action, targetType, targetId, JSON.stringify(detail)],
-    )
-    .catch((cause) => log.warn({ err: cause, action }, 'space log entry not written'));
-
-/** Part 3: accepted answers per person in one space, for helper badges. */
-const badgesFor = async (spaceId, userIds) => {
-  const ids = [...new Set(userIds)].filter(Boolean);
-  if (!ids.length) return new Map();
-  const { rows } = await pool
-    .query(
-      `SELECT p.author_id, count(*)::int AS n
-         FROM threads t JOIN posts p ON p.id = t.answered_post_id
-        WHERE t.space_id = $1 AND t.deleted_at IS NULL AND p.deleted_at IS NULL AND p.author_id = ANY($2::uuid[])
-          AND NOT (t.anonymous AND p.author_id = t.author_id)
-        GROUP BY p.author_id`,
-      [spaceId, ids],
-    )
-    .catch(() => ({ rows: [] }));
-  return new Map(rows.map((row) => [row.author_id, Part3.helperLevel(row.n)]).filter(([, badge]) => badge));
-};
 
 const fail = (code, message) => {
   throw Object.assign(new Error(message), { code });
@@ -150,7 +123,6 @@ const toSpace = (row) => ({
   endsAt: iso(row.ends_at),
   emoji: row.emoji ?? null,
   tags: row.tags ?? [],
-  chatSlowSeconds: row.chat_slow_seconds ?? 0,
   courseId: row.course_id ?? null,
   archivedAt: iso(row.archived_at),
   createdAt: iso(row.created_at),
@@ -158,18 +130,12 @@ const toSpace = (row) => ({
 
 const membershipOf = async (spaceId, userId, client = pool) => {
   const { rows } = await client.query(
-    `SELECT role, joined_at, last_seen_at, timeout_until, notify_mode FROM space_memberships WHERE space_id = $1 AND user_id = $2`,
+    `SELECT role, joined_at, last_seen_at, timeout_until FROM space_memberships WHERE space_id = $1 AND user_id = $2`,
     [spaceId, userId],
   );
   const row = rows[0];
   return row
-    ? {
-        role: row.role,
-        joinedAt: iso(row.joined_at),
-        lastSeenAt: iso(row.last_seen_at),
-        timeoutUntil: iso(row.timeout_until),
-        notifyMode: row.notify_mode ?? 'each',
-      }
+    ? { role: row.role, joinedAt: iso(row.joined_at), lastSeenAt: iso(row.last_seen_at), timeoutUntil: iso(row.timeout_until) }
     : null;
 };
 
@@ -249,7 +215,6 @@ export const getSpace = async ({ viewer, spaceId }) => {
       postingBlocked: Rules.postingBlockedBecause(space, membership),
       timeoutUntil: membership?.timeoutUntil ?? null,
       request: listed.myRequest,
-      notifyMode: membership?.notifyMode ?? null,
     },
   };
 };
@@ -299,10 +264,7 @@ export const updateSpace = async ({ viewer, spaceId, patch }) => {
     params.push(patch[key]);
     sets.push(`${column} = $${params.length}`);
   }
-  if (sets.length) {
-    await pool.query(`UPDATE spaces SET ${sets.join(', ')}, updated_at = now() WHERE id = $1`, params);
-    await logAction(spaceId, viewer.userId, 'space.update', { detail: { fields: Object.keys(patch).filter((key) => patch[key] !== undefined) } });
-  }
+  if (sets.length) await pool.query(`UPDATE spaces SET ${sets.join(', ')}, updated_at = now() WHERE id = $1`, params);
   return getSpace({ viewer, spaceId });
 };
 
@@ -310,7 +272,6 @@ export const archiveSpace = async ({ viewer, spaceId }) => {
   const { membership } = await loadSpace(viewer, spaceId);
   if (membership?.role !== 'owner') fail('forbidden', 'Only the owner can archive the space.');
   await pool.query(`UPDATE spaces SET archived_at = now(), updated_at = now() WHERE id = $1`, [spaceId]);
-  await logAction(spaceId, viewer.userId, 'space.archive');
   return { archived: true };
 };
 
@@ -418,7 +379,6 @@ export const decideRequest = async ({ viewer, spaceId, userId, approve }) => {
       await addMember(client, { spaceId, userId, tenantId: viewer.tenantId });
     }
   });
-  await logAction(spaceId, viewer.userId, approve ? 'request.approve' : 'request.decline', { targetType: 'user', targetId: userId });
   if (approve) {
     await notify({
       userIds: [userId],
@@ -448,7 +408,6 @@ export const invite = async ({ viewer, spaceId, userIds }) => {
       if (await addMember(client, { spaceId, userId, tenantId: viewer.tenantId })) added += 1;
     }
   });
-  if (added) await logAction(spaceId, viewer.userId, 'member.invite', { detail: { added } });
   await notify({
     userIds: ids.filter((id) => id !== viewer.userId),
     type: 'space.invite',
@@ -478,12 +437,10 @@ export const listMembers = async ({ viewer, spaceId }) => {
     [spaceId],
   );
   const moderator = Rules.isModerator(membership);
-  const badges = await badgesFor(spaceId, rows.map((row) => row.user_id));
   return {
     listVisible: visible,
     count: await memberCount(spaceId),
     items: rows.map((row) => ({
-      badge: badges.get(row.user_id) ?? null,
       userId: row.user_id,
       displayName: row.display_name,
       role: row.role,
@@ -504,7 +461,6 @@ export const updateMember = async ({ viewer, spaceId, userId, role, timeoutMinut
     if (membership.role !== 'owner') fail('forbidden', 'Only an owner changes roles.');
     if (userId === viewer.userId) fail('forbidden', 'Ask another owner to change your own role.');
     await pool.query(`UPDATE space_memberships SET role = $3 WHERE space_id = $1 AND user_id = $2`, [spaceId, userId, role]);
-    await logAction(spaceId, viewer.userId, 'member.role', { targetType: 'user', targetId: userId, detail: { role } });
   }
   if (timeoutMinutes !== undefined) {
     await pool.query(
@@ -512,9 +468,6 @@ export const updateMember = async ({ viewer, spaceId, userId, role, timeoutMinut
         WHERE space_id = $1 AND user_id = $2`,
       [spaceId, userId, timeoutMinutes],
     );
-    await logAction(spaceId, viewer.userId, timeoutMinutes > 0 ? 'member.pause' : 'member.unpause', {
-      targetType: 'user', targetId: userId, detail: { minutes: timeoutMinutes },
-    });
   }
   return { updated: true };
 };
@@ -525,7 +478,6 @@ export const removeMember = async ({ viewer, spaceId, userId }) => {
   const target = await membershipOf(spaceId, userId);
   if (target?.role === 'owner') fail('forbidden', 'An owner cannot be removed.');
   await pool.query(`DELETE FROM space_memberships WHERE space_id = $1 AND user_id = $2`, [spaceId, userId]);
-  await logAction(spaceId, viewer.userId, 'member.remove', { targetType: 'user', targetId: userId });
   return { removed: true };
 };
 
@@ -647,12 +599,8 @@ export const getThread = async ({ viewer, threadId }) => {
       .catch(() => undefined);
   }
   const blocked = Rules.postingBlockedBecause(space, membership);
-  const badges = await badgesFor(space.spaceId, posts.map((post) => post.author_id));
-  const mine = posts.filter((post) => post.author_id === viewer.userId);
-  const calmLeft = moderator ? 0 : Part3.calmWait({ slowSeconds: thread.slow_seconds, lastPostAt: mine.length ? mine[mine.length - 1].created_at : null });
   return {
     ...toThreadSummary(summaryRows[0], viewer),
-    calm: { slowSeconds: thread.slow_seconds ?? 0, waitSeconds: calmLeft },
     space: { spaceId: space.spaceId, name: space.name, emoji: space.emoji, kind: space.kind },
     answeredPostId: thread.answered_post_id ?? null,
     posts: posts.map((post, index) => ({
@@ -672,8 +620,6 @@ export const getThread = async ({ viewer, threadId }) => {
       }),
       answer: post.id === thread.answered_post_id,
       canRemove: Rules.canRemove({ authorId: post.author_id, viewerId: viewer.userId, membership }) && index > 0,
-      // Part 3: a quiet badge for people whose answers others accepted (never on anonymous posts).
-      badge: Boolean(thread.anonymous) && post.author_id === thread.author_id ? null : badges.get(post.author_id) ?? null,
       // Part 2: a solution others open deliberately.
       hiddenSolution: Boolean(post.hidden_solution),
       folded: Rules.solutionFolded({ hiddenSolution: post.hidden_solution, authorId: post.author_id, viewerId: viewer.userId }),
@@ -699,14 +645,6 @@ export const reply = async ({ viewer, threadId, input }) => {
   const blocked = Rules.postingBlockedBecause(space, membership);
   if (blocked) fail('forbidden', blocked);
   if (thread.locked) fail('forbidden', 'This thread is locked.');
-  if (thread.slow_seconds > 0 && !Rules.isModerator(membership)) {
-    const { rows: last } = await pool.query(
-      `SELECT max(created_at) AS at FROM posts WHERE thread_id = $1 AND author_id = $2 AND deleted_at IS NULL`,
-      [threadId, viewer.userId],
-    );
-    const wait = Part3.calmWait({ slowSeconds: thread.slow_seconds, lastPostAt: last[0]?.at });
-    if (wait > 0) fail('forbidden', Part3.calmMessage(wait));
-  }
   await inTransaction(async (client) => {
     await insertRow(client, 'posts', {
       thread_id: threadId,
@@ -781,17 +719,10 @@ export const toggleMetoo = async ({ viewer, threadId }) => {
 };
 
 export const moderateThread = async ({ viewer, threadId, pinned, locked }) => {
-  const { membership, thread } = await loadThread(viewer, threadId);
+  const { membership } = await loadThread(viewer, threadId);
   if (!Rules.isModerator(membership)) fail('forbidden', 'Only moderators pin or lock.');
-  const target = { targetType: 'thread', targetId: threadId, detail: { title: thread.title } };
-  if (pinned !== undefined) {
-    await pool.query(`UPDATE threads SET pinned = $2 WHERE id = $1`, [threadId, Boolean(pinned)]);
-    await logAction(thread.space_id, viewer.userId, pinned ? 'thread.pin' : 'thread.unpin', target);
-  }
-  if (locked !== undefined) {
-    await pool.query(`UPDATE threads SET locked = $2 WHERE id = $1`, [threadId, Boolean(locked)]);
-    await logAction(thread.space_id, viewer.userId, locked ? 'thread.lock' : 'thread.unlock', target);
-  }
+  if (pinned !== undefined) await pool.query(`UPDATE threads SET pinned = $2 WHERE id = $1`, [threadId, Boolean(pinned)]);
+  if (locked !== undefined) await pool.query(`UPDATE threads SET locked = $2 WHERE id = $1`, [threadId, Boolean(locked)]);
   return getThread({ viewer, threadId });
 };
 
@@ -799,9 +730,6 @@ export const removeThread = async ({ viewer, threadId }) => {
   const { thread, membership } = await loadThread(viewer, threadId);
   if (!Rules.canRemove({ authorId: thread.author_id, viewerId: viewer.userId, membership })) fail('forbidden', 'You cannot remove this thread.');
   await pool.query(`UPDATE threads SET deleted_at = now() WHERE id = $1`, [threadId]);
-  if (thread.author_id !== viewer.userId) {
-    await logAction(thread.space_id, viewer.userId, 'thread.remove', { targetType: 'thread', targetId: threadId, detail: { title: thread.title } });
-  }
   return { removed: true, spaceId: thread.space_id };
 };
 
@@ -819,9 +747,6 @@ export const removePost = async ({ viewer, postId }) => {
       [thread.id, postId],
     );
   });
-  if (rows[0].author_id !== viewer.userId) {
-    await logAction(thread.space_id, viewer.userId, 'post.remove', { targetType: 'post', targetId: postId, detail: { thread: thread.title } });
-  }
   return getThread({ viewer, threadId: thread.id });
 };
 
@@ -950,14 +875,11 @@ export const resolveReport = async ({ viewer, spaceId, reportId, action }) => {
     `UPDATE space_reports SET status = $2, resolved_by = $3, resolved_at = now() WHERE id = $1`,
     [reportId, action === 'remove' ? 'removed' : 'dismissed', viewer.userId],
   );
-  await logAction(spaceId, viewer.userId, action === 'remove' ? 'report.remove' : 'report.dismiss', {
-    targetType: found.target_type, targetId: found.target_id, detail: { reason: found.reason },
-  });
   return { resolved: true };
 };
 
 /** Shared with HubExtras.js (part 2); not part of the route surface. */
-export const internals = { loadSpace, loadThread, insertRow, notify, inTransaction, notBlocked: NOT_BLOCKED, iso, membershipOf, fail, logAction, badgesFor };
+export const internals = { loadSpace, insertRow, notify, inTransaction, notBlocked: NOT_BLOCKED, iso, membershipOf, fail };
 
 export default {
   viewerOf, listSpaces, getSpace, createSpace, updateSpace, archiveSpace, join, leave, listRequests, decideRequest,

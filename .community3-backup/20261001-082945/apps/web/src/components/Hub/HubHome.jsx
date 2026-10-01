@@ -1,37 +1,12 @@
 import { Link } from 'react-router-dom';
 import ThreadRow from './ThreadRow.jsx';
-import { morningLabel, spaceMark } from './hubModel.js';
+import { spaceMark } from './hubModel.js';
 
 /**
  * Community home: what is new in your spaces, in time order — no ranking, no
  * "you might like". Replies to your own threads first, then everything else.
  */
-function Waiting({ hub, items, onChanged }) {
-  if (!items?.length) return null;
-  return (
-    <section className="hb-block" aria-label="Waiting until morning">
-      <h2 className="hb-block__title">Waiting until morning</h2>
-      <ul className="hb-waiting">
-        {items.map((item) => (
-          <li key={item.scheduledId}>
-            <span aria-hidden="true">🌙</span>
-            <span className="hb-waiting__text">
-              <span>{item.preview}</span>
-              <span className="hb-muted">
-                {item.kind === 'reply' ? 'Reply' : item.kind === 'thread' ? 'New thread' : 'Chat message'}, {morningLabel(item.sendAt)}
-              </span>
-            </span>
-            <button type="button" className="hb-link" onClick={async () => { await hub.cancelScheduled(item.scheduledId).catch(() => undefined); onChanged(); }}>
-              Cancel
-            </button>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-export default function HubHome({ home, displayName, hub, scheduled, onChanged }) {
+export default function HubHome({ home, displayName }) {
   if (!home) return <p className="hb-muted">Loading…</p>;
   const first = (displayName ?? '').split(' ')[0];
 
@@ -86,8 +61,6 @@ export default function HubHome({ home, displayName, hub, scheduled, onChanged }
           ))}
         </section>
       ) : null}
-
-      <Waiting hub={hub} items={scheduled} onChanged={onChanged} />
 
       <div className="hb-tiles">
         {home.spaces.slice(0, 6).map((space) => (

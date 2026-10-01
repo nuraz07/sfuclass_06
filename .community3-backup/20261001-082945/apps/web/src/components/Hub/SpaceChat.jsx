@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useCore } from '@classroom/core-client';
 import { onUserEvent } from '../../lib/userEvents.js';
-import { CALM_CHOICES, calmLabel, dayLabel, groupMessages } from './hubModel.js';
-import LateNightNudge from './LateNightNudge.jsx';
+import { dayLabel, groupMessages } from './hubModel.js';
 
 /**
  * The chat of a space  (Community, part 2)
@@ -19,7 +18,6 @@ export default function SpaceChat({ hub, space }) {
   const core = useCore();
   const [items, setItems] = useState(null);
   const [blocked, setBlocked] = useState(null);
-  const [calm, setCalm] = useState({ seconds: 0, canModerate: false });
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(null);
@@ -45,7 +43,6 @@ export default function SpaceChat({ hub, space }) {
       else merge(page.items);
       cursor.current = page.nextCursor ?? cursor.current;
       setBlocked(page.postingBlocked);
-      setCalm({ seconds: page.calmSeconds ?? 0, canModerate: Boolean(page.canModerate) });
     } catch {
       setItems((current) => current ?? []);
     } finally {
@@ -105,35 +102,6 @@ export default function SpaceChat({ hub, space }) {
 
   return (
     <div className="hb-chat">
-      {calm.seconds > 0 || calm.canModerate ? (
-        <div className="hb-chat__bar">
-          {calm.seconds > 0 ? (
-            <span className="hb-calm hb-calm--inline">
-              <span aria-hidden="true">🌿</span> {calmLabel(calm.seconds)}
-            </span>
-          ) : (
-            <span className="hb-muted">Chat</span>
-          )}
-          {calm.canModerate ? (
-            <select
-              className="hb-input hb-input--small"
-              value={calm.seconds}
-              aria-label="Calm mode for the chat"
-              onChange={async (event) => {
-                const seconds = Number(event.target.value);
-                await hub.setChatCalm(space.spaceId, seconds).catch(() => undefined);
-                setCalm((current) => ({ ...current, seconds }));
-              }}
-            >
-              {CALM_CHOICES.map((choice) => (
-                <option key={choice.seconds} value={choice.seconds}>
-                  {choice.seconds ? `Calm: ${choice.label}` : 'Calm mode off'}
-                </option>
-              ))}
-            </select>
-          ) : null}
-        </div>
-      ) : null}
       <div className="hb-chat__list" ref={listRef} onScroll={onScroll} aria-live="polite">
         {items === null ? <p className="hb-muted">Loading…</p> : null}
         {items?.length === 0 ? <p className="hb-chat__empty">No messages yet. Say hello to the space.</p> : null}
@@ -202,11 +170,6 @@ export default function SpaceChat({ hub, space }) {
           </button>
         </form>
       )}
-      {!blocked ? (
-        <div className="hb-chat__nudge">
-          <LateNightNudge hub={hub} build={() => (draft.trim() ? { kind: 'chat', targetId: space.spaceId, body: draft.trim() } : null)} onScheduled={() => setDraft('')} />
-        </div>
-      ) : null}
       {error ? <p className="hb-error">{error}</p> : null}
     </div>
   );

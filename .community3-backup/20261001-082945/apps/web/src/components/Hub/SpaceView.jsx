@@ -6,8 +6,7 @@ import SpaceChat from './SpaceChat.jsx';
 import KnowledgeCards from './KnowledgeCards.jsx';
 import SpaceMaterials from './SpaceMaterials.jsx';
 import SpaceRooms from './SpaceRooms.jsx';
-import LateNightNudge from './LateNightNudge.jsx';
-import { ACCESS, KIND_LABEL, NOTIFY_MODES, ROLE_LABEL, TIMEOUTS, endsLabel, logLine, spaceMark, tabFrom, validateThreadForm } from './hubModel.js';
+import { ACCESS, KIND_LABEL, ROLE_LABEL, TIMEOUTS, endsLabel, spaceMark, tabFrom, validateThreadForm } from './hubModel.js';
 import { relativeTime } from '../Settings/notificationsModel.js';
 
 /**
@@ -19,7 +18,6 @@ import { relativeTime } from '../Settings/notificationsModel.js';
  *   materials links the space keeps at hand                    (part 2)
  *   rooms     drop-in and planned rooms; "Live now" above      (part 2)
  *   members   names and roles — or only the moderators, if the space says so
- *   log       what moderators did                             (part 3) moderators
  *   requests  people asking to join                       moderators
  *   reports   what members reported                       moderators
  *   about     description, rules of entry; settings        moderators edit
@@ -90,20 +88,6 @@ function NewThread({ hub, space, onCreated }) {
         </label>
       ) : null}
       {error ? <p className="hb-error" role="alert">{error}</p> : null}
-      <LateNightNudge
-        hub={hub}
-        build={() => {
-          setTouched(true);
-          if (Object.keys(errors).length) return null;
-          return { kind: 'thread', targetId: space.spaceId, title: title.trim(), body: body.trim(), threadKind: kind, anonymous: kind === 'question' && anonymous };
-        }}
-        onScheduled={() => {
-          setTitle('');
-          setBody('');
-          setTouched(false);
-          onCreated();
-        }}
-      />
       <div className="hb-inline">
         <button type="submit" className="btn btn--primary" disabled={busy}>
           {busy ? 'Posting…' : kind === 'question' ? 'Ask' : 'Post'}
@@ -200,7 +184,6 @@ function Members({ hub, space, version, bump }) {
               {member.displayName}
               {member.you ? ' (you)' : ''}
               {member.role !== 'member' ? <span className="hb-badge">{ROLE_LABEL[member.role]}</span> : null}
-              {member.badge ? <span className="hb-badge hb-badge--helper">{member.badge.label}</span> : null}
               {member.timeoutUntil && new Date(member.timeoutUntil) > new Date() ? <span className="hb-badge hb-badge--warn">Paused</span> : null}
             </span>
             {moderator && !member.you && member.role !== 'owner' ? (
@@ -333,60 +316,6 @@ function Reports({ hub, space }) {
         </li>
       ))}
     </ul>
-  );
-}
-
-function Log({ hub, space }) {
-  const [items, setItems] = useState(null);
-  useEffect(() => {
-    const controller = new AbortController();
-    hub
-      .log(space.spaceId, controller.signal)
-      .then((result) => setItems(result.items))
-      .catch(() => !controller.signal.aborted && setItems([]));
-    return () => controller.abort();
-  }, [hub, space.spaceId]);
-  if (!items) return <p className="hb-muted">Loading…</p>;
-  if (items.length === 0) return <p className="hb-muted">Nothing yet. Moderator actions in this space appear here.</p>;
-  return (
-    <div>
-      <p className="hb-muted">What moderators did in this space. Only moderators see this.</p>
-      <ol className="hb-log">
-        {items.map((entry) => (
-          <li key={entry.entryId}>
-            <span>{logLine(entry)}</span>
-            <span className="hb-muted">{relativeTime(entry.at)}</span>
-          </li>
-        ))}
-      </ol>
-    </div>
-  );
-}
-
-function NotifyMode({ hub, space, bump }) {
-  const [mode, setMode] = useState(space.me?.notifyMode ?? 'each');
-  if (!space.me?.role) return null;
-  return (
-    <label className="hb-notify" title="How this space notifies you">
-      <span aria-hidden="true">🔔</span>
-      <select
-        className="hb-input hb-input--small"
-        value={mode}
-        aria-label="Notifications from this space"
-        onChange={async (event) => {
-          const next = event.target.value;
-          setMode(next);
-          await hub.setNotifyMode(space.spaceId, next).catch(() => setMode(mode));
-          bump();
-        }}
-      >
-        {NOTIFY_MODES.map((entry) => (
-          <option key={entry.value} value={entry.value}>
-            {entry.label}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }
 
@@ -559,11 +488,11 @@ export default function SpaceView({ hub, spaceId, version, bump }) {
 
   const moderator = space.me?.moderator;
   const member = Boolean(space.me?.role);
-  const tabs = ['threads', 'chat', 'knowledge', 'materials', 'rooms', 'members', 'about', ...(moderator ? ['requests', 'reports', 'log'] : [])];
+  const tabs = ['threads', 'chat', 'knowledge', 'materials', 'rooms', 'members', 'about', ...(moderator ? ['requests', 'reports'] : [])];
   const tab = space.view === 'preview' ? 'about' : tabFrom(location.search, tabs, 'threads');
   const labels = {
     threads: 'Threads', chat: 'Chat', knowledge: 'Knowledge', materials: 'Materials', rooms: 'Rooms',
-    members: 'Members', about: 'About', requests: 'Requests', reports: 'Reports', log: 'Log',
+    members: 'Members', about: 'About', requests: 'Requests', reports: 'Reports',
   };
   const ends = endsLabel(space.endsAt);
 
@@ -594,7 +523,6 @@ export default function SpaceView({ hub, spaceId, version, bump }) {
           </p>
         </div>
         <div className="hb-space__action">
-          <NotifyMode hub={hub} space={space} bump={bump} />
           {member ? (
             <span className="hb-badge hb-badge--done">{moderator ? 'You moderate' : 'Member'}</span>
           ) : space.me?.request === 'pending' ? (
@@ -652,7 +580,6 @@ export default function SpaceView({ hub, spaceId, version, bump }) {
         {tab === 'requests' ? <Requests hub={hub} space={space} bump={bump} /> : null}
         {tab === 'reports' ? <Reports hub={hub} space={space} /> : null}
         {tab === 'about' ? <About hub={hub} space={space} bump={bump} /> : null}
-        {tab === 'log' ? <Log hub={hub} space={space} /> : null}
       </div>
     </div>
   );

@@ -45,23 +45,6 @@
  *   DELETE /chat/:id                                                         author, moderators
  *   GET    /spaces/:id/rooms                 the space's upcoming and running rooms
  *   POST   /spaces/:id/rooms/drop-in         open a drop-in room now (or the one already open)
- *
- * Part 3 (hub/HubPart3.js):
- *   GET|PUT /study/profile                    my study profile (opt-in)
- *   GET    /study/suggestions                 people who might study well with me, with reasons
- *   GET    /study/partners                    partners, requests for me, requests I sent
- *   POST   /study/requests/:userId            { message? }   ask to study together
- *   POST   /study/requests/:userId/respond    { accept }
- *   DELETE /study/partners/:userId            end a partnership
- *   POST   /study/partners/:userId/room       a room for the two of you, now
- *   GET    /scheduled   POST /scheduled   DELETE /scheduled/:id   posts waiting for 8:00
- *   PATCH  /threads/:id/calm  { seconds }                           moderators
- *   PATCH  /spaces/:id/chat/calm  { seconds }                       moderators
- *   PATCH  /spaces/:id/notify  { mode: each|daily|off }             members
- *   GET    /spaces/:id/log                                          moderators
- *
- * Loading this file starts the community scheduler (morning posts, daily
- * summaries): once a minute, under a Redis lock.
  */
 
 import { Router } from 'express';
@@ -69,8 +52,6 @@ import { z } from 'zod';
 
 import * as Hub from '../hub/HubService.js';
 import * as Extras from '../hub/HubExtras.js';
-import * as Part3 from '../hub/HubPart3.js';
-import * as PartRules from '../hub/partRules.js';
 import * as Rules from '../hub/hubRules.js';
 import { rateLimit } from '../middleware/rateLimit.js';
 import { route, validate, requireAuth, notFound, badRequest, forbidden, conflict } from './_helpers.js';
@@ -346,80 +327,5 @@ router.post(
     return result;
   }),
 );
-
-/* ---------------------------------------------------------------- part 3 */
-
-const userParam = z.object({ userId: id });
-
-router.get('/study/profile', handle((req, res, viewer) => Part3.getStudyProfile({ viewer })));
-
-router.put('/study/profile', handle((req, res, viewer) => Part3.saveStudyProfile({ viewer, input: parse(PartRules.StudyProfileSchema, req.body) })));
-
-router.get('/study/suggestions', handle((req, res, viewer) => Part3.studySuggestions({ viewer })));
-
-router.get('/study/partners', handle((req, res, viewer) => Part3.partners({ viewer })));
-
-router.post(
-  '/study/requests/:userId',
-  rateLimit({ key: 'hub:study-request', points: 20, durationSec: 86400, by: ['user'] }),
-  validate({ params: userParam }),
-  handle(async (req, res, viewer) => {
-    res.status(201);
-    return Part3.requestPartner({ viewer, targetId: req.params.userId, message: parse(PartRules.StudyRequestSchema, req.body).message ?? null });
-  }),
-);
-
-router.post(
-  '/study/requests/:userId/respond',
-  validate({ params: userParam, body: z.object({ accept: z.boolean() }) }),
-  handle((req, res, viewer) => Part3.respondPartner({ viewer, requesterId: req.params.userId, accept: req.body.accept })),
-);
-
-router.delete('/study/partners/:userId', validate({ params: userParam }), handle((req, res, viewer) => Part3.endPartnership({ viewer, otherId: req.params.userId })));
-
-router.post(
-  '/study/partners/:userId/room',
-  rateLimit({ key: 'hub:study-room', points: 10, durationSec: 3600, by: ['user'] }),
-  validate({ params: userParam }),
-  handle(async (req, res, viewer) => {
-    res.status(201);
-    return Part3.studyNow({ viewer, otherId: req.params.userId });
-  }),
-);
-
-router.get('/scheduled', handle((req, res, viewer) => Part3.listScheduled({ viewer })));
-
-router.post(
-  '/scheduled',
-  writeLimit,
-  handle(async (req, res, viewer) => {
-    res.status(201);
-    return Part3.schedulePost({ viewer, input: parse(PartRules.ScheduleSchema, req.body) });
-  }),
-);
-
-router.delete('/scheduled/:id', validate({ params: spaceParam }), handle((req, res, viewer) => Part3.cancelScheduled({ viewer, scheduledId: req.params.id })));
-
-router.patch(
-  '/threads/:id/calm',
-  validate({ params: spaceParam, body: z.object({ seconds: z.number().int() }) }),
-  handle((req, res, viewer) => Part3.setThreadCalm({ viewer, threadId: req.params.id, seconds: req.body.seconds })),
-);
-
-router.patch(
-  '/spaces/:id/chat/calm',
-  validate({ params: spaceParam, body: z.object({ seconds: z.number().int() }) }),
-  handle((req, res, viewer) => Part3.setChatCalm({ viewer, spaceId: req.params.id, seconds: req.body.seconds })),
-);
-
-router.patch(
-  '/spaces/:id/notify',
-  validate({ params: spaceParam, body: z.object({ mode: z.enum(PartRules.NOTIFY_MODES) }) }),
-  handle((req, res, viewer) => Part3.setNotifyMode({ viewer, spaceId: req.params.id, mode: req.body.mode })),
-);
-
-router.get('/spaces/:id/log', validate({ params: spaceParam }), handle((req, res, viewer) => Part3.listLog({ viewer, spaceId: req.params.id })));
-
-Part3.startHubScheduler();
 
 export default router;

@@ -9,7 +9,6 @@ import HubDiscover from '../components/Hub/HubDiscover.jsx';
 import NewSpaceForm from '../components/Hub/NewSpaceForm.jsx';
 import SpaceView from '../components/Hub/SpaceView.jsx';
 import HubThread from '../components/Hub/HubThread.jsx';
-import HubPartners from '../components/Hub/HubPartners.jsx';
 import { tabFrom } from '../components/Hub/hubModel.js';
 import { onUserEvent } from '../lib/userEvents.js';
 import '../components/Hub/hub.css';
@@ -21,7 +20,6 @@ import '../components/Hub/hub.css';
  *   /community?tab=questions      Questions across all your spaces
  *   /community?tab=discover       Spaces you are not in yet
  *   /community?tab=new            Create a space
- *   /community?tab=partners       Study partners                      (part 3)
  *   /community/spaces/:spaceId    One space (?tab=members|about|requests|reports)
  *   /community/threads/:threadId  One thread
  *
@@ -39,8 +37,6 @@ export default function CommunityPage() {
   const location = useLocation();
 
   const [home, setHome] = useState(null);
-  const [scheduled, setScheduled] = useState([]);
-  const [partnerRequests, setPartnerRequests] = useState(0);
   const [version, setVersion] = useState(0);
   const bump = useCallback(() => setVersion((value) => value + 1), []);
 
@@ -50,8 +46,6 @@ export default function CommunityPage() {
       .home(controller.signal)
       .then(setHome)
       .catch(() => !controller.signal.aborted && setHome({ spaces: [], recent: [], myThreads: [], openQuestions: 0 }));
-    hub.scheduled(controller.signal).then((result) => setScheduled(result.items)).catch(() => undefined);
-    hub.partners(controller.signal).then((result) => setPartnerRequests(result.incoming.length)).catch(() => undefined);
     return () => controller.abort();
   }, [hub, version]);
 
@@ -60,7 +54,7 @@ export default function CommunityPage() {
     () =>
       onUserEvent(core, 'notification:new', (payload) => {
         const kind = String(payload?.notification?.kind ?? '');
-        if (kind.startsWith('thread.') || kind.startsWith('space.') || kind.startsWith('study.')) bump();
+        if (kind.startsWith('thread.') || kind.startsWith('space.')) bump();
       }),
     [core, bump],
   );
@@ -72,7 +66,7 @@ export default function CommunityPage() {
     return () => window.removeEventListener('focus', onFocus);
   }, [bump]);
 
-  const tab = tabFrom(location.search, ['home', 'questions', 'discover', 'new', 'partners'], 'home');
+  const tab = tabFrom(location.search, ['home', 'questions', 'discover', 'new'], 'home');
   const canCreateClass = TEACHING.has(session?.role);
 
   let main;
@@ -81,12 +75,11 @@ export default function CommunityPage() {
   else if (tab === 'questions') main = <HubQuestions hub={hub} />;
   else if (tab === 'discover') main = <HubDiscover hub={hub} onChanged={bump} />;
   else if (tab === 'new') main = <NewSpaceForm hub={hub} canCreateClass={canCreateClass} onCreated={bump} />;
-  else if (tab === 'partners') main = <HubPartners hub={hub} />;
-  else main = <HubHome home={home} displayName={session?.displayName} hub={hub} scheduled={scheduled} onChanged={bump} />;
+  else main = <HubHome home={home} displayName={session?.displayName} />;
 
   return (
     <section className="page hb">
-      <SpaceRail spaces={home?.spaces ?? null} openQuestions={home?.openQuestions ?? 0} partnerRequests={partnerRequests} />
+      <SpaceRail spaces={home?.spaces ?? null} openQuestions={home?.openQuestions ?? 0} />
       <div className="hb-main" key={`${location.pathname}${location.search}`}>
         {main}
       </div>

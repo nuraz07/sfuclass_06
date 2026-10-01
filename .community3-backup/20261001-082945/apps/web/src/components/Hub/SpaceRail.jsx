@@ -5,7 +5,7 @@ import { spaceMark } from './hubModel.js';
  * The community's left rail: the four places, and your spaces with what is
  * new in each. On narrow screens it becomes a row of tabs above the content.
  */
-export default function SpaceRail({ spaces, openQuestions, partnerRequests = 0 }) {
+export default function SpaceRail({ spaces, openQuestions }) {
   const location = useLocation();
   const tab = new URLSearchParams(location.search).get('tab');
   const onOverview = location.pathname === '/community';
@@ -23,10 +23,6 @@ export default function SpaceRail({ spaces, openQuestions, partnerRequests = 0 }
         </NavLink>
         <NavLink to="/community?tab=discover" className={() => (is('discover') ? 'hb-place is-on' : 'hb-place')}>
           Discover
-        </NavLink>
-        <NavLink to="/community?tab=partners" className={() => (is('partners') ? 'hb-place is-on' : 'hb-place')}>
-          Study partners
-          {partnerRequests > 0 ? <span className="hb-count">{partnerRequests}</span> : null}
         </NavLink>
         <NavLink to="/community?tab=new" className={() => (is('new') ? 'hb-place hb-place--new is-on' : 'hb-place hb-place--new')}>
           + New space

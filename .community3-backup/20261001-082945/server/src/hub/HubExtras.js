@@ -19,10 +19,9 @@ import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
 import * as Rules from './hubRules.js';
 import { internals } from './HubService.js';
-import * as Part3 from './partRules.js';
 
 const log = logger.child({ component: 'community-extras' });
-const { loadSpace, notify, notBlocked, iso, fail, logAction } = internals;
+const { loadSpace, notify, notBlocked, iso, fail } = internals;
 
 const requireFullView = async (viewer, spaceId) => {
   const loaded = await loadSpace(viewer, spaceId);
@@ -104,7 +103,6 @@ export const updateCard = async ({ viewer, cardId, patch }) => {
 export const removeCard = async ({ viewer, cardId }) => {
   const card = await loadCard(viewer, cardId);
   await pool.query(`UPDATE space_cards SET deleted_at = now() WHERE id = $1`, [card.id]);
-  await logAction(card.space_id, viewer.userId, 'card.remove', { detail: { title: card.title } });
   return { removed: true };
 };
 
@@ -170,7 +168,6 @@ export const pinMaterial = async ({ viewer, materialId, pinned }) => {
 export const removeMaterial = async ({ viewer, materialId }) => {
   const material = await loadMaterial(viewer, materialId);
   await pool.query(`UPDATE space_materials SET deleted_at = now() WHERE id = $1`, [material.id]);
-  await logAction(material.space_id, viewer.userId, 'material.remove', { detail: { title: material.title } });
   return { removed: true };
 };
 
@@ -212,8 +209,6 @@ export const listMessages = async ({ viewer, spaceId, after = null }) => {
   return {
     items,
     nextCursor: items.length ? items[items.length - 1].cursor : after,
-    calmSeconds: space.chatSlowSeconds ?? 0,
-    canModerate: Rules.isModerator(membership),
     postingBlocked: Rules.postingBlockedBecause(space, membership),
     serverTime: new Date().toISOString(),
   };
@@ -226,14 +221,6 @@ export const sendMessage = async ({ viewer, spaceId, input }) => {
   const { space, membership } = await requireFullView(viewer, spaceId);
   const blocked = Rules.postingBlockedBecause(space, membership);
   if (blocked) fail('forbidden', blocked);
-  if (space.chatSlowSeconds > 0 && !Rules.isModerator(membership)) {
-    const { rows: last } = await pool.query(
-      `SELECT max(created_at) AS at FROM space_messages WHERE space_id = $1 AND author_id = $2 AND deleted_at IS NULL`,
-      [spaceId, viewer.userId],
-    );
-    const wait = Part3.calmWait({ slowSeconds: space.chatSlowSeconds, lastPostAt: last[0]?.at });
-    if (wait > 0) fail('forbidden', Part3.calmMessage(wait));
-  }
   const { rows } = await pool.query(
     `INSERT INTO space_messages AS m (space_id, author_id, body) VALUES ($1, $2, $3)
      RETURNING m.id, m.author_id, m.body, m.created_at, ${CURSOR} AS cursor`,
@@ -258,7 +245,6 @@ export const removeMessage = async ({ viewer, messageId }) => {
   const { membership } = await requireFullView(viewer, rows[0].space_id);
   if (!Rules.canRemoveMessage({ authorId: rows[0].author_id, viewerId: viewer.userId, membership })) fail('forbidden', 'You cannot remove this message.');
   await pool.query(`UPDATE space_messages SET deleted_at = now(), deleted_by = $2 WHERE id = $1`, [messageId, viewer.userId]);
-  if (rows[0].author_id !== viewer.userId) await logAction(rows[0].space_id, viewer.userId, 'chat.remove');
   return { removed: true };
 };
 
@@ -394,8 +380,7 @@ export const startDropIn = async ({ viewer, spaceId }) => {
   const room = await toSpaceRoom(rows[0]);
 
   const { rows: members } = await pool.query(
-    // Part 3: only people who want each notification from this space; "daily" gets it in the summary.
-    `SELECT user_id FROM space_memberships WHERE space_id = $1 AND user_id <> $2 AND notify_mode = 'each' LIMIT 500`,
+    `SELECT user_id FROM space_memberships WHERE space_id = $1 AND user_id <> $2 LIMIT 500`,
     [spaceId, viewer.userId],
   );
   await notify({
@@ -411,8 +396,6 @@ export const startDropIn = async ({ viewer, spaceId }) => {
   log.info({ spaceId, code: room.code }, 'drop-in room started');
   return { room, started: true };
 };
-
-export { localNow };
 
 export default {
   listCards, createCard, updateCard, removeCard, listMaterials, addMaterial, pinMaterial, removeMaterial,

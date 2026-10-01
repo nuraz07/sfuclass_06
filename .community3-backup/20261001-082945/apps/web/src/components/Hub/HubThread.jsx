@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import ReportButton from './ReportButton.jsx';
-import LateNightNudge from './LateNightNudge.jsx';
-import { CALM_CHOICES, calmLabel, paragraphs, spaceMark, waitLabel } from './hubModel.js';
+import { paragraphs, spaceMark } from './hubModel.js';
 import { relativeTime } from '../Settings/notificationsModel.js';
 
 /**
@@ -83,7 +82,7 @@ function Body({ text }) {
   );
 }
 
-function Author({ author, badge = null }) {
+function Author({ author }) {
   if (author.anonymous && !author.you && !author.revealedToModerator) {
     return <span className="hb-anon">Anonymous</span>;
   }
@@ -91,7 +90,6 @@ function Author({ author, badge = null }) {
     <span className="hb-post__author">
       {author.displayName}
       {author.you ? ' (you)' : ''}
-      {badge ? <span className="hb-badge hb-badge--helper" title="Answers by this person were accepted several times in this space">{badge.label}</span> : null}
       {author.anonymous && author.you ? <span className="hb-badge">Shown as anonymous</span> : null}
       {author.revealedToModerator ? <span className="hb-badge hb-badge--warn">Anonymous to members</span> : null}
     </span>
@@ -151,7 +149,7 @@ export default function HubThread({ hub, threadId, bump }) {
   const Post = ({ post, highlight = false }) => (
     <article className={`hb-post${highlight ? ' is-answer' : ''}`} id={`post-${post.postId}`}>
       <header className="hb-post__head">
-        <Author author={post.author} badge={post.badge} />
+        <Author author={post.author} />
         <span className="hb-muted">{relativeTime(post.createdAt) || 'just now'}</span>
         {highlight ? <span className="hb-badge hb-badge--done">Answer</span> : null}
         {post.hiddenSolution && !post.folded ? <span className="hb-badge hb-badge--pin">Hidden solution</span> : null}
@@ -199,7 +197,7 @@ export default function HubThread({ hub, threadId, bump }) {
         </p>
         <h1 className="hb-thread__title">{thread.title}</h1>
         <header className="hb-post__head">
-          <Author author={first.author} badge={first.badge} />
+          <Author author={first.author} />
           <span className="hb-muted">{relativeTime(first.createdAt) || 'just now'}</span>
         </header>
         <Body text={first.body} />
@@ -219,19 +217,6 @@ export default function HubThread({ hub, threadId, bump }) {
           ) : null}
           {thread.me.moderator ? (
             <>
-              <select
-                className="hb-input hb-input--small"
-                value={thread.calm.slowSeconds}
-                aria-label="Calm mode"
-                disabled={busy}
-                onChange={(event) => run(() => hub.setThreadCalm(thread.threadId, Number(event.target.value)))}
-              >
-                {CALM_CHOICES.map((choice) => (
-                  <option key={choice.seconds} value={choice.seconds}>
-                    {choice.seconds ? `Calm: ${choice.label}` : 'Calm mode off'}
-                  </option>
-                ))}
-              </select>
               <button type="button" className="hb-link" disabled={busy} onClick={() => run(() => hub.moderateThread(thread.threadId, { pinned: !thread.pinned }))}>
                 {thread.pinned ? 'Unpin' : 'Pin'}
               </button>
@@ -261,12 +246,6 @@ export default function HubThread({ hub, threadId, bump }) {
         </footer>
       </article>
 
-      {thread.calm.slowSeconds > 0 ? (
-        <p className="hb-calm" role="status">
-          <span aria-hidden="true">🌿</span> {calmLabel(thread.calm.slowSeconds)} Take a breath before you reply.
-        </p>
-      ) : null}
-
       {answer ? <Post post={answer} highlight /> : null}
 
       <h2 className="hb-thread__count">
@@ -276,9 +255,7 @@ export default function HubThread({ hub, threadId, bump }) {
         <Post key={post.postId} post={post} />
       ))}
 
-      {thread.me.canReply && thread.calm.waitSeconds > 0 ? (
-        <p className="hb-note">{waitLabel(thread.calm.waitSeconds)}</p>
-      ) : thread.me.canReply ? (
+      {thread.me.canReply ? (
         <form className="hb-composer hb-composer--reply" onSubmit={send}>
           <label className="hb-label" htmlFor="hb-reply">
             {question && !thread.answered ? 'Your answer' : 'Your reply'}
@@ -293,14 +270,6 @@ export default function HubThread({ hub, threadId, bump }) {
               </span>
             </label>
           ) : null}
-          <LateNightNudge
-            hub={hub}
-            build={() => (reply.trim() ? { kind: 'reply', targetId: thread.threadId, body: reply.trim(), hiddenSolution: question && hiddenSolution } : null)}
-            onScheduled={() => {
-              setReply('');
-              setHiddenSolution(false);
-            }}
-          />
           <div className="hb-inline">
             <button type="submit" className="btn btn--primary" disabled={busy || !reply.trim()}>
               {busy ? 'Sending…' : 'Reply'}
