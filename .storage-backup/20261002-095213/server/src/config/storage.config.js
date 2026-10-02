@@ -35,11 +35,6 @@ export const s3ClientOptions = {
   region: env.AWS_REGION,
   ...(env.S3_ENDPOINT ? { endpoint: env.S3_ENDPOINT } : {}),
   forcePathStyle: env.S3_FORCE_PATH_STYLE,
-  // AWS SDK v3.729+ signs a CRC32 of the *empty* body into presigned PUT
-  // URLs; the store then refuses the real upload (BadDigest). Checksums only
-  // where an operation requires them — the same setting works on AWS S3.
-  requestChecksumCalculation: 'WHEN_REQUIRED',
-  responseChecksumValidation: 'WHEN_REQUIRED',
   ...(env.AWS_ACCESS_KEY_ID
     ? {
         credentials: {
