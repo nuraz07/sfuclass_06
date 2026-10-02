@@ -173,8 +173,6 @@ const hydrate = async ({ row, viewerId, created = false }) => {
       lastMessagePreview: row.last_message_preview ?? null,
     }),
     created,
-    // Messages (031): pinned to the top of this person's list.
-    pinnedAt: row.pinned_at ? new Date(row.pinned_at).toISOString() : null,
   };
 };
 

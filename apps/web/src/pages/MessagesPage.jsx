@@ -1,31 +1,31 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { createChatApi, createProfileApi, useConversations, useCore } from '@classroom/core-client';
-import ChatRooms from '../components/Chat/ChatRooms.jsx';
-import '../components/Chat/chatRooms.css';
+import { createChatApi, createProfileApi, isMutedNow, otherParticipant, titleOf, useConversations, useCore } from '@classroom/core-client';
+import Avatar from '../components/Messenger/Avatar.jsx';
+import MessengerList from '../components/Messenger/MessengerList.jsx';
+import MessengerThread from '../components/Messenger/MessengerThread.jsx';
+import ContactPanel from '../components/Messenger/ContactPanel.jsx';
+import { ProfileDialog, useProfile } from '../components/Messenger/ProfileCard.jsx';
 import '../components/Chat/messages.css';
+import '../components/Messenger/messenger.css';
 
 /**
- * Messages  (F6 · Design)
+ * Messages  (F6 · Messages)
  *
- * Your conversations with people — only the ones that are really yours: chats
- * someone wrote in, and the one you have open. A chat that was opened by
- * accident and never used does not clutter the list. "New message" finds a
- * person in your organisation (people who blocked you, or whom you blocked,
- * never appear) and opens the chat with them; whether you may write to them
- * follows their privacy settings, as everywhere.
+ * A messenger across the whole width of the window, in three columns:
  *
- * The everyone-chat ("General") is not here: it belongs to live rooms, where
- * it is shown during the session.
+ *   chats      pinned first, then by activity; search; unread and muted marks
+ *   the chat   messages grouped by day and person, with reply, edit, copy
+ *              and delete; search inside the chat
+ *   details    the person (or the group), notifications, pin, what you have
+ *              in common, block, report, delete for me — opened with ⓘ
  *
- * The page has a fixed height and the conversation scrolls inside it, so the
- * back button and the ⋯ menu stay in view however long a chat gets.
- *
- * Wide screens show the list and the open conversation side by side, like a
- * messenger on the web; narrow screens show one at a time, with a back button.
+ * Narrow screens show one column at a time. Your conversations only: the
+ * everyone-chat ("General") belongs to live rooms. The lesson's own chat
+ * (components/Chat/ChatRooms.jsx) is not touched by this page.
  */
 
-const WIDE = '(min-width: 960px)';
+const WIDE = '(min-width: 900px)';
 
 function useWide() {
   const [wide, setWide] = useState(() => typeof window !== 'undefined' && window.matchMedia?.(WIDE).matches);
@@ -126,88 +126,214 @@ export default function MessagesPage() {
   const { http, chatSocket, session } = useCore();
   const { conversationId } = useParams();
   const navigate = useNavigate();
-  const [composing, setComposing] = useState(false);
   const wide = useWide();
+  const pageRef = useRef(null);
 
   const api = useMemo(() => createChatApi(http), [http]);
+  const profiles = useMemo(() => createProfileApi(http), [http]);
   const self = useMemo(
-    () => ({
-      userId: session?.userId ?? '',
-      displayName: session?.displayName ?? 'You',
-      avatarUrl: session?.avatarUrl ?? null,
-    }),
+    () => ({ userId: session?.userId ?? '', displayName: session?.displayName ?? 'You', avatarUrl: session?.avatarUrl ?? null }),
     [session],
   );
 
-  const rooms = useConversations({
-    api,
-    socket: chatSocket ?? undefined,
-    selfUserId: self.userId,
-    enabled: Boolean(self.userId),
-  });
+  const rooms = useConversations({ api, socket: chatSocket ?? undefined, selfUserId: self.userId, enabled: Boolean(self.userId) });
 
-  const [view, setView] = useState(conversationId ? { type: 'conversation', id: conversationId } : { type: 'list' });
+  const [composing, setComposing] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const [profileOf, setProfileOf] = useState(null);
+  const [editWindowMin, setEditWindowMin] = useState(0);
+  const [blockVersion, setBlockVersion] = useState(0);
 
+  // The open chat counts as read and gets no notifications (useConversations).
+  const { setOpen } = rooms;
   useEffect(() => {
-    setView(conversationId ? { type: 'conversation', id: conversationId } : { type: 'list' });
+    setOpen(conversationId ?? null);
+    return () => setOpen(null);
+  }, [conversationId, setOpen]);
+
+  // A different chat: close search, keep the details panel as it was.
+  useEffect(() => {
+    setSearch('');
+    setSearchOpen(false);
   }, [conversationId]);
 
-  const onViewChange = (next) => {
-    // The everyone-chat lives in rooms, not here.
-    if (next.type === 'lobby') return;
-    setView(next);
-    if (next.type === 'conversation') navigate(`/messages/${next.id}`);
-    else if (conversationId) navigate('/messages');
-  };
+  // Fill the window below the top bar exactly, whatever is above us.
+  useLayoutEffect(() => {
+    const fit = () => {
+      const el = pageRef.current;
+      if (el) el.style.setProperty('--mx-top', `${Math.max(0, Math.round(el.getBoundingClientRect().top + window.scrollY))}px`);
+    };
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  }, []);
+
+  const conversation = conversationId ? rooms.conversations.find((c) => c.conversationId === conversationId) ?? null : null;
+  const title = conversation ? titleOf(conversation, self.userId) : '';
+  const other = conversation?.kind === 'direct' ? otherParticipant(conversation, self.userId) : null;
+  const { profile: otherProfile } = useProfile(profiles, other?.userId ?? null, blockVersion);
+
+  // The edit window comes with the details (server: CHAT_EDIT_WINDOW_MIN).
+  useEffect(() => {
+    if (!conversationId) return undefined;
+    const controller = new AbortController();
+    api
+      .conversationDetails(conversationId, controller.signal)
+      .then((details) => setEditWindowMin(details.editWindowMin))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [api, conversationId]);
+
+  const open = useCallback((id) => navigate(`/messages/${id}`), [navigate]);
+  const back = () => navigate('/messages');
 
   const openWith = async (person) => {
-    const conversation = await api.openDirect(person.userId);
+    const created = await api.openDirect(person.userId);
     await rooms.refresh?.();
     setComposing(false);
-    onViewChange({ type: 'conversation', id: conversation.conversationId });
+    open(created.conversationId);
   };
 
-  // Unread from your conversations only — not from the everyone-chat.
-  const unread = rooms.conversations.reduce((sum, item) => sum + (item.unreadCount || 0), 0);
-  const inChat = view.type === 'conversation';
-  const shared = { rooms, api, socket: chatSocket, self, showLobby: false, hideEmpty: true };
+  const unread = rooms.conversations.reduce((sum, item) => sum + (isMutedNow(item) ? 0 : item.unreadCount || 0), 0);
+  const blockedReason = otherProfile?.isBlockedByViewer
+    ? `You blocked ${title}. Unblock them in the chat details to write again.`
+    : otherProfile && !otherProfile.canMessage && otherProfile.cannotMessageReason
+      ? otherProfile.cannotMessageReason
+      : '';
+
+  const showList = wide || !conversationId;
+  const showChat = wide || Boolean(conversationId);
+  const showPanel = Boolean(conversation && detailsOpen);
 
   return (
-    <section className={`page messages-page${inChat ? ' is-chat' : ''}${wide ? ' is-wide' : ''}`}>
-      <header className="messages-page__head">
-        <h1>
-          Messages {unread > 0 ? <span className="rooms-badge">{unread}</span> : null}
-        </h1>
-        {!inChat || wide ? (
-          <button type="button" className="btn btn--primary" onClick={() => setComposing((value) => !value)} aria-expanded={composing}>
-            New message
-          </button>
-        ) : null}
-      </header>
-      {composing && (!inChat || wide) ? <NewMessage onOpen={openWith} onClose={() => setComposing(false)} /> : null}
-      {wide ? (
-        <div className="messages-split">
-          {/* The list first: of the two, the open chat must be the last to tell `rooms` what is open. */}
-          <div className="messages-page__panel messages-split__list">
-            <ChatRooms {...shared} view={{ type: 'list' }} onViewChange={onViewChange} activeId={inChat ? view.id : null} />
-          </div>
-          <div className="messages-page__panel messages-split__chat">
-            {inChat ? (
-              <ChatRooms {...shared} view={view} onViewChange={onViewChange} />
-            ) : (
-              <div className="messages-split__empty">
-                <span aria-hidden="true">💬</span>
-                <p className="messages-split__title">Choose a conversation</p>
-                <p className="muted">Or start one with “New message”.</p>
-              </div>
-            )}
-          </div>
+    <section ref={pageRef} className={`mx-page${showPanel ? ' has-panel' : ''}${wide ? ' is-wide' : ' is-narrow'}`}>
+      {showList ? (
+        <div className="mx-col mx-col--list">
+          <header className="mx-col__head">
+            <h1>
+              Messages {unread > 0 ? <span className="mx-badge">{unread > 99 ? '99+' : unread}</span> : null}
+            </h1>
+            <button type="button" className="mx-newbtn" onClick={() => setComposing((value) => !value)} aria-expanded={composing} title="New message">
+              <span aria-hidden="true">✎</span>
+              <span className="mx-sr">New message</span>
+            </button>
+          </header>
+          {composing ? <NewMessage onOpen={openWith} onClose={() => setComposing(false)} /> : null}
+          <MessengerList rooms={rooms} self={self} activeId={conversationId ?? null} onOpen={open} />
         </div>
-      ) : (
-        <div className="messages-page__panel">
-          <ChatRooms {...shared} view={view} onViewChange={onViewChange} />
+      ) : null}
+
+      {showChat ? (
+        <div className="mx-col mx-col--chat">
+          {conversation ? (
+            <>
+              <header className="mx-chathead">
+                {!wide ? (
+                  <button type="button" className="mx-iconbtn" onClick={back} aria-label="Back to chats">
+                    ←
+                  </button>
+                ) : null}
+                <button type="button" className="mx-chathead__who" onClick={() => setDetailsOpen(true)} title={other ? 'Contact info' : 'Group info'}>
+                  <Avatar name={title} url={otherProfile?.avatarUrl ?? other?.profile?.avatarUrl ?? null} seed={other?.userId ?? conversation.conversationId} size={40} />
+                  <span>
+                    <strong>{title}</strong>
+                    <span className="mx-muted">
+                      {[
+                        other ? otherProfile?.headline ?? null : `${conversation.participants.length} members`,
+                        isMutedNow(conversation) ? 'Muted' : null,
+                        conversation.pinnedAt ? 'Pinned' : null,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ') || 'Click for contact info'}
+                    </span>
+                  </span>
+                </button>
+                <span className="mx-chathead__actions">
+                  <button type="button" className={`mx-iconbtn${searchOpen ? ' is-on' : ''}`} onClick={() => setSearchOpen((value) => !value)} aria-label="Search in this chat" title="Search in this chat">
+                    ⌕
+                  </button>
+                  <button type="button" className={`mx-iconbtn${detailsOpen ? ' is-on' : ''}`} onClick={() => setDetailsOpen((value) => !value)} aria-label="Chat details" aria-expanded={detailsOpen} title="Chat details">
+                    ⓘ
+                  </button>
+                </span>
+              </header>
+              <MessengerThread
+                key={conversation.conversationId}
+                api={api}
+                socket={chatSocket}
+                self={self}
+                conversation={conversation}
+                title={title}
+                other={other}
+                editWindowMin={editWindowMin}
+                search={searchOpen ? search : ''}
+                searchOpen={searchOpen}
+                onSearchChange={setSearch}
+                onCloseSearch={() => {
+                  setSearch('');
+                  setSearchOpen(false);
+                }}
+                onOpenProfile={(person) => setProfileOf(person)}
+                disabledReason={blockedReason}
+              />
+            </>
+          ) : conversationId && !rooms.loading ? (
+            <div className="mx-empty">
+              <p className="mx-empty__title">This chat is no longer in your list</p>
+              <button type="button" className="btn" onClick={back}>
+                Back to your chats
+              </button>
+            </div>
+          ) : (
+            <div className="mx-empty">
+              <span className="mx-empty__icon" aria-hidden="true">💬</span>
+              <p className="mx-empty__title">Your messages</p>
+              <p className="mx-muted">Choose a conversation, or start a new one.</p>
+              <button type="button" className="btn btn--primary" onClick={() => setComposing(true)}>
+                New message
+              </button>
+            </div>
+          )}
         </div>
-      )}
+      ) : null}
+
+      {showPanel ? (
+        <>
+          <button type="button" className="mx-scrim" aria-label="Close details" onClick={() => setDetailsOpen(false)} />
+          <ContactPanel
+            conversation={conversation}
+            title={title}
+            other={other}
+            self={self}
+            api={api}
+            profiles={profiles}
+            rooms={rooms}
+            onClose={() => setDetailsOpen(false)}
+            onSearch={() => {
+              setSearchOpen(true);
+              if (!wide) setDetailsOpen(false);
+            }}
+            onOpenProfile={(person) => setProfileOf(person)}
+            onBlockedChange={() => setBlockVersion((v) => v + 1)}
+            onDeleted={() => {
+              setDetailsOpen(false);
+              back();
+            }}
+          />
+        </>
+      ) : null}
+
+      {profileOf ? (
+        <ProfileDialog
+          person={profileOf}
+          profiles={profiles}
+          selfUserId={self.userId}
+          onMessage={profileOf.userId === other?.userId ? null : openWith}
+          onClose={() => setProfileOf(null)}
+        />
+      ) : null}
     </section>
   );
 }

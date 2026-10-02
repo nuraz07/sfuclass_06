@@ -22,7 +22,6 @@ import { z } from 'zod';
 import { ApiError } from '@classroom/contracts';
 
 import * as ConversationService from '../messaging/ConversationService.js';
-import * as ConversationExtras from '../messaging/ConversationExtras.js';
 import * as DirectMessageService from '../messaging/DirectMessageService.js';
 import * as PublicChatService from '../messaging/PublicChatService.js';
 import * as ChatAttachmentService from '../messaging/ChatAttachmentService.js';
@@ -190,20 +189,6 @@ router.delete(
   '/conversations/:id',
   validate({ params: idParam }),
   route(mapped(async (req) => ConversationService.deleteForMe({ conversationId: req.params.id, userId: req.user.id }))),
-);
-
-/** Messages: the panel beside a chat — shared spaces, counts, the edit window. */
-router.get(
-  '/conversations/:id/details',
-  validate({ params: idParam }),
-  route(mapped(async (req) => ConversationExtras.details({ conversationId: req.params.id, viewerId: req.user.id }))),
-);
-
-/** Messages: pin a chat to the top of my own list. */
-router.put(
-  '/conversations/:id/pin',
-  validate({ params: idParam, body: z.object({ pinned: z.boolean() }) }),
-  route(mapped(async (req) => ConversationExtras.setPinned({ conversationId: req.params.id, userId: req.user.id, pinned: req.body.pinned }))),
 );
 
 /** Leave a group; for a direct chat this is the same as delete for me. */

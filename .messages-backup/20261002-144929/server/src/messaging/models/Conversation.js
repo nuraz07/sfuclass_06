@@ -151,7 +151,7 @@ export const listForUser = async ({ userId, cursor = null, limit = 25, conversat
 
   const { rows } = await pool.query(
     `SELECT ${SELECT},
-            p.muted, p.muted_until, p.last_read_at, p.cleared_at, p.hidden_at, p.pinned_at,
+            p.muted, p.muted_until, p.last_read_at, p.cleared_at, p.hidden_at,
             coalesce(c.last_message_at, c.created_at) AS sort_at,
             (SELECT count(*)::int FROM messages m
               WHERE m.conversation_id = c.id

@@ -78,26 +78,11 @@ export const ConversationViewSchema = z
     muted: z.boolean().default(false),
     mutedUntil: z.string().nullable().default(null),
     created: z.boolean().optional(),
-    pinnedAt: z.string().nullable().default(null),
     createdAt: z.string(),
     updatedAt: z.string().nullable().default(null),
   })
   .passthrough();
 export type ConversationView = z.infer<typeof ConversationViewSchema>;
-
-export const ConversationDetailsSchema = z
-  .object({
-    conversationId: z.string(),
-    startedAt: z.string().nullable().default(null),
-    pinnedAt: z.string().nullable().default(null),
-    messageCount: z.number().default(0),
-    sharedSpaces: z
-      .array(z.object({ spaceId: z.string(), name: z.string(), emoji: z.string().nullable().default(null) }).passthrough())
-      .default([]),
-    editWindowMin: z.number().default(0),
-  })
-  .passthrough();
-export type ConversationDetails = z.infer<typeof ConversationDetailsSchema>;
 
 const ConversationPageSchema = z.object({
   items: z.array(ConversationViewSchema),
@@ -159,10 +144,6 @@ export interface ChatApi {
   deleteConversation(conversationId: string): Promise<void>;
   /** Kept for older callers: archiving is now "delete for me". */
   archiveConversation(conversationId: string, archived: boolean): Promise<void>;
-  /** Messages: shared spaces, counts and the edit window for the panel beside a chat. */
-  conversationDetails(conversationId: string, signal?: AbortSignal): Promise<ConversationDetails>;
-  /** Messages: pin or unpin a chat in my own list. */
-  pinConversation(conversationId: string, pinned: boolean): Promise<ConversationView>;
   leaveConversation(conversationId: string): Promise<void>;
 
   listChannels(
@@ -242,12 +223,6 @@ export const createChatApi = (http: HttpClient): ChatApi => ({
   deleteConversation: async (conversationId) => {
     await http.delete(`/messaging/conversations/${encodeURIComponent(conversationId)}`);
   },
-
-  conversationDetails: (conversationId, signal) =>
-    http.get(`/messaging/conversations/${encodeURIComponent(conversationId)}/details`, { schema: ConversationDetailsSchema, signal }),
-
-  pinConversation: (conversationId, pinned) =>
-    http.put(`/messaging/conversations/${encodeURIComponent(conversationId)}/pin`, { pinned }, { schema: ConversationViewSchema }),
 
   archiveConversation: async (conversationId, archived) => {
     if (archived) await http.delete(`/messaging/conversations/${encodeURIComponent(conversationId)}`);
