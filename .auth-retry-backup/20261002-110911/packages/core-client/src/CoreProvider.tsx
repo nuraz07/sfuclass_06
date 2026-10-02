@@ -60,7 +60,6 @@ import { ApiError, HEADERS } from '@classroom/contracts';
 import { createHttpClient, type AuthProvider, type HttpClient } from './http/httpClient.js';
 import { createSocketClient, type SocketClient } from './socket/socketClient.js';
 import { createNodeResolver, type NodeResolver } from './rtc/nodeResolver.js';
-import { classifyRefreshFailure, restoreDelayMs } from './auth/restorePolicy.js';
 
 // ---------------------------------------------------------------------------
 // Session
@@ -132,12 +131,6 @@ export interface CoreContextValue {
   chatSocket: SocketClient | null;
   session: Session | null;
   status: AuthStatus;
-  /**
-   * While status is "restoring": whether the server could not be reached
-   * yet, and when the next try is. retryNow() tries at once; signInInstead()
-   * gives up and shows the sign-in page.
-   */
-  restore: RestoreState;
   release: string;
   apiUrl: string;
   wsUrl: string;
@@ -158,14 +151,6 @@ export interface CoreContextValue {
     response: Record<string, unknown>;
   }): Promise<Session>;
   signOut(): Promise<void>;
-}
-
-export interface RestoreState {
-  reconnecting: boolean;
-  attempt: number;
-  nextRetryAt: number | null;
-  retryNow(): void;
-  signInInstead(): void;
 }
 
 const CoreContext = createContext<CoreContextValue | null>(null);
@@ -260,11 +245,7 @@ export function CoreProvider({
           setSession(result.user);
           setStatus('authenticated');
           return result.accessToken;
-        } catch (error) {
-          const verdict = classifyRefreshFailure(error);
-          if (verdict === 'csrf') csrfTokenRef.current = null;
-          // No answer from the server: keep the session, let the request fail.
-          if (verdict === 'transient') throw error;
+        } catch {
           return null;
         }
       },
@@ -293,77 +274,27 @@ export function CoreProvider({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiUrl, release]);
 
-  // On load: resume the session from the refresh cookie. "No session" from
-  // the server means nobody is signed in here. No answer at all (the API is
-  // restarting, the network is gone) says nothing about the session: stay in
-  // 'restoring', show that the server is being reached, and try again —
-  // 1 s, 2 s, 4 s … every 30 s, at once when the browser comes back online.
-  const [restoreInfo, setRestoreInfo] = useState({ reconnecting: false, attempt: 0, nextRetryAt: null as number | null });
-  const restoreControl = useRef({ retryNow: () => {}, signInInstead: () => {} });
-
+  // On load: resume the session from the refresh cookie, once. A failure only
+  // means nobody is signed in on this browser.
   useEffect(() => {
     let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let attempt = 0;
-    let csrfRetried = false;
-
-    const finish = (next: AuthStatus) => {
-      clearTimeout(timer);
-      setRestoreInfo({ reconnecting: false, attempt: 0, nextRetryAt: null });
-      setStatus((current) => (current === 'restoring' ? next : current));
-    };
-
-    const tryOnce = async (): Promise<void> => {
-      clearTimeout(timer);
-      attempt += 1;
-      try {
-        const tokens = (await renewViaCookie()) as TokenResponse;
+    renewViaCookie()
+      .then((result) => {
         if (cancelled) return;
+        const tokens = result as TokenResponse;
         accessTokenRef.current = tokens.accessToken;
         if (tokens.sessionId) sessionIdRef.current = tokens.sessionId;
         setSession(tokens.user);
-        finish('authenticated');
-      } catch (error) {
-        if (cancelled) return;
-        const verdict = classifyRefreshFailure(error);
-        if (verdict === 'csrf' && !csrfRetried) {
-          // A stale CSRF token (the API restarted): fetch a fresh one, once.
-          csrfRetried = true;
-          csrfTokenRef.current = null;
-          return tryOnce();
-        }
-        if (verdict !== 'transient') return finish('anonymous');
-        csrfTokenRef.current = null;
-        const delay = restoreDelayMs(attempt);
-        setRestoreInfo({ reconnecting: true, attempt, nextRetryAt: Date.now() + delay });
-        timer = setTimeout(() => void tryOnce(), delay);
-      }
-    };
-
-    restoreControl.current = {
-      retryNow: () => {
-        if (!cancelled) void tryOnce();
-      },
-      signInInstead: () => finish('anonymous'),
-    };
-    const onOnline = () => restoreControl.current.retryNow();
-    globalThis.addEventListener?.('online', onOnline);
-
-    void tryOnce();
+        setStatus('authenticated');
+      })
+      .catch(() => {
+        if (!cancelled) setStatus((current) => (current === 'restoring' ? 'anonymous' : current));
+      });
     return () => {
       cancelled = true;
-      clearTimeout(timer);
-      globalThis.removeEventListener?.('online', onOnline);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiUrl]);
-
-  const retryNow = useCallback(() => restoreControl.current.retryNow(), []);
-  const signInInstead = useCallback(() => restoreControl.current.signInInstead(), []);
-  const restore = useMemo<RestoreState>(
-    () => ({ ...restoreInfo, retryNow, signInInstead }),
-    [restoreInfo, retryNow, signInInstead],
-  );
 
   /**
    * Ensures a CSRF token exists and returns it as a header pair.
@@ -585,7 +516,6 @@ export function CoreProvider({
       chatSocket,
       session,
       status,
-      restore,
       release,
       apiUrl,
       wsUrl,
@@ -603,7 +533,6 @@ export function CoreProvider({
       chatSocket,
       session,
       status,
-      restore,
       release,
       apiUrl,
       wsUrl,

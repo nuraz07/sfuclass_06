@@ -274,13 +274,7 @@ export const createHttpClient = (options: HttpClientOptions): HttpClient => {
     if (!auth) return Promise.resolve(null);
     refreshInFlight ??= auth
       .refresh()
-      .catch((error) => {
-        // The refresh did not get an answer (server restarting, network gone):
-        // the request fails, the session stays. Only a "no" from the server
-        // (refresh() resolving null) ends it.
-        if (ApiError.is(error) && isRetryable(error.code)) throw error;
-        return null;
-      })
+      .catch(() => null)
       .finally(() => {
         refreshInFlight = null;
       });

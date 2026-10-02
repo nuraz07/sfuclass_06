@@ -1,8 +1,39 @@
-import { Suspense, lazy } from 'react';
+import { Suspense, lazy, useEffect, useState } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useCore } from '@classroom/core-client';
 
 const LandingPage = lazy(() => import('../../pages/LandingPage.jsx'));
+
+/**
+ * The server did not answer while your session was being resumed (it may be
+ * restarting). The session is kept; this retries by itself and signs you in
+ * the moment the server is back.
+ */
+function ReconnectNotice({ restore }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const seconds = restore.nextRetryAt ? Math.max(0, Math.ceil((restore.nextRetryAt - now) / 1000)) : 0;
+  return (
+    <div className="app app-empty" role="status" aria-live="polite" style={{ display: 'grid', placeItems: 'center', minHeight: '60vh', textAlign: 'center', gap: 12, padding: 24 }}>
+      <div style={{ display: 'grid', gap: 10, maxWidth: 420 }}>
+        <strong style={{ fontSize: 18 }}>Reconnecting to the server…</strong>
+        <span>You are still signed in. As soon as the server answers, you are back where you were.</span>
+        <span style={{ opacity: 0.7, fontSize: 14 }}>{seconds > 0 ? `Next try in ${seconds} s` : 'Trying now…'}</span>
+        <span style={{ display: 'flex', gap: 10, justifyContent: 'center', flexWrap: 'wrap', marginTop: 4 }}>
+          <button type="button" className="btn btn--primary" onClick={restore.retryNow}>
+            Try now
+          </button>
+          <button type="button" className="btn" onClick={restore.signInInstead}>
+            Go to sign-in
+          </button>
+        </span>
+      </div>
+    </div>
+  );
+}
 
 /**
  * The line between the homepage and the product  (Landing)
@@ -17,11 +48,11 @@ const LandingPage = lazy(() => import('../../pages/LandingPage.jsx'));
  * keep their own handling.
  */
 export default function AuthGate() {
-  const { status } = useCore();
+  const { status, restore } = useCore();
   const location = useLocation();
 
   if (status === 'authenticated') return <Outlet />;
-  if (status === 'restoring') return <p className="app app-empty">Loading…</p>;
+  if (status === 'restoring') return restore?.reconnecting ? <ReconnectNotice restore={restore} /> : <p className="app app-empty">Loading…</p>;
 
   if (location.pathname === '/') {
     return (
