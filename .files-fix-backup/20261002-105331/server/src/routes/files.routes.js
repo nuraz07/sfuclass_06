@@ -106,9 +106,8 @@ router.get('/:id/content', validate({ params: idParam }), async (req, res, next)
     req.on('close', () => opened.body.destroy?.());
     return opened.body.pipe(res);
   } catch (error) {
-    const status = { forbidden: 403, not_found: 404, unavailable: 503 }[error?.code];
-    if (status) {
-      res.status(status).type('text/plain; charset=utf-8').send(error.message);
+    if (error?.code === 'forbidden' || error?.code === 'not_found') {
+      res.status(error.code === 'forbidden' ? 403 : 404).type('text/plain; charset=utf-8').send(error.message);
       return undefined;
     }
     return next(error);

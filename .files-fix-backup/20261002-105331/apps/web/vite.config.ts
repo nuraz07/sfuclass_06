@@ -150,17 +150,6 @@ export default defineConfig(({ mode }) => {
           target: env.VITE_DEV_S3_TARGET || 'http://localhost:9000',
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/s3(?=\/|$)/, '') || '/',
-          // Codespaces (and any port forwarder) adds X-Forwarded-Host with the
-          // public address. The storage would then check the signature against
-          // that host instead of the one the API signed for (S3_ENDPOINT) and
-          // answer 403. For storage this proxy is the client, so they go.
-          configure: (proxy) => {
-            proxy.on('proxyReq', (proxyReq) => {
-              for (const header of ['x-forwarded-host', 'x-forwarded-port', 'x-forwarded-proto', 'x-forwarded-for', 'x-forwarded-prefix', 'forwarded']) {
-                proxyReq.removeHeader(header);
-              }
-            });
-          },
         },
       },
     },

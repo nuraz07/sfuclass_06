@@ -52,31 +52,10 @@ const LibrarySchema = z
   .passthrough();
 export type FileLibrary = z.infer<typeof LibrarySchema>;
 
-export const FileUsageSchema = z
-  .object({
-    items: z.array(
-      z
-        .object({
-          materialId: z.string(),
-          spaceId: z.string(),
-          spaceName: z.string(),
-          emoji: z.string().nullable().default(null),
-          addedAt: z.string().nullable().default(null),
-        })
-        .passthrough(),
-    ),
-  })
-  .passthrough();
-export type FileUsage = z.infer<typeof FileUsageSchema>;
-
-export type LibrarySort = 'new' | 'old' | 'name' | 'size';
-
 export interface FilesApi {
   startUpload(input: { name: string; sizeBytes: number }): Promise<UploadTicket>;
   completeUpload(fileId: string): Promise<FileView>;
-  list(query?: { q?: string; kind?: string; sort?: LibrarySort }, signal?: AbortSignal): Promise<FileLibrary>;
-  /** The spaces where one of my files is a material. */
-  usage(fileId: string, signal?: AbortSignal): Promise<FileUsage>;
+  list(query?: { q?: string; kind?: string }, signal?: AbortSignal): Promise<FileLibrary>;
   rename(fileId: string, name: string): Promise<FileView>;
   remove(fileId: string): Promise<unknown>;
   link(fileId: string): Promise<{ url: string }>;
@@ -93,7 +72,6 @@ export const createFilesApi = (http: HttpClient): FilesApi => ({
       query: Object.fromEntries(Object.entries(query).filter(([, value]) => value)),
       signal,
     }),
-  usage: (fileId, signal) => http.get(`/files/${enc(fileId)}/usage`, { schema: FileUsageSchema, signal }),
   rename: (fileId, name) => http.patch(`/files/${enc(fileId)}`, { name }, { schema: FileViewSchema }),
   remove: (fileId) => http.delete(`/files/${enc(fileId)}`),
   link: (fileId) => http.get(`/files/${enc(fileId)}/link`, { schema: z.object({ url: z.string() }).passthrough() }),

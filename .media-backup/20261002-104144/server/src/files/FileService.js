@@ -24,7 +24,6 @@ import { pool } from '../db/pool.js';
 import { logger } from '../observability/logger.js';
 import * as Rules from './fileRules.js';
 import * as Store from './FileStore.js';
-import * as Library from './libraryRules.js';
 
 const log = logger.child({ component: 'files' });
 
@@ -166,7 +165,7 @@ export const completeUpload = async ({ viewer, fileId }) => {
 // The library
 // ---------------------------------------------------------------------------
 
-export const list = async ({ viewer, q = null, kind = null, sort = Library.DEFAULT_SORT }) => {
+export const list = async ({ viewer, q = null, kind = null }) => {
   const params = [viewer.userId];
   const filters = [];
   if (q) {
@@ -181,7 +180,7 @@ export const list = async ({ viewer, q = null, kind = null, sort = Library.DEFAU
     `SELECT f.*, (SELECT count(*) FROM space_materials m WHERE m.file_id = f.id AND m.deleted_at IS NULL) AS used_in
        FROM files f
       WHERE f.owner_id = $1 AND f.deleted_at IS NULL AND f.status = 'ready' ${filters.length ? `AND ${filters.join(' AND ')}` : ''}
-      ORDER BY ${Library.orderBy(sort)} LIMIT 500`,
+      ORDER BY f.created_at DESC LIMIT 500`,
     params,
   );
   const { maxFileBytes, quotaBytes } = limits();
@@ -206,25 +205,6 @@ export const rename = async ({ viewer, fileId, name }) => {
   if (!clean || clean === `.${row.ext}`) fail('validation_failed', 'Give the file a name.');
   const { rows } = await pool.query(`UPDATE files SET name = $2, updated_at = now() WHERE id = $1 RETURNING *`, [row.id, clean]);
   return toView(rows[0]);
-};
-
-/**
- * Where one of my files is a material: the spaces, so Media can show it and
- * say before a delete what the delete also removes. Only the owner asks;
- * only the owner can have added it (HubExtras.addMaterial).
- */
-export const usage = async ({ viewer, fileId }) => {
-  const row = await ownFile(viewer, fileId);
-  const { rows } = await pool.query(
-    `SELECT m.id AS material_id, m.created_at AS added_at, s.id AS space_id, s.name AS space_name,
-            to_jsonb(s) ->> 'emoji' AS space_emoji
-       FROM space_materials m
-       JOIN spaces s ON s.id = m.space_id
-      WHERE m.file_id = $1 AND m.deleted_at IS NULL
-      ORDER BY lower(s.name), m.created_at`,
-    [row.id],
-  );
-  return { items: rows.map(Library.toUsage) };
 };
 
 /** Deleting a file also removes it from every space it was a material in. */
@@ -255,24 +235,6 @@ export const linkFor = async ({ viewer, fileId }) => {
   return { url: openPath(fileId) };
 };
 
-/** The storage answered that the object is not there (as opposed to not answering). */
-const isMissingObject = (cause) =>
-  ['NoSuchKey', 'NotFound'].includes(cause?.name) || cause?.Code === 'NoSuchKey' || cause?.$metadata?.httpStatusCode === 404;
-
-/**
- * A file whose bytes are gone from storage (for example after the storage
- * was replaced) leaves the library and stops counting against the quota.
- * The row stays, with the reason; materials pointing at it show it as gone.
- */
-const markMissing = async (row) => {
-  await pool.query(
-    `UPDATE files SET status = 'rejected', reject_reason = 'The stored file is missing.', updated_at = now()
-      WHERE id = $1 AND status = 'ready'`,
-    [row.id],
-  );
-  log.warn({ fileId: row.id, bucket: row.bucket, key: row.object_key }, 'stored object missing; file marked unavailable');
-};
-
 /** For a signed link: the file's headers and a stream (or a range of it). */
 export const open = async ({ fileId, token, rangeHeader }) => {
   if (!Rules.verifyLinkToken({ fileId, token, secret: secret() })) fail('forbidden', 'This link has expired. Open the file again from where you found it.');
@@ -284,18 +246,8 @@ export const open = async ({ fileId, token, rangeHeader }) => {
   if (rangeHeader && !range) return { status: 416, headers: { 'Content-Range': `bytes */${size}` }, body: null };
   const headers = Rules.deliveryHeaders({ ext: row.ext, name: row.name, sizeBytes: range ? range.end - range.start + 1 : size });
   if (range) headers['Content-Range'] = `bytes ${range.start}-${range.end}/${size}`;
-  let body;
-  try {
-    body = await Store.stream({ bucket: row.bucket, key: row.object_key, range });
-  } catch (cause) {
-    if (isMissingObject(cause)) {
-      await markMissing(row);
-      fail('not_found', 'This file is no longer in storage. Upload it again.');
-    }
-    log.error({ err: cause, fileId: row.id }, 'storage unavailable while opening a file');
-    fail('unavailable', 'The file storage is not reachable right now. Try again in a moment.');
-  }
+  const body = await Store.stream({ bucket: row.bucket, key: row.object_key, range });
   return { status: range ? 206 : 200, headers, body };
 };
 
-export default { limits, openPath, toView, createUpload, completeUpload, list, usage, rename, remove, canView, linkFor, open };
+export default { limits, openPath, toView, createUpload, completeUpload, list, rename, remove, canView, linkFor, open };

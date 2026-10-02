@@ -255,24 +255,6 @@ export const linkFor = async ({ viewer, fileId }) => {
   return { url: openPath(fileId) };
 };
 
-/** The storage answered that the object is not there (as opposed to not answering). */
-const isMissingObject = (cause) =>
-  ['NoSuchKey', 'NotFound'].includes(cause?.name) || cause?.Code === 'NoSuchKey' || cause?.$metadata?.httpStatusCode === 404;
-
-/**
- * A file whose bytes are gone from storage (for example after the storage
- * was replaced) leaves the library and stops counting against the quota.
- * The row stays, with the reason; materials pointing at it show it as gone.
- */
-const markMissing = async (row) => {
-  await pool.query(
-    `UPDATE files SET status = 'rejected', reject_reason = 'The stored file is missing.', updated_at = now()
-      WHERE id = $1 AND status = 'ready'`,
-    [row.id],
-  );
-  log.warn({ fileId: row.id, bucket: row.bucket, key: row.object_key }, 'stored object missing; file marked unavailable');
-};
-
 /** For a signed link: the file's headers and a stream (or a range of it). */
 export const open = async ({ fileId, token, rangeHeader }) => {
   if (!Rules.verifyLinkToken({ fileId, token, secret: secret() })) fail('forbidden', 'This link has expired. Open the file again from where you found it.');
@@ -284,17 +266,7 @@ export const open = async ({ fileId, token, rangeHeader }) => {
   if (rangeHeader && !range) return { status: 416, headers: { 'Content-Range': `bytes */${size}` }, body: null };
   const headers = Rules.deliveryHeaders({ ext: row.ext, name: row.name, sizeBytes: range ? range.end - range.start + 1 : size });
   if (range) headers['Content-Range'] = `bytes ${range.start}-${range.end}/${size}`;
-  let body;
-  try {
-    body = await Store.stream({ bucket: row.bucket, key: row.object_key, range });
-  } catch (cause) {
-    if (isMissingObject(cause)) {
-      await markMissing(row);
-      fail('not_found', 'This file is no longer in storage. Upload it again.');
-    }
-    log.error({ err: cause, fileId: row.id }, 'storage unavailable while opening a file');
-    fail('unavailable', 'The file storage is not reachable right now. Try again in a moment.');
-  }
+  const body = await Store.stream({ bucket: row.bucket, key: row.object_key, range });
   return { status: range ? 206 : 200, headers, body };
 };
 

@@ -1,0 +1,1117 @@
+=== FILE: packages/core-client/src/CoreProvider.tsx ===
+/**
+ * CoreProvider  (F5)
+ *
+ * Owns the things that are singular per tab: the API client with its refresh
+ * and trace ids, the authenticated session, the chat socket, and the room-to-
+ * node resolver. Nothing below it constructs a transport of its own.
+ *
+ * What it deliberately does *not* own: the SfuClient.
+ *
+ * A tab has one HTTP client and one chat connection for its whole life. A
+ * lesson does not — it starts when someone opens a room and ends when they
+ * leave, and it drags in mediasoup-client, the largest dependency in the
+ * product. Building it here would put mediasoup in the main bundle and make the
+ * lazy route split in main.jsx meaningless. The classroom route assembles its
+ * own SfuClient from the pieces below, so mediasoup loads only for people who
+ * actually join a lesson.
+ *
+ * Three things are worth reading before changing anything here.
+ *
+ * Tokens. Both the access token and the refresh token live in memory. The
+ * refresh token would normally sit in an httpOnly cookie, and in production it
+ * should — but behind a tunnel that serves the page over https while proxying
+ * to a plain-http API, browsers discard that cookie without a word: no console
+ * warning, no failed request, only a 401 several steps later that looks like an
+ * auth bug rather than a storage one. Asking for the token in the response body
+ * with `wantsRefreshToken` — the path apps/mobile already uses, because a React
+ * Native app has no cookie jar either — removes the browser's cookie policy
+ * from the equation entirely.
+ *
+ * The cost is explicit: nothing survives a reload, so a reload signs you out.
+ * That is a development trade, not a design. Restoring the cookie path means
+ * dropping `wantsRefreshToken` and letting refresh read the cookie again.
+ *
+ * Two-step sign-in (Settings, Phase C). For an account with an authenticator
+ * app or a passkey, POST /auth/login answers with a challenge instead of
+ * tokens. signIn() then throws SecondFactorRequired, and the sign-in page
+ * finishes with completeSignIn() (a code) or signInWithPasskey() (a passkey,
+ * with or without a password first). Nothing is signed in before that.
+ *
+ * CSRF. middleware/csrf.js issues the cookie on the way out but validates on
+ * the way in, so the very first call to a protected route can never succeed — a
+ * client cannot echo a token it has not been given. Bootstrapping therefore
+ * runs in two steps: GET /auth/csrf, which is an ignored method and returns the
+ * token in its body, then the protected call with that token echoed back.
+ */
+
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+
+import { ApiError, HEADERS } from '@classroom/contracts';
+
+import { createHttpClient, type AuthProvider, type HttpClient } from './http/httpClient.js';
+import { createSocketClient, type SocketClient } from './socket/socketClient.js';
+import { createNodeResolver, type NodeResolver } from './rtc/nodeResolver.js';
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+export interface Session {
+  userId: string;
+  displayName: string;
+  avatarUrl: string | null;
+  /** Tenant role, not the room role — a teacher is still a learner elsewhere. */
+  role: 'owner' | 'teacher' | 'learner';
+  tenantId: string;
+}
+
+export type AuthStatus = 'restoring' | 'authenticated' | 'anonymous';
+
+/** What auth.routes.js `issue()` puts in the body. */
+export interface TokenResponse {
+  accessToken: string;
+  expiresIn: number;
+  tokenType: 'Bearer';
+  user: Session;
+  /** Present only when the request asked for it. */
+  refreshToken?: string;
+  sessionId?: string;
+}
+
+/** POST /auth/login for an account with two-step sign-in. */
+interface ChallengeResponse {
+  secondFactorRequired: true;
+  challengeId: string;
+  methods: Array<'totp' | 'recovery' | 'passkey'>;
+  expiresInSec?: number;
+}
+
+/**
+ * Thrown by signIn() when the password was right and a second step is needed.
+ * Not an ApiError: nothing failed.
+ */
+export class SecondFactorRequired extends Error {
+  readonly secondFactorRequired = true;
+  readonly challengeId: string;
+  readonly methods: ChallengeResponse['methods'];
+  readonly expiresInSec: number;
+
+  constructor(challenge: ChallengeResponse) {
+    super('A second step is needed to sign in.');
+    this.name = 'SecondFactorRequired';
+    this.challengeId = challenge.challengeId;
+    this.methods = challenge.methods ?? [];
+    this.expiresInSec = challenge.expiresInSec ?? 300;
+  }
+}
+
+/** WebAuthn options as the server sends them (JSON, base64url). */
+export interface PasskeyOptions {
+  optionsId: string;
+  options: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// Context
+// ---------------------------------------------------------------------------
+
+export interface CoreContextValue {
+  http: HttpClient;
+  nodeResolver: NodeResolver;
+  /** The `/chat` connection. Null until there is a session to authenticate it. */
+  chatSocket: SocketClient | null;
+  session: Session | null;
+  status: AuthStatus;
+  release: string;
+  apiUrl: string;
+  wsUrl: string;
+  /** Handed to SfuClient and to any socket the classroom route opens. */
+  getAccessToken(): string | null;
+  /** Throws SecondFactorRequired when the account has two-step sign-in. */
+  signIn(credentials: { email: string; password: string }): Promise<Session>;
+  /** The second step with a code from the authenticator app or a recovery code. */
+  /** Creates an account and signs it in (Landing). */
+  signUp(input: { displayName: string; email: string; password: string; username?: string | null }): Promise<Session>;
+  completeSignIn(input: { challengeId: string; code: string }): Promise<Session>;
+  /** Options for a passkey: the second step (with a challengeId) or a sign-in on its own. */
+  passkeyOptions(input?: { challengeId?: string | null }): Promise<PasskeyOptions>;
+  /** Finishes a passkey sign-in with the browser's answer. */
+  signInWithPasskey(input: {
+    challengeId?: string | null;
+    optionsId: string;
+    response: Record<string, unknown>;
+  }): Promise<Session>;
+  signOut(): Promise<void>;
+}
+
+const CoreContext = createContext<CoreContextValue | null>(null);
+
+export const useCore = (): CoreContextValue => {
+  const value = useContext(CoreContext);
+  if (!value) throw new Error('useCore must be used inside <CoreProvider>');
+  return value;
+};
+
+/** Convenience accessors, so a component that needs one thing imports one thing. */
+export const useHttp = (): HttpClient => useCore().http;
+export const useSession = (): Session | null => useCore().session;
+
+// ---------------------------------------------------------------------------
+// Provider
+// ---------------------------------------------------------------------------
+
+export interface CoreProviderProps {
+  apiUrl: string;
+  wsUrl: string;
+  release: string;
+  children: ReactNode;
+  /** Where to send someone whose session expired. Defaults to no redirect. */
+  onSessionExpired?(): void;
+}
+
+export function CoreProvider({
+  apiUrl,
+  wsUrl,
+  release,
+  children,
+  onSessionExpired,
+}: CoreProviderProps) {
+  // Refs, not state: all four are read inside callbacks that must not go stale
+  // between renders, and changing any of them should never trigger one.
+  const accessTokenRef = useRef<string | null>(null);
+  const csrfTokenRef = useRef<string | null>(null);
+  const refreshTokenRef = useRef<string | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+
+  const [session, setSession] = useState<Session | null>(null);
+  // The refresh cookie (httpOnly, set by the server at sign-in and renewed with
+  // every refresh) survives a reload: start in 'restoring' and ask once.
+  const [status, setStatus] = useState<AuthStatus>('restoring');
+
+  const sessionExpiredRef = useRef(onSessionExpired);
+  sessionExpiredRef.current = onSessionExpired;
+
+  // -------------------------------------------------------------------------
+  // HTTP
+  // -------------------------------------------------------------------------
+
+  /**
+   * One renewal through the refresh cookie. A Web Lock serialises renewals
+   * across tabs: the token rotates on every use, and two tabs presenting the
+   * same one at once would look like theft and end the session everywhere.
+   * Rejects when this browser has no valid session.
+   */
+  const renewViaCookie = async () => {
+    const run = async () => {
+      // A plain client: the main one would recurse, its 401 handling calls refresh().
+      const bare = createHttpClient({ baseUrl: apiUrl, credentials: 'include' });
+      return bare.post('/auth/refresh', {}, { anonymous: true, headers: await csrfHeaders(bare) });
+    };
+    const locks = (globalThis as { navigator?: { locks?: { request: (name: string, fn: () => Promise<unknown>) => Promise<unknown> } } })
+      .navigator?.locks;
+    return locks ? locks.request('classroom:session-refresh', run) : run();
+  };
+
+  const http = useMemo<HttpClient>(() => {
+    const auth: AuthProvider = {
+      getAccessToken: () => accessTokenRef.current,
+
+      /**
+       * httpClient serialises concurrent callers onto one call, so a burst of
+       * 401s produces one refresh — which matters because the refresh token
+       * rotates on every use and a second concurrent call would present an
+       * already-rotated token. AuthService treats that as theft and revokes the
+       * whole session family.
+       */
+      async refresh() {
+        // Through the httpOnly cookie only. The token used to be sent from
+        // memory, but the route dropped its session id, so every renewal
+        // failed and people were signed out when the first access token ran out.
+        try {
+          const result = (await renewViaCookie()) as TokenResponse;
+          accessTokenRef.current = result.accessToken;
+          refreshTokenRef.current = null;
+          if (result.sessionId) sessionIdRef.current = result.sessionId;
+
+          setSession(result.user);
+          setStatus('authenticated');
+          return result.accessToken;
+        } catch {
+          return null;
+        }
+      },
+
+      onSessionExpired() {
+        accessTokenRef.current = null;
+        refreshTokenRef.current = null;
+        sessionIdRef.current = null;
+        setSession(null);
+        setStatus('anonymous');
+        sessionExpiredRef.current?.();
+      },
+
+      // Used by httpClient for every non-GET request that is not anonymous.
+      getCsrfToken: () => csrfTokenRef.current,
+    };
+
+    return createHttpClient({
+      baseUrl: apiUrl,
+      auth,
+      // Still 'include' so the CSRF cookie round-trips; the refresh token no
+      // longer depends on it.
+      credentials: 'include',
+      defaultHeaders: { 'x-client-release': release },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiUrl, release]);
+
+  // On load: resume the session from the refresh cookie, once. A failure only
+  // means nobody is signed in on this browser.
+  useEffect(() => {
+    let cancelled = false;
+    renewViaCookie()
+      .then((result) => {
+        if (cancelled) return;
+        const tokens = result as TokenResponse;
+        accessTokenRef.current = tokens.accessToken;
+        if (tokens.sessionId) sessionIdRef.current = tokens.sessionId;
+        setSession(tokens.user);
+        setStatus('authenticated');
+      })
+      .catch(() => {
+        if (!cancelled) setStatus((current) => (current === 'restoring' ? 'anonymous' : current));
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiUrl]);
+
+  /**
+   * Ensures a CSRF token exists and returns it as a header pair.
+   *
+   * Login, refresh and logout are sent with `anonymous: true` — otherwise
+   * httpClient would attach a bearer token they do not need and, worse, would
+   * run its refresh-on-401 logic against the refresh route itself. Anonymous
+   * requests skip httpClient's automatic CSRF header, so these three set it by
+   * hand.
+   */
+  const csrfHeaders = useCallback(
+    async (client: HttpClient = http): Promise<Record<string, string>> => {
+      if (!csrfTokenRef.current) {
+        try {
+          const { csrfToken } = (await client.get('/auth/csrf')) as { csrfToken: string };
+          csrfTokenRef.current = csrfToken;
+        } catch {
+          // Let the request proceed and fail on its own terms; a 403 with a
+          // clear message beats a silent no-op here.
+          return {};
+        }
+      }
+      return { [HEADERS.csrfToken]: csrfTokenRef.current as string };
+    },
+    [http],
+  );
+
+  // -------------------------------------------------------------------------
+  // Room to node resolution (F1)
+  // -------------------------------------------------------------------------
+
+  // Lives here rather than in the classroom route so its cache survives leaving
+  // and rejoining a lesson.
+  const nodeResolver = useMemo(() => createNodeResolver({ http }), [http]);
+
+  // -------------------------------------------------------------------------
+  // Chat socket (F6)
+  // -------------------------------------------------------------------------
+
+  const [chatSocket, setChatSocket] = useState<SocketClient | null>(null);
+
+  useEffect(() => {
+    if (status !== 'authenticated') return undefined;
+
+    const socket = createSocketClient({
+      namespace: '/chat',
+      getAccessToken: () => accessTokenRef.current,
+    });
+
+    let cancelled = false;
+    void socket
+      .connect(wsUrl, {})
+      .then(() => {
+        if (!cancelled) setChatSocket(socket);
+      })
+      .catch(() => {
+        // A chat socket that will not open must not take the app down with it.
+        // Everything else keeps working; the dock shows itself as offline.
+      });
+
+    return () => {
+      cancelled = true;
+      socket.disconnect();
+      setChatSocket(null);
+    };
+  }, [status, wsUrl]);
+
+  // -------------------------------------------------------------------------
+  // Actions
+  // -------------------------------------------------------------------------
+
+  /** Takes the tokens of any successful sign-in: password, second step or passkey. */
+  const adopt = useCallback((result: TokenResponse): Session => {
+    accessTokenRef.current = result.accessToken;
+    refreshTokenRef.current = result.refreshToken ?? null;
+    sessionIdRef.current = result.sessionId ?? null;
+
+    setSession(result.user);
+    setStatus('authenticated');
+    return result.user;
+  }, []);
+
+  const signIn = useCallback<CoreContextValue['signIn']>(
+    async (credentials) => {
+      const headers = await csrfHeaders();
+
+      const result = (await http.post(
+        '/auth/login',
+        {
+          ...credentials,
+          device: { platform: 'web' },
+          // The whole reason this works behind the tunnel: the token comes back
+          // in the body instead of in a cookie the browser may silently drop.
+          wantsRefreshToken: true,
+        },
+        { anonymous: true, headers },
+      )) as TokenResponse | ChallengeResponse;
+
+      if ('secondFactorRequired' in result && result.secondFactorRequired) {
+        throw new SecondFactorRequired(result);
+      }
+      return adopt(result as TokenResponse);
+    },
+    [http, csrfHeaders, adopt],
+  );
+
+  const signUp = useCallback<CoreContextValue['signUp']>(
+    async ({ displayName, email, password, username = null }) => {
+      const headers = await csrfHeaders();
+      let timeZone: string | undefined;
+      try {
+        timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      } catch {
+        timeZone = undefined;
+      }
+      const language = (globalThis as { navigator?: { language?: string } }).navigator?.language;
+      const result = (await http.post(
+        '/auth/register',
+        {
+          displayName,
+          email,
+          password,
+          username: username || undefined,
+          timeZone,
+          locale: language ? language.slice(0, 2).toLowerCase() : undefined,
+          device: { platform: 'web' },
+          wantsRefreshToken: true,
+        },
+        // Not retried: a second attempt would only meet "already exists".
+        { anonymous: true, headers, retry: { attempts: 1 } },
+      )) as TokenResponse;
+      return adopt(result);
+    },
+    [http, csrfHeaders, adopt],
+  );
+
+  const completeSignIn = useCallback<CoreContextValue['completeSignIn']>(
+    async ({ challengeId, code }) => {
+      const headers = await csrfHeaders();
+      const result = (await http.post(
+        '/auth/login/second-factor',
+        { challengeId, code, device: { platform: 'web' }, wantsRefreshToken: true },
+        // Not retried: a code is single-use, a replay would be refused anyway.
+        { anonymous: true, headers, retry: { attempts: 1 } },
+      )) as TokenResponse;
+      return adopt(result);
+    },
+    [http, csrfHeaders, adopt],
+  );
+
+  const passkeyOptions = useCallback<CoreContextValue['passkeyOptions']>(
+    async ({ challengeId = null } = {}) => {
+      const headers = await csrfHeaders();
+      return (await http.post(
+        challengeId ? '/auth/login/second-factor/passkey/options' : '/auth/passkey/options',
+        challengeId ? { challengeId } : {},
+        { anonymous: true, headers, retry: { attempts: 1 } },
+      )) as PasskeyOptions;
+    },
+    [http, csrfHeaders],
+  );
+
+  const signInWithPasskey = useCallback<CoreContextValue['signInWithPasskey']>(
+    async ({ challengeId = null, optionsId, response }) => {
+      const headers = await csrfHeaders();
+      const body = { optionsId, response, device: { platform: 'web' }, wantsRefreshToken: true };
+      const result = (await http.post(
+        challengeId ? '/auth/login/second-factor/passkey' : '/auth/passkey',
+        challengeId ? { ...body, challengeId } : body,
+        { anonymous: true, headers, retry: { attempts: 1 } },
+      )) as TokenResponse;
+      return adopt(result);
+    },
+    [http, csrfHeaders, adopt],
+  );
+
+  const signOut = useCallback<CoreContextValue['signOut']>(async () => {
+    try {
+      const headers = await csrfHeaders();
+      await http.post(
+        '/auth/logout',
+        {},
+        { headers },
+      );
+    } catch (cause) {
+      // A logout that fails server-side still has to clear the client, or the
+      // user stays signed in on a machine they just tried to leave.
+      if (!ApiError.is(cause)) throw cause;
+    } finally {
+      accessTokenRef.current = null;
+      refreshTokenRef.current = null;
+      sessionIdRef.current = null;
+      // The old token is bound to the session that just ended.
+      csrfTokenRef.current = null;
+      nodeResolver.clear();
+      setSession(null);
+      setStatus('anonymous');
+    }
+  }, [http, csrfHeaders, nodeResolver]);
+
+  /**
+   * Stable across renders, deliberately.
+   *
+   * An inline arrow here is a new function every time the context value is
+   * rebuilt — which is on every session, status and socket change. Anything
+   * memoised against it downstream rebuilds too, and useSfuClient memoises the
+   * whole SfuClient against exactly this. The result was a client torn down and
+   * recreated on unrelated state changes, which the server sees as the peer
+   * leaving and a new one arriving.
+   *
+   * It reads a ref, so it never needs to change.
+   */
+  const getAccessToken = useCallback(() => accessTokenRef.current, []);
+
+  const value = useMemo<CoreContextValue>(
+    () => ({
+      http,
+      nodeResolver,
+      chatSocket,
+      session,
+      status,
+      release,
+      apiUrl,
+      wsUrl,
+      getAccessToken,
+      signIn,
+      signUp,
+      completeSignIn,
+      passkeyOptions,
+      signInWithPasskey,
+      signOut,
+    }),
+    [
+      http,
+      nodeResolver,
+      chatSocket,
+      session,
+      status,
+      release,
+      apiUrl,
+      wsUrl,
+      getAccessToken,
+      signIn,
+      signUp,
+      completeSignIn,
+      passkeyOptions,
+      signInWithPasskey,
+      signOut,
+    ],
+  );
+
+  return <CoreContext.Provider value={value}>{children}</CoreContext.Provider>;
+}
+
+export default CoreProvider;
+
+=== FILE: packages/core-client/src/http/httpClient.ts ===
+/**
+ * HTTP transport.
+ *
+ * One client, three runtimes: the browser, React Native and Node (tests, SSR).
+ * It therefore depends on `fetch` and nothing else — no axios, no XHR, no
+ * platform globals beyond what all three have.
+ *
+ * What it handles so that no caller has to:
+ *
+ *   auth        injects the access token, refreshes once on 401 and replays the
+ *               request; concurrent 401s share a single refresh
+ *   retries     network failures and retryable ApiErrors, with exponential
+ *               backoff and jitter — but never for a non-idempotent request
+ *               that carries no idempotency key
+ *   tracing     a fresh request id per attempt, a stable trace id per logical
+ *               request, both echoed in the server logs
+ *   errors      every failure arrives as an ApiError, whatever went wrong
+ *   validation  an optional zod schema parses the response, so a route that
+ *               drifts from the contract fails here rather than three layers up
+ *
+ * Deliberately not handled here: offline queueing and optimistic state. Those
+ * live in offline/syncQueue.ts and the state/ hooks, because they need to know
+ * what a mutation means, and this file does not.
+ */
+
+import type { z } from 'zod';
+import {
+  ApiError,
+  CONTRACT_VERSION,
+  HEADERS,
+  isRetryable,
+  type ErrorCode,
+} from '@classroom/contracts';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+/** Methods that may be replayed safely without an idempotency key. */
+const IDEMPOTENT_METHODS: ReadonlySet<HttpMethod> = new Set<HttpMethod>(['GET', 'PUT', 'DELETE']);
+
+export interface AuthProvider {
+  /** Current access token, or null when signed out. */
+  getAccessToken(): string | null | Promise<string | null>;
+  /**
+   * Exchanges the refresh credential for a new access token. Called at most
+   * once per 401 burst; the client serialises concurrent callers onto one
+   * promise. Returns null when the session is truly gone.
+   */
+  refresh(): Promise<string | null>;
+  /** The refresh failed. Clients route to the sign-in screen from here. */
+  onSessionExpired?(): void;
+  /** Double-submit token for the cookie-based refresh route. */
+  getCsrfToken?(): string | null;
+}
+
+export interface RetryPolicy {
+  /** Attempts in total, including the first. 1 disables retrying. */
+  attempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+export interface HttpClientOptions {
+  /** e.g. 'https://api.classroom.app'. A trailing slash is tolerated. */
+  baseUrl: string;
+  auth?: AuthProvider;
+  /** Injected so tests and React Native can substitute their own. */
+  fetchImpl?: typeof fetch;
+  /** Per-attempt timeout. A retry gets a fresh budget. */
+  timeoutMs?: number;
+  retry?: Partial<RetryPolicy>;
+  /** Sent on every request; the server rejects an unsupported major. */
+  contractVersion?: string;
+  /** Web sends the refresh cookie; mobile keeps tokens in secure storage. */
+  credentials?: RequestCredentials;
+  defaultHeaders?: Record<string, string>;
+  /** Observability hooks. Wired to the logger in the app layer, not here. */
+  onRequest?(info: RequestInfoEvent): void;
+  onResponse?(info: ResponseInfoEvent): void;
+  /** The API no longer speaks this build's contract version. */
+  onContractMismatch?(serverVersion: string | null): void;
+}
+
+export interface RequestOptions<TSchema extends z.ZodTypeAny = z.ZodTypeAny> {
+  method?: HttpMethod;
+  /** Serialised as JSON unless it is FormData or a string. */
+  body?: unknown;
+  query?: Record<string, string | number | boolean | undefined | null>;
+  headers?: Record<string, string>;
+  /** Parsed and type-narrowed on success. Omit to get the raw JSON. */
+  schema?: TSchema;
+  /**
+   * Makes a mutation safely retryable. The same key is reused across attempts,
+   * which is the whole point — a retry must be recognisable as the same call.
+   */
+  idempotencyKey?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  retry?: Partial<RetryPolicy>;
+  /** Skips the token and the refresh dance. Used by the auth routes. */
+  anonymous?: boolean;
+}
+
+export interface RequestInfoEvent {
+  method: HttpMethod;
+  path: string;
+  requestId: string;
+  traceId: string;
+  attempt: number;
+}
+
+export interface ResponseInfoEvent extends RequestInfoEvent {
+  status: number;
+  durationMs: number;
+  error?: ErrorCode;
+}
+
+type BodylessOptions<TSchema extends z.ZodTypeAny> = Omit<
+  RequestOptions<TSchema>,
+  'method' | 'body'
+>;
+
+export interface HttpClient {
+  request<TSchema extends z.ZodTypeAny>(
+    path: string,
+    options: RequestOptions<TSchema> & { schema: TSchema },
+  ): Promise<z.infer<TSchema>>;
+  request(path: string, options?: RequestOptions): Promise<unknown>;
+
+  get<TSchema extends z.ZodTypeAny>(
+    path: string,
+    options: BodylessOptions<TSchema> & { schema: TSchema },
+  ): Promise<z.infer<TSchema>>;
+  get(path: string, options?: BodylessOptions<z.ZodTypeAny>): Promise<unknown>;
+
+  post<TSchema extends z.ZodTypeAny>(
+    path: string,
+    body: unknown,
+    options: BodylessOptions<TSchema> & { schema: TSchema },
+  ): Promise<z.infer<TSchema>>;
+  post(path: string, body?: unknown, options?: BodylessOptions<z.ZodTypeAny>): Promise<unknown>;
+
+  patch<TSchema extends z.ZodTypeAny>(
+    path: string,
+    body: unknown,
+    options: BodylessOptions<TSchema> & { schema: TSchema },
+  ): Promise<z.infer<TSchema>>;
+  patch(path: string, body?: unknown, options?: BodylessOptions<z.ZodTypeAny>): Promise<unknown>;
+
+  put<TSchema extends z.ZodTypeAny>(
+    path: string,
+    body: unknown,
+    options: BodylessOptions<TSchema> & { schema: TSchema },
+  ): Promise<z.infer<TSchema>>;
+  put(path: string, body?: unknown, options?: BodylessOptions<z.ZodTypeAny>): Promise<unknown>;
+
+  delete<TSchema extends z.ZodTypeAny>(
+    path: string,
+    options: BodylessOptions<TSchema> & { schema: TSchema },
+  ): Promise<z.infer<TSchema>>;
+  delete(path: string, options?: BodylessOptions<z.ZodTypeAny>): Promise<unknown>;
+
+  /** Escape hatch for streaming and binary responses: no parsing, no retry. */
+  raw(method: HttpMethod, path: string, options?: RequestOptions): Promise<Response>;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const DEFAULT_RETRY: RetryPolicy = { attempts: 3, baseDelayMs: 300, maxDelayMs: 5_000 };
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+/** crypto.randomUUID exists in browsers, Node 22 and Hermes. */
+const newId = (): string =>
+  globalThis.crypto?.randomUUID?.() ??
+  `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
+
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(new ApiError('internal_error', { detail: 'Request aborted' }));
+      },
+      { once: true },
+    );
+  });
+
+/** Full jitter: spreads a thundering herd instead of synchronising it. */
+const backoffDelay = (attempt: number, policy: RetryPolicy): number => {
+  const exponential = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), policy.maxDelayMs);
+  return Math.random() * exponential;
+};
+
+const buildUrl = (baseUrl: string, path: string, query?: RequestOptions['query']): string => {
+  const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  if (!query) return url;
+
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null) continue;
+    params.append(key, String(value));
+  }
+  const qs = params.toString();
+  if (!qs) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}${qs}`;
+};
+
+const isFormData = (value: unknown): value is FormData =>
+  typeof FormData !== 'undefined' && value instanceof FormData;
+
+/**
+ * A transport failure — DNS, TLS, connection reset, timeout. Indistinguishable
+ * from each other through fetch, and all equally worth retrying.
+ */
+const asNetworkError = (cause: unknown, traceId: string): ApiError =>
+  new ApiError('dependency_unavailable', {
+    title: 'Network unavailable',
+    detail: 'The request did not reach the server.',
+    traceId,
+    cause,
+  });
+
+const statusToCode = (status: number): ErrorCode => {
+  if (status === 401) return 'unauthenticated';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not_found';
+  if (status === 413) return 'payload_too_large';
+  if (status === 426) return 'unsupported_contract_version';
+  if (status === 429) return 'rate_limited';
+  if (status >= 500) return 'dependency_unavailable';
+  return 'internal_error';
+};
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+export const createHttpClient = (options: HttpClientOptions): HttpClient => {
+  const {
+    baseUrl,
+    auth,
+    fetchImpl = globalThis.fetch?.bind(globalThis),
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    contractVersion = CONTRACT_VERSION,
+    credentials = 'include',
+    defaultHeaders = {},
+    onRequest,
+    onResponse,
+    onContractMismatch,
+  } = options;
+
+  if (!fetchImpl) {
+    throw new Error('No fetch implementation available; pass options.fetchImpl');
+  }
+
+  const retryDefaults: RetryPolicy = { ...DEFAULT_RETRY, ...options.retry };
+
+  /**
+   * Single-flight refresh. Ten parallel requests that all see a 401 must
+   * produce one refresh, not ten — otherwise the rotating refresh token
+   * invalidates itself and signs the user out.
+   */
+  let refreshInFlight: Promise<string | null> | null = null;
+
+  const refreshOnce = (): Promise<string | null> => {
+    if (!auth) return Promise.resolve(null);
+    refreshInFlight ??= auth
+      .refresh()
+      .catch(() => null)
+      .finally(() => {
+        refreshInFlight = null;
+      });
+    return refreshInFlight;
+  };
+
+  const buildHeaders = async (
+    method: HttpMethod,
+    requestOptions: RequestOptions,
+    requestId: string,
+    traceId: string,
+  ): Promise<Record<string, string>> => {
+    const headers: Record<string, string> = {
+      accept: 'application/json',
+      [HEADERS.contractVersion]: contractVersion,
+      [HEADERS.requestId]: requestId,
+      [HEADERS.traceId]: traceId,
+      ...defaultHeaders,
+      ...requestOptions.headers,
+    };
+
+    if (requestOptions.idempotencyKey) {
+      headers[HEADERS.idempotencyKey] = requestOptions.idempotencyKey;
+    }
+
+    if (!requestOptions.anonymous && auth) {
+      const token = await auth.getAccessToken();
+      if (token) headers.authorization = `Bearer ${token}`;
+      const csrf = auth.getCsrfToken?.();
+      if (csrf && method !== 'GET') headers[HEADERS.csrfToken] = csrf;
+    }
+
+    return headers;
+  };
+
+  const encodeBody = (
+    method: HttpMethod,
+    value: unknown,
+    headers: Record<string, string>,
+  ): BodyInit | undefined => {
+    if (value === undefined || method === 'GET') return undefined;
+    if (isFormData(value) || typeof value === 'string') return value as BodyInit;
+    headers['content-type'] = 'application/json';
+    return JSON.stringify(value);
+  };
+
+  const parseErrorBody = async (response: Response, traceId: string): Promise<ApiError> => {
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      body = undefined;
+    }
+
+    if (body && typeof body === 'object' && 'code' in (body as Record<string, unknown>)) {
+      const error = ApiError.fromResponse(body);
+      // Prefer the server's trace id; fall back to ours so nothing is unlinked.
+      if (!error.traceId) error.traceId = traceId;
+      return error;
+    }
+
+    // A response that is not shaped like an ApiError came from a proxy or the
+    // load balancer, not from the application.
+    return new ApiError(statusToCode(response.status), {
+      detail: `Unexpected response (${response.status})`,
+      traceId,
+    });
+  };
+
+  async function raw(
+    method: HttpMethod,
+    path: string,
+    requestOptions: RequestOptions = {},
+  ): Promise<Response> {
+    const requestId = newId();
+    const traceId = newId().replaceAll('-', '');
+    const headers = await buildHeaders(method, requestOptions, requestId, traceId);
+    const body = encodeBody(method, requestOptions.body, headers);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), requestOptions.timeoutMs ?? timeoutMs);
+    const onAbort = () => controller.abort();
+    requestOptions.signal?.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      return await fetchImpl(buildUrl(baseUrl, path, requestOptions.query), {
+        method,
+        headers,
+        body,
+        credentials,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+      requestOptions.signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  async function request(path: string, requestOptions: RequestOptions = {}): Promise<unknown> {
+    const method = requestOptions.method ?? 'GET';
+    const retry: RetryPolicy = { ...retryDefaults, ...requestOptions.retry };
+    const url = buildUrl(baseUrl, path, requestOptions.query);
+
+    /** Stable across retries: one logical request, one trace. */
+    const traceId = newId().replaceAll('-', '');
+    const canRetry = IDEMPOTENT_METHODS.has(method) || Boolean(requestOptions.idempotencyKey);
+
+    let refreshed = false;
+    let lastError: ApiError | undefined;
+
+    for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
+      const requestId = newId();
+      const startedAt = Date.now();
+
+      const headers = await buildHeaders(method, requestOptions, requestId, traceId);
+      const body = encodeBody(method, requestOptions.body, headers);
+
+      // Own controller per attempt, chained to the caller's signal so an abort
+      // upstream stops the retry loop as well as the in-flight fetch.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), requestOptions.timeoutMs ?? timeoutMs);
+      const onAbort = () => controller.abort();
+      requestOptions.signal?.addEventListener('abort', onAbort, { once: true });
+
+      onRequest?.({ method, path, requestId, traceId, attempt });
+
+      try {
+        const response = await fetchImpl(url, {
+          method,
+          headers,
+          body,
+          credentials,
+          signal: controller.signal,
+        });
+
+        if (response.ok) {
+          onResponse?.({
+            method,
+            path,
+            requestId,
+            traceId,
+            attempt,
+            status: response.status,
+            durationMs: Date.now() - startedAt,
+          });
+
+          if (response.status === 204) return undefined;
+          const json: unknown = await response.json().catch(() => undefined);
+          return requestOptions.schema ? requestOptions.schema.parse(json) : json;
+        }
+
+        const error = await parseErrorBody(response, traceId);
+        onResponse?.({
+          method,
+          path,
+          requestId,
+          traceId,
+          attempt,
+          status: response.status,
+          durationMs: Date.now() - startedAt,
+          error: error.code,
+        });
+
+        if (error.code === 'unsupported_contract_version') {
+          onContractMismatch?.(response.headers.get(HEADERS.contractVersion));
+          throw error;
+        }
+
+        // One refresh, one replay. A second 401 means the session is gone.
+        if (
+          response.status === 401 &&
+          error.code !== 'token_revoked' &&
+          !refreshed &&
+          !requestOptions.anonymous &&
+          auth
+        ) {
+          refreshed = true;
+          const token = await refreshOnce();
+          if (token) continue;
+          auth.onSessionExpired?.();
+          throw error;
+        }
+
+        if (response.status === 401) {
+          auth?.onSessionExpired?.();
+          throw error;
+        }
+
+        const retryable = canRetry && isRetryable(error.code) && attempt < retry.attempts;
+        if (!retryable) throw error;
+
+        lastError = error;
+        // Honour Retry-After when the server sent one; it knows better.
+        const delay = error.retryAfter ? error.retryAfter * 1000 : backoffDelay(attempt, retry);
+        await sleep(delay, requestOptions.signal);
+        continue;
+      } catch (cause) {
+        if (ApiError.is(cause)) throw cause;
+
+        // Caller aborted deliberately: not a failure to report or retry.
+        if (requestOptions.signal?.aborted) {
+          throw new ApiError('internal_error', { detail: 'Request cancelled', traceId, cause });
+        }
+
+        const networkError = asNetworkError(cause, traceId);
+        onResponse?.({
+          method,
+          path,
+          requestId,
+          traceId,
+          attempt,
+          status: 0,
+          durationMs: Date.now() - startedAt,
+          error: networkError.code,
+        });
+
+        // A timeout or a dropped connection is retryable for any method: the
+        // server may never have seen the request at all.
+        if (attempt < retry.attempts) {
+          lastError = networkError;
+          await sleep(backoffDelay(attempt, retry), requestOptions.signal);
+          continue;
+        }
+        throw networkError;
+      } finally {
+        clearTimeout(timer);
+        requestOptions.signal?.removeEventListener('abort', onAbort);
+      }
+    }
+
+    throw lastError ?? new ApiError('internal_error', { detail: 'Request failed', traceId });
+  }
+
+  const client = {
+    request,
+    raw,
+    get: (path: string, opts: RequestOptions = {}) => request(path, { ...opts, method: 'GET' }),
+    post: (path: string, body?: unknown, opts: RequestOptions = {}) =>
+      request(path, { ...opts, method: 'POST', body }),
+    patch: (path: string, body?: unknown, opts: RequestOptions = {}) =>
+      request(path, { ...opts, method: 'PATCH', body }),
+    put: (path: string, body?: unknown, opts: RequestOptions = {}) =>
+      request(path, { ...opts, method: 'PUT', body }),
+    delete: (path: string, opts: RequestOptions = {}) =>
+      request(path, { ...opts, method: 'DELETE' }),
+  };
+
+  return client as unknown as HttpClient;
+};
+=== FILE: apps/web/src/components/system/AuthGate.jsx ===
+import { Suspense, lazy } from 'react';
+import { Navigate, Outlet, useLocation } from 'react-router-dom';
+import { useCore } from '@classroom/core-client';
+
+const LandingPage = lazy(() => import('../../pages/LandingPage.jsx'));
+
+/**
+ * The line between the homepage and the product  (Landing)
+ *
+ *   signed in       the app, exactly as before (everything under AppLayout)
+ *   not signed in   "/"           the public homepage
+ *                   anything else the sign-in page, which returns here after
+ *   restoring       a short loading state, so nobody sees the homepage flash
+ *                   while a session is being resumed
+ *
+ * The classroom, room lobbies and the sign-in pages sit outside this gate and
+ * keep their own handling.
+ */
+export default function AuthGate() {
+  const { status } = useCore();
+  const location = useLocation();
+
+  if (status === 'authenticated') return <Outlet />;
+  if (status === 'restoring') return <p className="app app-empty">Loading…</p>;
+
+  if (location.pathname === '/') {
+    return (
+      <Suspense fallback={<p className="app app-empty">Loading…</p>}>
+        <LandingPage />
+      </Suspense>
+    );
+  }
+  return <Navigate to="/login" replace state={{ from: `${location.pathname}${location.search}` }} />;
+}
+
