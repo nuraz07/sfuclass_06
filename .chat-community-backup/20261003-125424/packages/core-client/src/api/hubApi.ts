@@ -372,17 +372,8 @@ export interface HubApi {
   pinMaterial(materialId: string, pinned: boolean): Promise<HubMaterial>;
   removeMaterial(materialId: string): Promise<unknown>;
   chat(spaceId: string, after?: string | null, signal?: AbortSignal): Promise<z.infer<typeof ChatPageSchema>>;
-  sendChat(
-    spaceId: string,
-    input: string | { body?: string; fileIds?: string[]; voice?: { durationMs: number }; replyToId?: string | null },
-  ): Promise<HubMessage>;
+  sendChat(spaceId: string, body: string): Promise<HubMessage>;
   removeChat(messageId: string): Promise<unknown>;
-  /** Community: edit your own message, within the edit window. */
-  editChat(messageId: string, body: string): Promise<HubMessage>;
-  /** Community: add or remove one emoji. */
-  reactChat(messageId: string, input: { emoji: string; action: 'add' | 'remove' }): Promise<{ messageId: string; emoji: string; count: number; reacted: boolean; names: string[] }>;
-  /** Community: pictures and videos · files · voice messages of a space chat. */
-  chatMedia(spaceId: string, query?: { kind?: 'media' | 'files' | 'voice'; before?: string | null }, signal?: AbortSignal): Promise<{ items: Array<Record<string, unknown>>; nextBefore: string | null }>;
   rooms(spaceId: string, signal?: AbortSignal): Promise<{ items: HubRoom[] }>;
   dropIn(spaceId: string): Promise<{ room: HubRoom; started: boolean }>;
   // Part 3
@@ -458,12 +449,7 @@ export const createHubApi = (http: HttpClient): HubApi => ({
   removeMaterial: (materialId) => http.delete(`/hub/materials/${enc(materialId)}`),
   chat: (spaceId, after = null, signal) =>
     http.get(`/hub/spaces/${enc(spaceId)}/chat`, { schema: ChatPageSchema, query: after ? { after } : undefined, signal, retry: { attempts: 1 } }),
-  sendChat: (spaceId, input) =>
-    http.post(`/hub/spaces/${enc(spaceId)}/chat`, typeof input === 'string' ? { body: input } : input, { schema: HubMessageSchema, ...once }),
-  editChat: (messageId, body) => http.patch(`/hub/chat/${enc(messageId)}`, { body }, { schema: HubMessageSchema }),
-  reactChat: (messageId, input) => http.post(`/hub/chat/${enc(messageId)}/reactions`, input, { retry: { attempts: 1 } }),
-  chatMedia: (spaceId, query = {}, signal) =>
-    http.get(`/hub/spaces/${enc(spaceId)}/chat/media`, { query: { kind: query.kind ?? 'media', ...(query.before ? { before: query.before } : {}) }, signal }),
+  sendChat: (spaceId, body) => http.post(`/hub/spaces/${enc(spaceId)}/chat`, { body }, { schema: HubMessageSchema, ...once }),
   removeChat: (messageId) => http.delete(`/hub/chat/${enc(messageId)}`),
   rooms: (spaceId, signal) => http.get(`/hub/spaces/${enc(spaceId)}/rooms`, { schema: Items(HubRoomSchema), signal }),
   dropIn: (spaceId) =>

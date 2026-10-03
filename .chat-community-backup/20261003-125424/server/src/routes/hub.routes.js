@@ -69,17 +69,6 @@ import { z } from 'zod';
 
 import * as Hub from '../hub/HubService.js';
 import * as Extras from '../hub/HubExtras.js';
-import * as SpaceChat from '../hub/SpaceChat.js';
-
-/** A space chat message: text, files or one voice message, optionally a reply. */
-const SpaceChatSendSchema = z
-  .object({
-    body: z.string().trim().max(2000).default(''),
-    fileIds: z.array(z.string().uuid()).max(10).default([]),
-    voice: z.object({ durationMs: z.number().int().min(0).max(900_000) }).nullish(),
-    replyToId: z.string().uuid().nullish(),
-  })
-  .strict();
 import * as Part3 from '../hub/HubPart3.js';
 import * as PartRules from '../hub/partRules.js';
 import * as Rules from '../hub/hubRules.js';
@@ -330,7 +319,7 @@ router.delete('/materials/:id', validate({ params: spaceParam }), handle((req, r
 router.get(
   '/spaces/:id/chat',
   validate({ params: spaceParam, query: z.object({ after: z.string().datetime({ offset: true }).optional() }).passthrough() }),
-  handle((req, res, viewer) => SpaceChat.list({ viewer, spaceId: req.params.id, after: (req.validatedQuery ?? req.query).after ?? null })),
+  handle((req, res, viewer) => Extras.listMessages({ viewer, spaceId: req.params.id, after: req.query.after ?? null })),
 );
 
 router.post(
@@ -339,33 +328,11 @@ router.post(
   validate({ params: spaceParam }),
   handle(async (req, res, viewer) => {
     res.status(201);
-    return SpaceChat.send({ viewer, spaceId: req.params.id, input: parse(SpaceChatSendSchema, req.body) });
+    return Extras.sendMessage({ viewer, spaceId: req.params.id, input: parse(Rules.ChatMessageSchema, req.body) });
   }),
 );
 
-router.delete('/chat/:id', validate({ params: spaceParam }), handle((req, res, viewer) => SpaceChat.remove({ viewer, messageId: req.params.id })));
-
-router.patch(
-  '/chat/:id',
-  validate({ params: spaceParam, body: z.object({ body: z.string().trim().min(1).max(2000) }) }),
-  handle((req, res, viewer) => SpaceChat.edit({ viewer, messageId: req.params.id, body: req.body.body })),
-);
-
-router.post(
-  '/chat/:id/reactions',
-  rateLimit({ key: 'hub:react', points: 120, durationSec: 60, by: ['user'] }),
-  validate({ params: spaceParam, body: z.object({ emoji: z.string().min(1).max(16), action: z.enum(['add', 'remove']).default('add') }) }),
-  handle((req, res, viewer) => SpaceChat.react({ viewer, messageId: req.params.id, emoji: req.body.emoji, action: req.body.action })),
-);
-
-router.get(
-  '/spaces/:id/chat/media',
-  validate({ params: spaceParam, query: z.object({ kind: z.enum(['media', 'files', 'voice']).default('media'), before: z.string().datetime({ offset: true }).optional() }).passthrough() }),
-  handle((req, res, viewer) => {
-    const query = req.validatedQuery ?? req.query;
-    return SpaceChat.media({ viewer, spaceId: req.params.id, kind: query.kind ?? 'media', before: query.before ?? null });
-  }),
-);
+router.delete('/chat/:id', validate({ params: spaceParam }), handle((req, res, viewer) => Extras.removeMessage({ viewer, messageId: req.params.id })));
 
 router.get('/spaces/:id/rooms', validate({ params: spaceParam }), handle((req, res, viewer) => Extras.listRooms({ viewer, spaceId: req.params.id })));
 

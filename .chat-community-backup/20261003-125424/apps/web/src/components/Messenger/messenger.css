@@ -1,0 +1,18 @@
+
+/* ---------------------------------------------------------------- shared media (details panel) */
+.mx-shared { display: grid; gap: 10px; }
+.mx-tabs { display: grid; grid-template-columns: repeat(3, 1fr); padding: 3px; border-radius: 10px; background: var(--color-surface-2, #f1f5f4); }
+.mx-tabs button { padding: 7px 6px; border: 0; border-radius: 8px; background: none; font: inherit; font-size: 13.5px; font-weight: 700; color: var(--color-muted, #5d6f73); cursor: pointer; }
+.mx-tabs button.is-on { background: var(--color-surface, #fff); color: var(--color-text, #15272c); box-shadow: 0 1px 3px rgba(20, 38, 43, 0.12); }
+.mx-shared__grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.mx-shared__grid a { display: grid; place-items: center; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: #0d1a1e; }
+.mx-shared__grid img { width: 100%; height: 100%; object-fit: cover; }
+.mx-shared__video { color: #fff; font-size: 22px; }
+.mx-shared__list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.mx-shared__list li { display: flex; align-items: center; gap: 10px; }
+.mx-shared__list li.mx-shared__voice { display: grid; gap: 2px; }
+.mx-shared__text { display: grid; min-width: 0; font-size: 14px; }
+.mx-shared__text a { color: var(--color-text, #15272c); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-shared__text .mx-muted { font-size: 12.5px; }
+.mx-composer .ck-composer__hint { max-width: 920px; margin: 0 auto; }
+@media (max-width: 899px) { .mx-composer .ck-composer__hint { display: none; } }

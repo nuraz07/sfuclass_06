@@ -13,7 +13,6 @@ import HubPartners from '../components/Hub/HubPartners.jsx';
 import { tabFrom } from '../components/Hub/hubModel.js';
 import { onUserEvent } from '../lib/userEvents.js';
 import '../components/Hub/hub.css';
-import '../components/Hub/hubWide.css';
 
 /**
  * Community  (Community, part 1)

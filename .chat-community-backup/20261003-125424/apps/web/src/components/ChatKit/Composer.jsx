@@ -14,8 +14,7 @@ import { CHAT_ACCEPT, attachProblem, formatDuration, recorderFormat } from './ch
  *               sends or cancels; the recording is an ordinary upload too
  *
  * The caller decides what "send" means (onSend({ body, files, voice })), so the
- * same composer serves Messages and the community chat. `below(draft, clear)`
- * renders something under it that needs the draft (the late-night nudge).
+ * same composer serves Messages and the community chat.
  */
 
 const MAX_VOICE_MS = 15 * 60 * 1000;
@@ -153,7 +152,7 @@ function useRecorder() {
   return { state, setState, elapsed, error, setError, start, stop, cancel };
 }
 
-export default function Composer({ files, placeholder, disabled = false, disabledReason = '', onSend, onTyping, onArrowUp, onEscape, top = null, below = null, inputRef: externalRef = null, hint = true }) {
+export default function Composer({ files, placeholder, disabled = false, disabledReason = '', onSend, onTyping, onArrowUp, onEscape, top = null, inputRef: externalRef = null, hint = true }) {
   const [draft, setDraft] = useState('');
   const [notice, setNotice] = useState(null);
   const [dragging, setDragging] = useState(false);
@@ -337,7 +336,6 @@ export default function Composer({ files, placeholder, disabled = false, disable
           </button>
         </div>
       )}
-      {below ? below(draft, () => setDraft('')) : null}
       {hint ? <p className="ck-composer__hint">Enter to send · Shift+Enter for a new line · drop files to attach</p> : null}
     </div>
   );

@@ -250,14 +250,7 @@ export const canView = async ({ viewer, fileId }) => {
               SELECT 1 FROM message_files mf
                 JOIN messages msg ON msg.message_id = mf.message_id AND msg.deleted_at IS NULL
                 JOIN conversation_participants cp ON cp.conversation_id = msg.conversation_id AND cp.user_id = $2 AND cp.left_at IS NULL
-               WHERE mf.file_id = f.id)
-            OR EXISTS (
-              -- Community (033): a file sent in a space chat, for whoever can read that chat.
-              SELECT 1 FROM space_message_files smf
-                JOIN space_messages sm2 ON sm2.id = smf.message_id AND sm2.deleted_at IS NULL
-                JOIN spaces s2 ON s2.id = sm2.space_id AND s2.tenant_id = $3
-                LEFT JOIN space_memberships ms2 ON ms2.space_id = s2.id AND ms2.user_id = $2
-               WHERE smf.file_id = f.id AND (ms2.user_id IS NOT NULL OR s2.access = 'open')))`,
+               WHERE mf.file_id = f.id))`,
     [fileId, viewer.userId, viewer.tenantId],
   );
   return rows.length > 0;
