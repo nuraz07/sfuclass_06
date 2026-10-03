@@ -55,7 +55,7 @@ test('thread rows: day separators and groups by author within five minutes', () 
 
 test('edit and delete follow the server rule', () => {
   const now = Date.parse('2026-10-02T12:00:00Z');
-  const mine = { author: { userId: 'me' }, body: 'hello', delivery: 'sent', createdAt: '2026-10-02T11:55:00Z' };
+  const mine = { author: { userId: 'me' }, delivery: 'sent', createdAt: '2026-10-02T11:55:00Z' };
   const o = { selfUserId: 'me', windowMin: 15, now };
   assert.equal(canEdit(mine, o), true);
   assert.equal(canEdit({ ...mine, createdAt: '2026-10-02T11:40:00Z' }, o), false);
@@ -63,7 +63,6 @@ test('edit and delete follow the server rule', () => {
   assert.equal(canEdit({ ...mine, deletedAt: 'x' }, o), false);
   assert.equal(canEdit({ ...mine, author: { userId: 'other' } }, o), false);
   assert.equal(canEdit({ ...mine, createdAt: '2020-01-01T00:00:00Z' }, { ...o, windowMin: 0 }), true);
-  assert.equal(canEdit({ ...mine, body: '' }, o), false, 'files only: nothing to edit');
   assert.equal(canDelete(mine, o), true);
   assert.equal(canDelete({ ...mine, author: { userId: 'x' } }, o), false);
   const list = [{ ...mine, messageId: '1' }, { ...mine, messageId: '2', author: { userId: 'x' } }, { ...mine, messageId: '3', delivery: 'failed' }];

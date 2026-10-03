@@ -125,8 +125,6 @@ export const threadRows = (messages = []) => {
 /** Same rule as the server (conversationRules.canEdit): own, sent, not deleted, inside the window. */
 export const canEdit = (message, { selfUserId, windowMin = 0, now = Date.now() } = {}) => {
   if (!message || message.author?.userId !== selfUserId || message.deletedAt || message.delivery !== 'sent') return false;
-  // A message that is only files (or a voice message) has no text to edit.
-  if (!String(message.body ?? '').trim()) return false;
   if (!windowMin || windowMin <= 0) return true;
   const created = Date.parse(message.createdAt);
   return !Number.isNaN(created) && now - created <= windowMin * 60_000;

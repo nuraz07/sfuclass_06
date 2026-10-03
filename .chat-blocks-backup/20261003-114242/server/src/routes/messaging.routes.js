@@ -24,7 +24,6 @@ import { ApiError } from '@classroom/contracts';
 import * as ConversationService from '../messaging/ConversationService.js';
 import * as ConversationExtras from '../messaging/ConversationExtras.js';
 import * as DirectMessageService from '../messaging/DirectMessageService.js';
-import * as ChatExtras from '../messaging/ChatExtras.js';
 import * as PublicChatService from '../messaging/PublicChatService.js';
 import * as ChatAttachmentService from '../messaging/ChatAttachmentService.js';
 import * as ChatSearchService from '../messaging/ChatSearchService.js';
@@ -409,22 +408,18 @@ router.post(
     body: z.object({
       body: z.string().max(env.CHAT_MAX_MESSAGE_LEN),
       attachmentIds: z.array(z.string().uuid()).max(10).default([]),
-      fileIds: z.array(z.string().uuid()).max(10).default([]),
-      voice: z.object({ durationMs: z.number().int().min(0).max(900_000) }).nullish(),
       replyToId: z.string().uuid().nullish(),
       clientId: z.string().max(128),
     }),
   }),
   route(
     mapped(async (req, res) => {
-      if (!req.body.body.trim() && req.body.attachmentIds.length === 0 && req.body.fileIds.length === 0) {
+      if (!req.body.body.trim() && req.body.attachmentIds.length === 0) {
         throw badRequest('A message needs text or an attachment');
       }
 
       const message = await DirectMessageService.send({
         target: { kind: 'conversation', conversationId: req.params.id },
-        fileIds: req.body.fileIds,
-        voice: req.body.voice ?? null,
         authorId: req.user.id,
         tenantId: tenantOf(req),
         body: req.body.body,
@@ -443,26 +438,6 @@ router.patch(
   '/messages/:id',
   validate({ params: idParam, body: z.object({ body: z.string().min(1).max(env.CHAT_MAX_MESSAGE_LEN) }) }),
   route(mapped(async (req) => DirectMessageService.edit({ messageId: req.params.id, userId: req.user.id, body: req.body.body }))),
-);
-
-/** Messages: add or remove one emoji on a message. */
-router.post(
-  '/messages/:id/reactions',
-  rateLimit({ key: 'chat:react', points: 120, durationSec: 60, by: ['user'] }),
-  validate({ params: idParam, body: z.object({ emoji: z.string().min(1).max(16), action: z.enum(['add', 'remove']).default('add') }) }),
-  route(mapped(async (req) => ChatExtras.react({ messageId: req.params.id, userId: req.user.id, emoji: req.body.emoji, action: req.body.action }))),
-);
-
-/** Messages: what was shared in a conversation — media · files · voice. */
-router.get(
-  '/conversations/:id/media',
-  validate({ params: idParam, query: z.object({ kind: z.enum(['media', 'files', 'voice']).default('media'), before: isoDateTime.optional(), limit: z.coerce.number().int().min(1).max(200).optional() }).passthrough() }),
-  route(
-    mapped(async (req) => {
-      const query = q(req);
-      return ChatExtras.media({ conversationId: req.params.id, viewerId: req.user.id, kind: query.kind ?? 'media', before: query.before ?? null, limit: query.limit ?? 60 });
-    }),
-  ),
 );
 
 router.delete(

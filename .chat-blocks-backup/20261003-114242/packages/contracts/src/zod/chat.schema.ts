@@ -170,25 +170,7 @@ export const ReactionSummarySchema = z.object({
   count: z.number().int().positive(),
   /** Whether the viewer is one of them, so the chip renders active. */
   reacted: z.boolean().default(false),
-  /** Up to ten display names, for "who reacted" (Messages). */
-  names: z.array(z.string()).max(10).default([]),
 });
-
-/** A file from the upload pipeline (files) on a message; `voice` marks a voice message. */
-export const MessageFileSchema = z
-  .object({
-    fileId: z.string(),
-    name: z.string(),
-    ext: z.string(),
-    kind: z.string(),
-    sizeBytes: z.number().nonnegative(),
-    inline: z.boolean().default(false),
-    openUrl: z.string().nullable().default(null),
-    voice: z.boolean().default(false),
-    durationMs: z.number().nullable().default(null),
-  })
-  .passthrough();
-export type MessageFile = z.infer<typeof MessageFileSchema>;
 
 export const MessageSchema = z
   .object({
@@ -201,7 +183,6 @@ export const MessageSchema = z
     attachments: z.array(MessageAttachmentSchema).max(CHAT_ATTACHMENTS_PER_MESSAGE).default([]),
     replyToId: MessageIdSchema.nullable().default(null),
     reactions: z.array(ReactionSummarySchema).max(20).default([]),
-    files: z.array(MessageFileSchema).max(10).default([]),
 
     /** Echoed back so an optimistic bubble can be reconciled, not duplicated. */
     clientMessageId: IdempotencyKeySchema.nullable().default(null),
@@ -243,14 +224,11 @@ export const SendMessageSchema = z
     body: richText(CHAT_MESSAGE_MAX_LENGTH).default(''),
     /** Assets must already be `ready`; the server rejects anything else. */
     attachmentIds: z.array(AssetIdSchema).max(CHAT_ATTACHMENTS_PER_MESSAGE).default([]),
-    /** Files from the upload pipeline (Messages). */
-    fileIds: z.array(z.string().uuid()).max(10).default([]),
-    voice: z.strictObject({ durationMs: z.number().int().min(0).max(900_000) }).optional(),
     replyToId: MessageIdSchema.optional(),
     mentions: z.array(MentionSchema).max(50).default([]),
     clientMessageId: IdempotencyKeySchema,
   })
-  .refine((v) => v.body.trim().length > 0 || v.attachmentIds.length > 0 || v.fileIds.length > 0, {
+  .refine((v) => v.body.trim().length > 0 || v.attachmentIds.length > 0, {
     error: 'a message needs text or at least one attachment',
     path: ['body'],
   });

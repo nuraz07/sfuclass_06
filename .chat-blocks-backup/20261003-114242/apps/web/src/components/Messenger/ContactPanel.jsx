@@ -5,7 +5,6 @@ import { formatDate, formatTime } from '../../lib/preferences.js';
 import Avatar from './Avatar.jsx';
 import { ProfileSummary, useProfile } from './ProfileCard.jsx';
 import { ConfirmDialog, ReportDialog } from './Dialogs.jsx';
-import SharedMedia from './SharedMedia.jsx';
 import { MUTE_CHOICES, muteState, muteUntil } from './messengerModel.js';
 
 /**
@@ -15,7 +14,6 @@ import { MUTE_CHOICES, muteState, muteUntil } from './messengerModel.js';
  *   the person      profile as they allow it to be seen
  *   quick actions   search in the chat, mute, pin
  *   notifications   mute for 1 h / 8 h / 1 day / 1 week / until turned on
- *   shared          media, files and voice messages of this chat
  *   in common       the spaces you share (links into Community)
  *   about           since when, how many messages you can see
  *   privacy         block or unblock, report, delete the chat for you
@@ -135,10 +133,6 @@ export default function ContactPanel({ conversation, title, other, self, api, pr
               ))}
             </div>
           ) : null}
-        </Section>
-
-        <Section title="Shared in this chat">
-          <SharedMedia api={api} conversationId={conversation.conversationId} refreshKey={conversation.lastMessageAt} />
         </Section>
 
         {other ? (

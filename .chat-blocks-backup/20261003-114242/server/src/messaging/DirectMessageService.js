@@ -88,10 +88,10 @@ const authoriseWrite = async ({ target, userId }) => {
 // Send
 // ---------------------------------------------------------------------------
 
-export const send = async ({ target, authorId, tenantId, body, attachmentIds = [], fileIds = [], voice = null, replyToId = null, clientMessageId }) => {
+export const send = async ({ target, authorId, tenantId, body, attachmentIds = [], replyToId = null, clientMessageId }) => {
   const text = String(body ?? '').trim();
 
-  if (!text && attachmentIds.length === 0 && fileIds.length === 0) {
+  if (!text && attachmentIds.length === 0) {
     throw new ApiError('validation_failed', { detail: 'A message needs text or an attachment.' });
   }
   if (text.length > env.CHAT_MAX_MESSAGE_LEN) {
@@ -102,10 +102,6 @@ export const send = async ({ target, authorId, tenantId, body, attachmentIds = [
 
   await assertNotMuted({ userId: authorId, target });
   const { recipients } = await authoriseWrite({ target, userId: authorId });
-
-  // Messages (032): files from the upload pipeline, checked before anything is written.
-  const Extras = await import('./ChatExtras.js');
-  const checkedFiles = await Extras.checkFiles({ authorId, tenantId, fileIds, voice });
 
   const row = await Message.insert({
     messageId: randomUUID(),
@@ -123,10 +119,8 @@ export const send = async ({ target, authorId, tenantId, body, attachmentIds = [
     await Attachment.attach({ messageId: row.message_id, assetIds: attachmentIds });
   }
 
-  await Extras.attachFiles({ messageId: row.message_id, checked: checkedFiles });
-
   const attachments = await Attachment.listForMessage(row.message_id);
-  const [message] = await Extras.applyExtras([Message.toMessage(row, { attachments, viewerId: authorId })], authorId);
+  const message = Message.toMessage(row, { attachments, viewerId: authorId });
 
   if (target.kind === 'conversation') {
     await Conversation.touch(target.conversationId);
@@ -199,8 +193,7 @@ export const edit = async ({ messageId, userId, body }) => {
 
   const updated = await Message.update({ messageId, body: String(body).trim() });
   const attachments = await Attachment.listForMessage(messageId);
-  const { applyExtras } = await import('./ChatExtras.js');
-  const [message] = await applyExtras([Message.toMessage(updated, { attachments, viewerId: userId })], userId);
+  const message = Message.toMessage(updated, { attachments, viewerId: userId });
 
   const { broadcastUpdate } = await import('./chatGateway.js');
   broadcastUpdate({ message });
@@ -284,8 +277,7 @@ export const history = async ({ target, viewerId, cursor, limit = 25, order = 'd
     ),
   );
 
-  const { applyExtras } = await import('./ChatExtras.js');
-  return { items: await applyExtras(items, viewerId), nextCursor: page.nextCursor, hasMore: page.hasMore };
+  return { items, nextCursor: page.nextCursor, hasMore: page.hasMore };
 };
 
 export const authoriseRead = async ({ target, userId }) => {
@@ -301,7 +293,4 @@ export const authoriseRead = async ({ target, userId }) => {
   return true;
 };
 
-/** Reactions live in ChatExtras; the socket handler looks for them here. */
-export const react = async (input) => (await import('./ChatExtras.js')).react(input);
-
-export default { send, edit, remove, history, authoriseRead, react };
+export default { send, edit, remove, history, authoriseRead };

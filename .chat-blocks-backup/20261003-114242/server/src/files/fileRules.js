@@ -36,8 +36,6 @@ export const FORMATS = Object.freeze({
   m4a: { type: 'audio/mp4', kind: 'audio', inline: true, magic: 'ftyp' },
   mp3: { type: 'audio/mpeg', kind: 'audio', inline: true, magic: 'mp3' },
   wav: { type: 'audio/wav', kind: 'audio', inline: true, magic: 'wav' },
-  webm: { type: 'video/webm', kind: 'video', inline: true, magic: 'webm' },
-  ogg: { type: 'audio/ogg', kind: 'audio', inline: true, magic: 'ogg' },
 });
 
 export const EXTENSIONS = Object.keys(FORMATS);
@@ -94,10 +92,6 @@ export const bytesMatch = (magic, bytes) => {
       return startsWith(b, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
     case 'ftyp':
       return startsWith(b, ascii('ftyp'), 4);
-    case 'webm':
-      return startsWith(b, [0x1a, 0x45, 0xdf, 0xa3]);
-    case 'ogg':
-      return startsWith(b, ascii('OggS'));
     case 'mp3':
       return startsWith(b, ascii('ID3')) || (b[0] === 0xff && (b[1] & 0xe0) === 0xe0);
     case 'text': {

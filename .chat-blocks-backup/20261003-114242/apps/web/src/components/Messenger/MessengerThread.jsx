@@ -1,10 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createFilesApi, useChat, useCore } from '@classroom/core-client';
-import Composer from '../ChatKit/Composer.jsx';
-import MessageFiles from '../ChatKit/MessageFiles.jsx';
-import { ReactionChips, ReactionPicker } from '../ChatKit/Reactions.jsx';
-import { filesLabel, toggleAction } from '../ChatKit/chatKitModel.js';
-import '../ChatKit/chatkit.css';
+import { useChat } from '@classroom/core-client';
 import { formatDate, formatTime } from '../../lib/preferences.js';
 import Avatar from './Avatar.jsx';
 import { ConfirmDialog } from './Dialogs.jsx';
@@ -15,12 +10,11 @@ import { canDelete, canEdit, dayLabel, highlightParts, lastEditable, searchHits,
  *
  *   messages   grouped by day and by person; names and pictures open the
  *              person's profile
- *   actions    on hover (or always on touch screens): React, Reply, Edit (your
+ *   actions    on hover (or the ⋯ button on touch screens): Reply, Edit (your
  *              own, within the edit window), Copy, Delete (your own, for
- *              everyone). Edits, deletes and reactions reach the other side live.
- *   files      pictures, videos, documents and voice messages in the bubble
- *   composer   the chat kit's: text, files (📎, drop, paste) and voice (🎤);
- *              ↑ in an empty composer edits your last message, Esc cancels a reply
+ *              everyone). Edits and deletes reach the other side live.
+ *   composer   Enter sends, Shift+Enter is a new line, ↑ in an empty composer
+ *              edits your last message, Esc cancels a reply or an edit
  *   search     finds text in the loaded messages, highlights it and jumps
  *              between hits; "Load earlier" reaches further back
  *
@@ -56,32 +50,29 @@ function AutoTextarea({ value, onChange, onKeyDown, placeholder, disabled, input
   );
 }
 
-function MessageActions({ message, mine, editable, deletable, onReact, onReply, onEdit, onCopy, onDelete }) {
+function MessageActions({ message, mine, editable, deletable, onReply, onEdit, onCopy, onDelete }) {
   if (message.deletedAt || message.delivery !== 'sent') return null;
   return (
     <span className={`mx-actions${mine ? ' is-mine' : ''}`} role="toolbar" aria-label="Message actions">
-      <button type="button" onClick={onReact} title="React" aria-label="React">☺</button>
       <button type="button" onClick={onReply} title="Reply" aria-label="Reply">↩</button>
       {editable ? <button type="button" onClick={onEdit} title="Edit" aria-label="Edit">✎</button> : null}
-      {message.body ? <button type="button" onClick={onCopy} title="Copy text" aria-label="Copy text">⧉</button> : null}
+      <button type="button" onClick={onCopy} title="Copy text" aria-label="Copy text">⧉</button>
       {deletable ? <button type="button" className="is-danger" onClick={onDelete} title="Delete" aria-label="Delete">🗑</button> : null}
     </span>
   );
 }
 
 export default function MessengerThread({ api, socket, self, conversation, title, other, editWindowMin, search, onSearchChange, searchOpen, onCloseSearch, onOpenProfile, disabledReason = '' }) {
-  const { http } = useCore();
-  const files = useMemo(() => createFilesApi(http), [http]);
   const target = useMemo(() => ({ kind: 'conversation', conversationId: conversation.conversationId }), [conversation.conversationId]);
-  const { messages, loading, loadingOlder, hasMore, loadOlder, typingUserIds, throttledUntil, send, retry, edit, remove, react, setTyping, error } = useChat({
+  const { messages, loading, loadingOlder, hasMore, loadOlder, typingUserIds, throttledUntil, send, retry, edit, remove, setTyping, error } = useChat({
     api,
     socket: socket ?? undefined,
     target,
     self,
   });
 
+  const [draft, setDraft] = useState('');
   const [replyTo, setReplyTo] = useState(null);
-  const [pickerFor, setPickerFor] = useState(null);
   const [editing, setEditing] = useState(null); // { messageId, text }
   const [editError, setEditError] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -121,8 +112,8 @@ export default function MessengerThread({ api, socket, self, conversation, title
   // A new chat: start at the bottom, composer focused, nothing half-done.
   useEffect(() => {
     stickToBottom.current = true;
+    setDraft('');
     setReplyTo(null);
-    setPickerFor(null);
     setEditing(null);
     composerRef.current?.focus({ preventScroll: true });
   }, [conversation.conversationId]);
@@ -146,25 +137,15 @@ export default function MessengerThread({ api, socket, self, conversation, title
     return undefined;
   };
 
-  const sendFromComposer = async ({ body, files: ready, voice }) => {
+  const submit = async () => {
+    const body = draft.trim();
+    if (!body || disabled) return;
+    setDraft('');
+    setTyping(false);
     stickToBottom.current = true;
     const reply = replyTo;
     setReplyTo(null);
-    await send({
-      body,
-      fileIds: ready.map((f) => f.fileId),
-      previewFiles: ready.map((f) => ({ ...f, voice: Boolean(voice), durationMs: voice?.durationMs ?? null })),
-      ...(voice ? { voice } : {}),
-      ...(reply ? { replyToId: reply.messageId } : {}),
-    });
-  };
-
-  const toggleReaction = async (message, emoji) => {
-    try {
-      await react(message.messageId, emoji, toggleAction(message.reactions, emoji));
-    } catch (cause) {
-      say(cause?.detail ?? 'The reaction was not saved.');
-    }
+    await send({ body, ...(reply ? { replyToId: reply.messageId } : {}) });
   };
 
   const startEdit = useCallback((message) => {
@@ -204,6 +185,21 @@ export default function MessengerThread({ api, socket, self, conversation, title
     }
   };
 
+  const onComposerKey = (event) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      submit();
+    } else if (event.key === 'ArrowUp' && !draft) {
+      const last = lastEditable(messages, rules);
+      if (last) {
+        event.preventDefault();
+        startEdit(last);
+      }
+    } else if (event.key === 'Escape' && replyTo) {
+      setReplyTo(null);
+    }
+  };
+
   const typingName = typingUserIds.length === 1 ? (typingUserIds[0] === other?.userId ? other?.profile?.displayName : 'Someone') : null;
 
   return (
@@ -231,7 +227,7 @@ export default function MessengerThread({ api, socket, self, conversation, title
         </div>
       ) : null}
 
-      <div className="mx-messages" ref={scrollRef} onScroll={onScroll} data-ck-dropzone>
+      <div className="mx-messages" ref={scrollRef} onScroll={onScroll}>
         <div className="mx-messages__inner">
           {hasMore ? (
             <button type="button" className="mx-loadmore" onClick={() => loadOlder()} disabled={loadingOlder}>
@@ -296,7 +292,7 @@ export default function MessengerThread({ api, socket, self, conversation, title
                       {message.replyToId ? (
                         <button type="button" className="mx-quote" onClick={() => jumpTo(message.replyToId)}>
                           <strong>{reply ? (reply.author?.userId === self.userId ? 'You' : reply.author?.displayName) : 'Reply'}</strong>
-                          <span>{reply ? (reply.deletedAt ? 'Message deleted' : snippet(reply.body) || filesLabel(reply.files)) : 'to an earlier message'}</span>
+                          <span>{reply ? (reply.deletedAt ? 'Message deleted' : snippet(reply.body)) : 'to an earlier message'}</span>
                         </button>
                       ) : null}
                       {isEditing ? (
@@ -337,14 +333,9 @@ export default function MessengerThread({ api, socket, self, conversation, title
                       ) : message.deletedAt ? (
                         <em className="mx-deleted">This message was deleted</em>
                       ) : (
-                        <>
-                          <MessageFiles files={message.files ?? []} mine={mine} />
-                          {message.body ? (
-                            <span className="mx-bubble__text">
-                              <Text body={message.body} query={search} />
-                            </span>
-                          ) : null}
-                        </>
+                        <span className="mx-bubble__text">
+                          <Text body={message.body} query={search} />
+                        </span>
                       )}
                       {!isEditing ? (
                         <span className="mx-bubble__meta">
@@ -353,16 +344,12 @@ export default function MessengerThread({ api, socket, self, conversation, title
                         </span>
                       ) : null}
                     </div>
-                    {pickerFor === message.messageId ? (
-                      <ReactionPicker align={mine ? 'end' : 'start'} onPick={(emoji) => toggleReaction(message, emoji)} onClose={() => setPickerFor(null)} />
-                    ) : null}
                     {!isEditing ? (
                       <MessageActions
                         message={message}
                         mine={mine}
                         editable={canEdit(message, rules)}
                         deletable={canDelete(message, rules)}
-                        onReact={() => setPickerFor(message.messageId)}
                         onReply={() => {
                           setReplyTo(message);
                           composerRef.current?.focus();
@@ -373,7 +360,6 @@ export default function MessengerThread({ api, socket, self, conversation, title
                       />
                     ) : null}
                   </div>
-                  {!message.deletedAt ? <ReactionChips reactions={message.reactions ?? []} mine={mine} onToggle={(emoji) => toggleReaction(message, emoji)} /> : null}
                   {message.delivery === 'failed' ? (
                     <button type="button" className="mx-retry" onClick={() => retry(message.clientMessageId)}>
                       Not sent. Tap to try again.
@@ -390,38 +376,46 @@ export default function MessengerThread({ api, socket, self, conversation, title
       {notice ? <p className="mx-toast" role="status">{notice}</p> : null}
 
       <div className="mx-composer">
-        <Composer
-          files={files}
-          inputRef={composerRef}
-          placeholder={throttled ? 'Slow down a little — you can write again in a moment' : `Message ${title}`}
-          disabled={disabled}
-          disabledReason={disabledReason}
-          onSend={sendFromComposer}
-          onTyping={setTyping}
-          onArrowUp={() => {
-            const last = lastEditable(messages, rules);
-            if (last) startEdit(last);
-            return Boolean(last);
+        {disabledReason ? <p className="mx-composer__notice">{disabledReason}</p> : null}
+        {replyTo ? (
+          <div className="mx-replychip">
+            <span>
+              <strong>Replying to {replyTo.author?.userId === self.userId ? 'yourself' : replyTo.author?.displayName}</strong>
+              <span>{snippet(replyTo.body)}</span>
+            </span>
+            <button type="button" className="mx-iconbtn" onClick={() => setReplyTo(null)} aria-label="Cancel reply">×</button>
+          </div>
+        ) : null}
+        <form
+          className="mx-composer__row"
+          onSubmit={(event) => {
+            event.preventDefault();
+            submit();
           }}
-          onEscape={() => setReplyTo(null)}
-          top={
-            replyTo ? (
-              <div className="mx-replychip">
-                <span>
-                  <strong>Replying to {replyTo.author?.userId === self.userId ? 'yourself' : replyTo.author?.displayName}</strong>
-                  <span>{snippet(replyTo.body) || filesLabel(replyTo.files)}</span>
-                </span>
-                <button type="button" className="mx-iconbtn" onClick={() => setReplyTo(null)} aria-label="Cancel reply">×</button>
-              </div>
-            ) : null
-          }
-        />
+        >
+          <AutoTextarea
+            inputRef={composerRef}
+            label={`Message ${title}`}
+            placeholder={throttled ? 'Slow down a little — you can write again in a moment' : `Message ${title}`}
+            value={draft}
+            disabled={disabled}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              setTyping(event.target.value.length > 0);
+            }}
+            onKeyDown={onComposerKey}
+          />
+          <button type="submit" className="mx-send" disabled={!draft.trim() || disabled} aria-label="Send">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-8-6 16-2.5-6.5L4 12z" /></svg>
+          </button>
+        </form>
+        <p className="mx-composer__hint">Enter to send · Shift+Enter for a new line · ↑ to edit your last message</p>
       </div>
 
       {confirmDelete ? (
         <ConfirmDialog
           title="Delete this message?"
-          body={`It is removed for everyone in this chat, with its files, and shows as “This message was deleted”. ${snippet(confirmDelete.body, 60) ? `“${snippet(confirmDelete.body, 60)}”` : filesLabel(confirmDelete.files)}`}
+          body={`It is removed for everyone in this chat and shows as “This message was deleted”. ${snippet(confirmDelete.body, 60) ? `“${snippet(confirmDelete.body, 60)}”` : ''}`}
           confirmLabel="Delete for everyone"
           danger
           onConfirm={() => remove(confirmDelete.messageId)}

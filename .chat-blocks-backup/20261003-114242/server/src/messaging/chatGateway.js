@@ -161,8 +161,6 @@ export const attachChatGateway = (io) => {
         tenantId: socket.data.tenantId,
         body: payload.body,
         attachmentIds: payload.attachmentIds,
-        fileIds: payload.fileIds ?? [],
-        voice: payload.voice ?? null,
         replyToId: payload.replyToId,
         clientMessageId: payload.clientMessageId,
       });
@@ -302,8 +300,8 @@ export const broadcastUpdate = ({ message }) =>
 export const broadcastDelete = ({ target, messageId, deletedBy, deletedAt }) =>
   emit(target, SERVER.messageDeleted, { target, messageId, deletedBy, deletedAt });
 
-export const broadcastReaction = ({ target, messageId, emoji, userId, action, count, names }) =>
-  emit(target, SERVER.reactionChanged, { target, messageId, emoji, userId, action, count, names: names ?? [] });
+export const broadcastReaction = ({ target, messageId, emoji, userId, action, count }) =>
+  emit(target, SERVER.reactionChanged, { target, messageId, emoji, userId, action, count });
 
 export const broadcastTyping = ({ target, userId, typing, expiresAt }) =>
   emit(target, SERVER.typingChanged, { target, userId, typing, expiresAt });

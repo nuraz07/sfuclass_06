@@ -63,7 +63,7 @@ export default function MessengerList({ rooms, self, activeId, onOpen }) {
                 {preview ? (
                   <>
                     {preview.authorId === self.userId ? <span className="mx-row__you">You: </span> : null}
-                    {preview.body ? <Highlight text={preview.body} query={filter} /> : <span>📎 Attachment</span>}
+                    <Highlight text={preview.body} query={filter} />
                   </>
                 ) : (
                   'No messages yet'

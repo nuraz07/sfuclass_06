@@ -59,16 +59,7 @@ export interface UseChatResult {
   /** Set when slow mode or a rate limit is holding the composer. */
   throttledUntil: number | null;
 
-  send(input: {
-    body: string;
-    attachmentIds?: string[];
-    replyToId?: string;
-    /** Messages: files from the upload pipeline, and whether the one file is a voice message. */
-    fileIds?: string[];
-    voice?: { durationMs: number };
-    /** Shown in the bubble while it is sending. */
-    previewFiles?: Chat.MessageFile[];
-  }): Promise<void>;
+  send(input: { body: string; attachmentIds?: string[]; replyToId?: string }): Promise<void>;
   retry(clientMessageId: string): Promise<void>;
   edit(messageId: string, body: string): Promise<void>;
   remove(messageId: string): Promise<void>;
@@ -162,7 +153,7 @@ export const useChat = (options: UseChatOptions): UseChatResult => {
       setMessages((current) =>
         current.map((m) =>
           m.messageId === payload.message.messageId
-            ? { ...payload.message, reactions: m.reactions, files: payload.message.files ?? m.files, delivery: 'sent' as const }
+            ? { ...payload.message, delivery: 'sent' as const }
             : m,
         ),
       );
@@ -194,7 +185,6 @@ export const useChat = (options: UseChatOptions): UseChatResult => {
                 emoji: payload.emoji,
                 count: payload.count,
                 reacted: mine ? payload.action === 'add' : (existing?.reacted ?? false),
-                names: ((payload as { names?: string[] }).names ?? existing?.names ?? []).slice(0, 10),
               },
             ],
           };
@@ -317,8 +307,6 @@ export const useChat = (options: UseChatOptions): UseChatResult => {
         attachmentIds: (input.attachmentIds ?? []) as Chat.SendMessage['attachmentIds'],
         mentions: [],
         ...(input.replyToId ? { replyToId: input.replyToId as Chat.MessageId } : {}),
-        fileIds: input.fileIds ?? [],
-        ...(input.voice ? { voice: input.voice } : {}),
         clientMessageId,
       };
 
@@ -334,7 +322,6 @@ export const useChat = (options: UseChatOptions): UseChatResult => {
         attachments: [],
         replyToId: (input.replyToId ?? null) as Chat.MessageId | null,
         reactions: [],
-        files: input.previewFiles ?? [],
         clientMessageId,
         editedAt: null,
         deletedAt: null,
@@ -364,9 +351,6 @@ export const useChat = (options: UseChatOptions): UseChatResult => {
         target,
         body: message.body,
         attachmentIds: message.attachments.map((a) => a.assetId),
-        fileIds: (message.files ?? []).map((f) => f.fileId),
-        ...(message.files?.[0]?.voice ? { voice: { durationMs: message.files[0].durationMs ?? 0 } } : {}),
-        ...(message.replyToId ? { replyToId: message.replyToId } : {}),
         mentions: [],
         clientMessageId,
       });
@@ -452,21 +436,7 @@ export const useChat = (options: UseChatOptions): UseChatResult => {
       );
     },
     react: async (messageId, emoji, action = 'add') => {
-      const result = await api.react(messageId, { emoji, action });
-      if (!result) return;
-      // Applied here as well as by the socket event, so it also works without one.
-      setMessages((current) =>
-        current.map((m) => {
-          if (m.messageId !== messageId) return m;
-          const others = m.reactions.filter((r) => r.emoji !== emoji);
-          if (result.count === 0) return { ...m, reactions: others };
-          const position = m.reactions.findIndex((r) => r.emoji === emoji);
-          const next = { emoji, count: result.count, reacted: result.reacted, names: result.names };
-          const reactions = [...others];
-          reactions.splice(position === -1 ? reactions.length : position, 0, next);
-          return { ...m, reactions };
-        }),
-      );
+      await api.react(messageId, { emoji, action });
     },
     loadOlder,
     markRead,

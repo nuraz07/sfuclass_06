@@ -99,25 +99,6 @@ export const ConversationDetailsSchema = z
   .passthrough();
 export type ConversationDetails = z.infer<typeof ConversationDetailsSchema>;
 
-export const ConversationMediaSchema = z
-  .object({
-    items: z.array(
-      Chat.MessageFileSchema.extend({
-        messageId: z.string(),
-        sentAt: z.string(),
-        authorId: z.string().nullable().default(null),
-        authorName: z.string().default('Someone'),
-      }).passthrough(),
-    ),
-    nextBefore: z.string().nullable().default(null),
-  })
-  .passthrough();
-export type ConversationMedia = z.infer<typeof ConversationMediaSchema>;
-
-export const ReactionResultSchema = z
-  .object({ messageId: z.string(), emoji: z.string(), count: z.number(), reacted: z.boolean(), names: z.array(z.string()).default([]) })
-  .passthrough();
-
 const ConversationPageSchema = z.object({
   items: z.array(ConversationViewSchema),
   nextCursor: z.string().nullable().default(null),
@@ -202,9 +183,7 @@ export interface ChatApi {
   send(input: z.infer<typeof Chat.SendMessageSchema>): Promise<z.infer<typeof Chat.MessageSchema>>;
   edit(messageId: string, body: string): Promise<z.infer<typeof Chat.MessageSchema>>;
   remove(messageId: string): Promise<void>;
-  react(messageId: string, input: z.infer<typeof Chat.ReactToMessageSchema>): Promise<z.infer<typeof ReactionResultSchema> | undefined>;
-  /** Messages: what was shared in a conversation. */
-  media(conversationId: string, query?: { kind?: 'media' | 'files' | 'voice'; before?: string | null }, signal?: AbortSignal): Promise<ConversationMedia>;
+  react(messageId: string, input: z.infer<typeof Chat.ReactToMessageSchema>): Promise<void>;
 
   markRead(target: ChatTarget, messageId: string): Promise<void>;
   getUnread(signal?: AbortSignal): Promise<z.infer<typeof Chat.UnreadSummarySchema>>;
@@ -331,8 +310,6 @@ export const createChatApi = (http: HttpClient): ChatApi => ({
       {
         body: input.body,
         attachmentIds: input.attachmentIds,
-        fileIds: input.fileIds ?? [],
-        voice: input.voice,
         replyToId: input.replyToId,
         clientId: input.clientMessageId,
       },
@@ -351,18 +328,11 @@ export const createChatApi = (http: HttpClient): ChatApi => ({
     await http.delete(`/messaging/messages/${encodeURIComponent(messageId)}`);
   },
 
-  react: async (messageId, input) =>
-    http.post(`/messaging/messages/${encodeURIComponent(messageId)}/reactions`, input, {
-      schema: ReactionResultSchema,
+  react: async (messageId, input) => {
+    await http.post(`/messaging/messages/${encodeURIComponent(messageId)}/reactions`, input, {
       retry: { attempts: 1 },
-    }),
-
-  media: (conversationId, query = {}, signal) =>
-    http.get(`/messaging/conversations/${encodeURIComponent(conversationId)}/media`, {
-      query: { kind: query.kind ?? 'media', ...(query.before ? { before: query.before } : {}) },
-      schema: ConversationMediaSchema,
-      signal,
-    }),
+    });
+  },
 
   markRead: async (target, messageId) => {
     await http.put(`${targetPath(target)}/read`, { messageId }, { retry: { attempts: 1 } });
